@@ -36,6 +36,7 @@ from nemo.collections.asr.models.k2_sequence_models import (
     EncDecK2SeqModel,
     EncDecK2SeqModelBPE,
 )
+from nemo.collections.asr.models.eesd_models import SortformerEncLabelModel
 from nemo.collections.asr.models.label_models import EncDecSpeakerLabelModel
 from nemo.collections.asr.models.msdd_models import EncDecDiarLabelModel, NeuralDiarizer
 from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel

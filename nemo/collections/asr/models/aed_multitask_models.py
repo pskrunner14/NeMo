@@ -594,7 +594,7 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRTran
 
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
-        
+
         encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
 
         enc_states = encoded.permute(0, 2, 1)
@@ -991,7 +991,7 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
             self.spk = True
             # Initialize the speaker branch
             self._init_spk_model()
-            
+
             # layer normalization, ln, l2, or None
             if 'norm' in cfg:
                 if cfg.norm == 'ln':
@@ -1021,7 +1021,7 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
                 self.segment_shift = 8
         else:
             self.spk = False
-            
+
 
     def _init_spk_model(self):
         """
@@ -1049,7 +1049,7 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
         Initialize the ASR model. Assuming that the model is initialized with super().__init__().
         """
         model_path = self.cfg.asr_model_path
-        
+
         if model_path is not None and model_path.endswith('.nemo'):
             pretrained_asr_model = EncDecMultiTaskModel.restore_from(model_path, map_location="cpu")
             logging.info("ASR Model restored locally from {}".format(model_path))
@@ -1057,22 +1057,23 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
             pretrained_asr_model = EncDecMultiTaskModel.load_from_checkpoint(model_path, map_location="cpu")
             logging.info("ASR Model restored locally from {}".format(model_path))
         else:
-            pretrained_asr_model = None
-        
+            pretrained_asr_model = EncDecMultiTaskModel.from_pretrained(model_path, map_location="cpu")
+            logging.info("ASR Model restored from NGC {}".format(model_path))
+
         if pretrained_asr_model is not None:
             logging.info("Restoring ASR model parameters from pretrained model.")
             self.encoder.load_state_dict(pretrained_asr_model.encoder.state_dict(), strict=True)
             self.encoder_decoder_proj.load_state_dict(pretrained_asr_model.encoder_decoder_proj.state_dict(), strict=True)
             if self.use_transf_encoder:
                 self.transf_encoder.load_state_dict(pretrained_asr_model.transf_encoder.state_dict(), strict=True)
-            self.transf_decoder.load_state_dict(pretrained_asr_model.transf_decoder.state_dict(), strict=True) 
-        
+            self.transf_decoder.load_state_dict(pretrained_asr_model.transf_decoder.state_dict(), strict=True)
+
         if self.cfg.freeze_asr:
             self.encoder.eval()
             self.encoder_decoder_proj.eval()
             if self.use_transf_encoder:
                 self.transf_encoder.eval()
-                
+
     def forward_asr(
         self,
         input_signal=None,
@@ -1124,7 +1125,7 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
         else:
             pad = segment_length - res
         pad_l, pad_r = pad // 2, pad - pad // 2
-        
+
         feat = torch.nn.functional.pad(input=feat, pad=(pad_l, pad_r), mode='constant', value=0)
         B, D, T = feat.shape
         n_segments = (T - segment_length) // segment_shift + 1
@@ -1133,10 +1134,10 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
             seg_feats[:, :, i, :] = feat[:, :, i * segment_shift : i * segment_shift + segment_length]
         return seg_feats
 
-    def random_zero_mask(self, 
-                         feat=None, 
-                         prob=0.5, 
-                         mask_value=0, 
+    def random_zero_mask(self,
+                         feat=None,
+                         prob=0.5,
+                         mask_value=0,
                          min_mask_len=0.2,
                          mask_range=(0.1, 0.9),
                          ):
@@ -1164,7 +1165,7 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
             mask[selected_sample_idx[i], mask_starts[i]:mask_starts[i] + mask_len] = mask_value
 
         return mask, feat * mask
-       
+
 
     def forward_spk(
         self,
@@ -1181,7 +1182,7 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
 
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_len)
-        
+
         encoded, length = self.spk_encoder(audio_signal=processed_signal, length=processed_signal_len) # B x D x T
         seg_encoded = self.segmentation(encoded, segment_length, segment_shift) # B x D x n_segments x segment_length
         B, D, n_segments, _ = seg_encoded.shape
@@ -1230,7 +1231,7 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
             4) The speaker embeddings of shape [B, D]
         """
         #logging.info('.......................', self.training, self.cfg.zero_prob)
-        
+
         # ASR branch: downsample rate is 8
         with torch.set_grad_enabled(not self.cfg.freeze_asr):
             asr_enc_states, asr_encoded_len, asr_enc_mask = self.forward_asr( # B x T x D
@@ -1249,7 +1250,7 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
             elif self.norm == 'l2':
                 spk_enc_states = torch.nn.functional.normalize(spk_enc_states, p=2, dim=-1)
                 asr_enc_states = torch.nn.functional.normalize(asr_enc_states, p=2, dim=-1)
-            
+
             if spk_enc_states.shape[1] > asr_enc_states.shape[1]:
                 spk_enc_states = spk_enc_states[:, :asr_enc_states.shape[1], :]
 
@@ -1257,7 +1258,7 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
             enc_states = self.joint_proj(concat_enc_states)
         else:
             enc_states = asr_enc_states
-            
+
         # merge two states
         transf_log_probs = None
         if transcript is not None:
@@ -1268,4 +1269,4 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
             transf_log_probs = self.log_softmax(hidden_states=dec_states)
 
         return transf_log_probs, asr_encoded_len, enc_states, asr_enc_mask
-    
+

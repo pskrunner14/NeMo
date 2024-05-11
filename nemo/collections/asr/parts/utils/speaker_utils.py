@@ -95,6 +95,28 @@ def get_uniq_id_with_dur(meta, decimals=3):
     return uniq_id
 
 
+from pyannote.core import Segment, Timeline
+def get_uem_object(uem_lines, uniq_id):
+    """
+    Generate pyannote timeline segments for uem file
+    
+     <UEM> file format
+     UNIQ_SPEAKER_ID CHANNEL START_TIME END_TIME
+     
+    Args:
+        uem_lines (list): list of session ID and start, end times.
+    """
+    timeline = Timeline(uri=uniq_id)
+    # lines = f.readlines()
+    for uem_stt_end in uem_lines:
+        # line = line.strip()
+        start_time, end_time = uem_stt_end 
+        timeline.add(Segment(float(start_time), float(end_time)))
+    return timeline
+
+
+
+
 def audio_rttm_map(manifest, attach_dur=False):
     """
     This function creates AUDIO_RTTM_MAP which is used by all diarization components to extract embeddings,
@@ -605,10 +627,7 @@ def get_selected_channel_embs(ms_emb_seq,
         selected_ss_mc_embs = torch.stack(merged_mono_scale_embs_list, dim=0)
     else:
         ms_cat_emb_seq = torch.stack(merged_mono_scale_embs_list, dim=0)
-        try:
-            selected_ss_mc_embs = ms_cat_emb_seq.reshape(ms_emb_seq.shape[0], ms_emb_seq.shape[1], ms_emb_seq.shape[2], ms_cat_emb_seq.shape[-1])
-        except:
-            import ipdb; ipdb.set_trace()
+        selected_ss_mc_embs = ms_cat_emb_seq.reshape(ms_emb_seq.shape[0], ms_emb_seq.shape[1], ms_emb_seq.shape[2], ms_cat_emb_seq.shape[-1])
     return selected_ss_mc_embs
 
 def perform_clustering_embs(
@@ -1305,10 +1324,13 @@ def get_subsegments(
     if slices == 1:
         if min(duration, window) >= min_subsegment_duration:
             subsegments.append([start, min(duration, window)])
-    else:
+    elif slices > 0: # What if slcies = 0 ?
         start_col = torch.arange(offset, slice_end, shift)[:slices]
         dur_col = window * torch.ones(slices)
-        dur_col[-1] = min(slice_end - start_col[-1], window)
+        try:
+            dur_col[-1] = min(slice_end - start_col[-1], window)
+        except:
+            import ipdb; ipdb.set_trace()
         dur_col = torch.round(dur_col, decimals=decimals)
         ss_tensor = torch.stack([start_col, dur_col], dim=1)
         for k in range(ss_tensor.shape[0]):
@@ -1717,11 +1739,9 @@ def get_adaptive_threshold(estimated_num_of_spks: int, min_threshold: float, ove
     )
     return adaptive_threshold
 
-def generate_speaker_timestamps_(
-    clus_labels: List[Union[float, int]], 
-    msdd_preds: List[torch.Tensor], 
-    timestamps, 
-    **params
+
+def generate_speaker_timestamps(
+    clus_labels: List[Union[float, int]], msdd_preds: List[torch.Tensor], **params
 ) -> Tuple[List[str], List[str]]:
     '''
     Generate speaker timestamps from the segmentation information. If `use_clus_as_main=True`, use clustering result for main speaker
@@ -1754,45 +1774,39 @@ def generate_speaker_timestamps_(
             Note that `ovl_labels` includes only overlapping speech that is not included in `maj_labels`.
             Example: [..., '152.495 152.745 speaker_1', '372.71 373.085 speaker_0', '554.97 555.885 speaker_1', ...]
     '''
-    if torch.isnan(msdd_preds).any():
-        raise ValueError("MSDD output `msdd_preds` contains NaN values. Please check the input data.")
     msdd_preds.squeeze(0)
     estimated_num_of_spks = msdd_preds.shape[-1]
     overlap_speaker_list = [[] for _ in range(estimated_num_of_spks)]
     infer_overlap = estimated_num_of_spks < int(params['overlap_infer_spk_limit'])
     main_speaker_lines = []
-
-    params['use_clus_as_main'] = True
-    infer_overlap = False
-    threshold = params['threshold']
+    if params['use_adaptive_thres']:
+        threshold = get_adaptive_threshold(
+            estimated_num_of_spks, params['threshold'], params['overlap_infer_spk_limit']
+        )
+    else:
+        threshold = params['threshold']
     for seg_idx, cluster_label in enumerate(clus_labels):
         msdd_preds.squeeze(0)
-        spk_for_seg = (msdd_preds[seg_idx] > threshold).int().cpu().numpy().tolist()
-        sm_for_seg = msdd_preds[seg_idx].cpu().numpy()
+        spk_for_seg = (msdd_preds[0, seg_idx] > threshold).int().cpu().numpy().tolist()
+        sm_for_seg = msdd_preds[0, seg_idx].cpu().numpy()
 
         if params['use_clus_as_main']:
-            main_spk_idx = int(cluster_label)
-            
+            main_spk_idx = int(cluster_label[2])
         else:
-            main_spk_idx = np.argsort(msdd_preds[seg_idx].cpu().numpy())[::-1][0]
+            main_spk_idx = np.argsort(msdd_preds[0, seg_idx].cpu().numpy())[::-1][0]
+
         if sum(spk_for_seg) > 1 and infer_overlap:
             idx_arr = np.argsort(sm_for_seg)[::-1]
             for ovl_spk_idx in idx_arr[: params['max_overlap_spks']].tolist():
                 if ovl_spk_idx != int(main_spk_idx):
                     overlap_speaker_list[ovl_spk_idx].append(seg_idx)
-        if params['use_clus_as_main']:
-            main_spk_idx = int(cluster_label)
-            main_speaker_lines.append(f"{timestamps[seg_idx][0]} {timestamps[seg_idx][1]} speaker_{main_spk_idx}")
-        elif sum(spk_for_seg) > 0 and cluster_label > -1:
-            main_spk_idx = np.argsort(msdd_preds[seg_idx].cpu().numpy())[::-1][0]
-            main_speaker_lines.append(f"{timestamps[seg_idx][0]} {timestamps[seg_idx][1]} speaker_{main_spk_idx}")
-            pass
+        main_speaker_lines.append(f"{cluster_label[0]} {cluster_label[1]} speaker_{main_spk_idx}")
     cont_stamps = get_contiguous_stamps(main_speaker_lines)
     maj_labels = merge_stamps(cont_stamps)
     ovl_labels = get_overlap_stamps(cont_stamps, overlap_speaker_list)
     return maj_labels, ovl_labels
 
-def generate_speaker_timestamps(
+def generate_speaker_timestamps_(
     clus_labels: List[Union[float, int]], 
     msdd_preds: List[torch.Tensor], 
     timestamps, 
@@ -2119,6 +2133,79 @@ def mixdown_msdd_preds(clus_labels, msdd_preds, time_stamps, offset, threshold, 
     return spk_ts
 
 def make_rttm_with_overlap(
+    manifest_file_path: str,
+    clus_label_dict: Dict[str, List[Union[float, int]]],
+    msdd_preds: List[torch.Tensor],
+    **params,
+):
+    """
+    Create RTTM files that include detected overlap speech. Note that the effect of overlap detection is only
+    notable when RTTM files are evaluated with `ignore_overlap=False` option.
+
+    Args:
+        manifest_file_path (str):
+            Path to the input manifest file.
+        clus_label_dict (dict):
+            Dictionary containing subsegment timestamps in float type and cluster labels in integer type.
+            Indexed by `uniq_id` string.
+        msdd_preds (list):
+            List containing tensors of the predicted sigmoid values.
+            Each tensor has shape of: (Session length, estimated number of speakers).
+        params:
+            Parameters for generating RTTM output and evaluation. Parameters include:
+                infer_overlap (bool): If False, overlap-speech will not be detected.
+            See docstrings of `generate_speaker_timestamps` function for other variables in `params`.
+
+    Returns:
+        all_hypothesis (list):
+            List containing Pyannote's `Annotation` objects that are created from hypothesis RTTM outputs.
+        all_reference
+            List containing Pyannote's `Annotation` objects that are created from ground-truth RTTM outputs
+    """
+    AUDIO_RTTM_MAP = audio_rttm_map(manifest_file_path)
+    manifest_file_lengths_list = []
+    all_hypothesis, all_reference, all_uems = [], [], []
+    no_references = False
+    with open(manifest_file_path, 'r', encoding='utf-8') as manifest:
+        for i, line in enumerate(manifest.readlines()):
+            manifest_dic = AUDIO_RTTM_MAP[uniq_id]
+            if 'uniq_id' in manifest_dic:
+                uniq_id = manifest_dic['uniq_id']
+            else:
+                uniq_id = get_uniq_id_from_manifest_line(line)
+                
+            clus_labels = clus_label_dict[uniq_id]
+            if 'offset' in manifest_dic and 'duration' in manifest_dic:
+                offset, dur = float(manifest_dic['offset']), float(manifest_dic['duration'])
+                uem_lines = [[offset, dur+offset]] 
+                uem_obj = get_uem_object(uem_lines, uniq_id=uniq_id)
+                all_uems.append(uem_obj)
+            else:
+                all_uems = None
+            # import ipdb; ipdb.set_trace()
+            manifest_file_lengths_list.append(len(clus_labels))
+            maj_labels, ovl_labels = generate_speaker_timestamps(clus_labels, msdd_preds[i], **params)
+            if params['infer_overlap']:
+                hyp_labels = maj_labels + ovl_labels
+            else:
+                hyp_labels = maj_labels
+            hypothesis = labels_to_pyannote_object(hyp_labels, uniq_name=uniq_id)
+            if params['out_rttm_dir']:
+                hyp_labels = sorted(hyp_labels, key=lambda x: float(x.split()[0]))
+                labels_to_rttmfile(hyp_labels, uniq_id, params['out_rttm_dir'])
+            all_hypothesis.append([uniq_id, hypothesis])
+            rttm_file = manifest_dic.get('rttm_filepath', None)
+            if rttm_file is not None and os.path.exists(rttm_file) and not no_references:
+                ref_labels = rttm_to_labels(rttm_file)
+                reference = labels_to_pyannote_object(ref_labels, uniq_name=uniq_id)
+                all_reference.append([uniq_id, reference])
+            else:
+                no_references = True
+                all_reference = []
+    return all_reference, all_hypothesis, all_uems 
+
+
+def _make_rttm_with_overlap(
     manifest_file_path: str,
     clus_label_dict: Dict[str, List[Union[float, int]]],
     preds_dict: Dict[str, torch.Tensor],

@@ -476,7 +476,7 @@ def cal_vad_onset_offset(
     return float(onset), float(offset)
 
 
-@torch.jit.script
+# @torch.jit.script
 def binarization(sequence: torch.Tensor, per_args: Dict[str, float]) -> torch.Tensor:
     """
     Binarize predictions to speech and non-speech
@@ -566,7 +566,7 @@ def get_gap_segments(segments: torch.Tensor) -> torch.Tensor:
     return torch.column_stack((segments[:-1, 1], segments[1:, 0]))
 
 
-@torch.jit.script
+# @torch.jit.script
 def filtering(speech_segments: torch.Tensor, per_args: Dict[str, float]) -> torch.Tensor:
 
     """

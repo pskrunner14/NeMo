@@ -32,6 +32,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from typing import List, Optional, Union, Dict 
 import itertools
+from dataclasses import dataclass
 
 from nemo.collections.asr.parts.preprocessing.perturb import process_augmentations
 
@@ -71,9 +72,12 @@ except ImportError:
         yield
 
 
+torch.backends.cudnn.enabled = False 
+
 __all__ = ['EncDecDiarLabelModel']
 
 from nemo.core.classes import Loss, Typing, typecheck
+
 
 def init_weights(m):
     if isinstance(m, nn.Linear):
@@ -888,7 +892,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         if self.cfg_e2e_diarizer_model.use_mock_embs:
             emb_seq = self.train_non_linear_transform_layer(audio_signal)
         else:
-            attn_weights = None
             ms_emb_seq = self.forward_encoder(
                 audio_signal=audio_signal, 
                 audio_signal_length=audio_signal_length,
@@ -987,7 +990,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         """
         if len(self.train_f1_acc_history) >= self.train_f1_acc_window_length:
             mean_f1 = torch.mean(torch.tensor(self.train_f1_acc_history), dim=0)
-            # print(f"Mean F1 score: {mean_f1}, thres: {self.train_f1_acc_thres_pil_shift}")
             if mean_f1 > self.train_f1_acc_thres_pil_shift:
                 return True
             else:
@@ -1342,12 +1344,11 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             preds_mean = preds_mid_all.mean(dim=0)
             # All mid-layer outputs + final layer output
             preds_list.append(_preds)
-            preds_all = torch.cat(preds_list)
+            self.preds_all = torch.cat(preds_list)
             targets_rep = targets_tr_loss.repeat(mid_layer_count+1,1,1)
             sequence_lengths_rep = sequence_lengths.repeat(mid_layer_count+1)
         else:
             preds_mean = preds
-        # import ipdb; ipdb.set_trace()
         preds_vad, preds_ovl, targets_vad, targets_ovl = self.compute_aux_f1(preds, targets_f1_score)
         self._accuracy_test_vad(preds_vad, targets_vad, sequence_lengths, cumulative=True)
         test_f1_vad = self._accuracy_test_vad.compute()
@@ -1360,40 +1361,37 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         self._accuracy_test_prdmean(preds_mean, targets_f1_score, sequence_lengths, cumulative=True)
         f1_acc_prdmean = self._accuracy_test_prdmean.compute()
         # if self.cfg_e2e_diarizer_model.get('save_tensor_images', False):
-        if True:
-            tags = f"f1acc{f1_acc:.4f}_bidx{batch_idx}"
-            tags = tags.replace('0.', '0p')
-            print(f"Saving tensor images with tags: {tags}")
-            # directory = '/home/taejinp/projects/sortformer_script/tensor_image/'
-            # directory = '/home/taejinp/projects/sortformer_script/tensor_image_v2/'
-            # directory = '/home/taejinp/projects/sortformer_script/tensor_image_model_v501/'
-            # directory_ex = '/home/taejinp/projects/sortformer_script/tensor_image_ch109/'
-            # directory_ex = None
-            # directory = self.cfg_e2e_diarizer_model.get('tensor_image_dir', directory_ex) 
-            directory = self._cfg.diarizer.get('out_dir', None)
-            if directory is None:
-                raise ValueError(f"No output directory specified for tensor image saving. Please set the `out_dir` in the config file.")
-            else:
-                print(f"Saving tensor images to directory: {directory}")
-            torch.save(preds, f'{directory}/preds_{tags}.pt')
-            torch.save(targets_f1_score, f'{directory}/targets_{tags}.pt')
+        #     tags = f"f1acc{f1_acc:.4f}_bidx{batch_idx}".replace('0.', '0p')
+        #     print(f"Saving tensor images with tags: {tags}")
+        #     directory = self._cfg.diarizer.get('out_dir', None)
+        #     if directory is None:
+        #         raise ValueError(f"No output directory specified for tensor image saving. Please set the `out_dir` in the config file.")
+        #     else:
+        #         print(f"Saving tensor images to directory: {directory}")
+        #     torch.save(preds, f'{directory}/preds_{tags}.pt')
+        #     torch.save(targets_f1_score, f'{directory}/targets_{tags}.pt')
         self.max_f1_acc = max(self.max_f1_acc, f1_acc)
         batch_score_dict = {"f1_acc": f1_acc, "f1_toplyr_acc": f1_acc_toplyr, "f1_prdmean_acc": f1_acc_prdmean, "f1_vad_acc": test_f1_vad, "f1_ovl_acc": test_f1_ovl}
         cum_score_dict = self._cumulative_test_set_eval(score_dict=batch_score_dict, batch_idx=batch_idx, sample_count=len(sequence_lengths))
         print(cum_score_dict)
-        return preds_all
+        return self.preds_all
     
     def test_batch(self,):
-        for batch in tqdm(self._test_dl): 
+        self.preds_total_list = []
+        self.batch_f1_accs_list = []
+        for batch_idx, batch in enumerate(tqdm(self._test_dl)):
             if self.cfg_e2e_diarizer_model.use_mock_embs:
                 audio_signal, audio_signal_length, targets = batch 
             else: # In this case, audio_signal is emb_seed
                 audio_signal, audio_signal_length, ms_seg_timestamps, ms_seg_counts, clus_label_index, scale_mapping, ch_clus_mat, targets, global_spk_labels = batch
+            audio_signal = audio_signal.to(self.device)
+            audio_signal_length = audio_signal_length.to(self.device)
             batch_size = audio_signal.shape[0]
             ms_seg_counts = self.ms_seg_counts.unsqueeze(0).repeat(batch_size, 1).to(audio_signal.device)
             ms_seg_timestamps = self.ms_seg_timestamps.unsqueeze(0).repeat(batch_size, 1, 1, 1).to(audio_signal.device)
-            scale_mapping = self.scale_mapping.unsqueeze(0).repeat(batch_size, 1, 1)
-            sequence_lengths = torch.tensor([x[-1] for x in ms_seg_counts])
+            scale_mapping = self.scale_mapping.unsqueeze(0).repeat(batch_size, 1, 1).to(audio_signal.device)
+            sequence_lengths = torch.tensor([x[-1] for x in ms_seg_counts]).to(audio_signal.device)
+            # targets = targets.to(self.device)
             self.validation_mode = True
             preds, _preds, attn_score_stack, preds_list, encoder_states_list = self.forward(
                 audio_signal=audio_signal,
@@ -1402,6 +1400,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
                 ms_seg_counts=ms_seg_counts,
                 scale_mapping=scale_mapping,
             )
+            preds, _preds, attn_score_stack = preds.detach().to('cpu'), _preds.detach().to('cpu'), attn_score_stack.detach().to('cpu')
+            preds_list = [x.detach().to('cpu') for x in preds_list]
+            encoder_states_list = [x.detach().to('cpu') for x in encoder_states_list]
             if self.loss.sorted_loss:
                 # Perform arrival-time sorting (ATS)
                 targets_ats = self.sort_probs_and_labels(targets.clone(), discrete=True)
@@ -1430,26 +1431,38 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
                 # All mid-layer outputs + final layer output
                 preds_list.append(_preds)
                 preds_all = torch.cat(preds_list)
-                targets_rep = targets_tr_loss.repeat(mid_layer_count+1,1,1)
-                sequence_lengths_rep = sequence_lengths.repeat(mid_layer_count+1)
-                loss = self.loss(probs=preds_all, labels=targets_rep, signal_lengths=sequence_lengths_rep)/(mid_layer_count+1)
             else:
-                loss = self.loss(probs=preds, labels=targets_tr_loss, signal_lengths=sequence_lengths)  
                 preds_mean = preds
+            self.preds_total_list.append(preds)
             # self._reset_test_f1_accs()
             preds_vad, preds_ovl, targets_vad, targets_ovl = self.compute_aux_f1(preds, targets_f1_score)
-            self._accuracy_test_vad(preds_vad, targets_vad, sequence_lengths)
-            test_f1_vad = self._accuracy_test_vad.compute()
-            self._accuracy_test_ovl(preds_ovl, targets_ovl, sequence_lengths)
-            test_f1_ovl = self._accuracy_test_ovl.compute()
+            # self._accuracy_test_vad(preds_vad, targets_vad, sequence_lengths)
+            # test_f1_vad = self._accuracy_test_vad.compute()
+            # self._accuracy_test_ovl(preds_ovl, targets_ovl, sequence_lengths)
+            # test_f1_ovl = self._accuracy_test_ovl.compute()
             self._accuracy_valid(preds, targets_f1_score, sequence_lengths)
             f1_acc = self._accuracy_valid.compute()
-            self._accuracy_test_toplyr(_preds, targets_f1_score, sequence_lengths)
-            f1_acc_toplyr = self._accuracy_test_toplyr.compute()
-            self._accuracy_test_prdmean(preds_mean, targets_f1_score, sequence_lengths)
-            f1_acc_prdmean = self._accuracy_test_prdmean.compute()
-
-        
+            self.batch_f1_accs_list.append(f1_acc)
+            # self._accuracy_test_toplyr(_preds, targets_f1_score, sequence_lengths)
+            # f1_acc_toplyr = self._accuracy_test_toplyr.compute()
+            # self._accuracy_test_prdmean(preds_mean, targets_f1_score, sequence_lengths)
+            # f1_acc_prdmean = self._accuracy_test_prdmean.compute()
+            # if self.cfg_e2e_diarizer_model.get('save_tensor_images', False):
+            if True:
+                for pred_idx in range(preds.shape[0]):
+                    global_index = batch_idx * self._test_dl.batch_size + pred_idx
+                    uniq_id = self._test_dl.dataset.collection[global_index][1]
+                    tags = f"{uniq_id}-bid{batch_idx}-sid{pred_idx}"
+                    print(f"Batch F1Acc. {f1_acc:.4f}_Saving tensor images with tags: {tags}")
+                    directory = self._cfg.diarizer.get('out_dir', None)
+                    if directory is None:
+                        raise ValueError(f"No output directory specified for tensor image saving. Please set the `out_dir` in the config file.")
+                    else:
+                        print(f"Saving tensor images to directory: {directory}")
+                    torch.save(preds[pred_idx], f'{directory}/preds_{tags}.pt')
+                    torch.save(targets_f1_score[pred_idx], f'{directory}/targets_{tags}.pt')
+        print(f"Batch F1Acc. MEAN: {torch.mean(torch.tensor(self.batch_f1_accs_list))}") 
+        self.preds_total = torch.vstack(self.preds_total_list) 
     def diarize(self,):
         pass
 

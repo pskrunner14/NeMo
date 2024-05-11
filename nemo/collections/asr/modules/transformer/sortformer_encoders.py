@@ -226,17 +226,6 @@ class SortformerEncoderBlock(nn.Module):
         # import ipdb; ipdb.set_trace()
         return torch.nn.functional.normalize(sorted_output_states, p=2, dim=-1)
 
-    def arrival_time_sort(self, sorted_output_states):
-        eps = 1e-5
-        # max_normed_states = sorted_output_states/torch.abs(sorted_output_states).max()
-        # softmax_states = torch.softmax(max_normed_states+eps, dim=-1)
-        ats_sorted_softmax_states = self.sort_probs_and_labels(sorted_output_states, discrete=False)
-        # binary_states = max_normed_states.sign()
-        # bs, seq_dim, short_dim = sorted_output_states.shape
-        # offsets = torch.linspace(1, seq_dim, steps=seq_dim).to(log_sm.device).unsqueeze(0).unsqueeze(2).repeat((bs,1,short_dim))
-        # offset_log_sm = log_sm + offsets
-        return ats_sorted_output_states
-   
     def find_first_nonzero(self, mat, max_cap_val=-1):
         non_zero_mask = mat != 0
         mask_max_values, mask_max_indices = torch.max(non_zero_mask, dim=1)
@@ -257,30 +246,6 @@ class SortformerEncoderBlock(nn.Module):
         output_states = self.layer_norm_2(output_states)
 
         return output_states 
-    
-    # def __sort_probs_and_labels(self, labels, discrete=True, thres=0.5):
-    #     """
-    #     Sorts probs and labels in descending order of signal_lengths.
-    #     """
-    #     max_cap_val = labels.shape[1] + 1 
-    #     if not discrete:
-    #         labels_discrete = torch.zeros_like(labels).to(labels.device)
-    #         # mean = torch.mean(labels, dim=(1,2)).detach()
-    #         # median_repeat = mean.unsqueeze(1).unsqueeze(1).repeat(1, labels.shape[1], labels.shape[2])
-    #         # thres = 0.5
-    #         # thres = torch.mean(labels, dim=(1,2)).detach()
-    #         thres = torch.mean(labels).detach()
-    #         labels_discrete[labels > thres] = 1
-    #         # labels = labels_discrete
-    #     else:
-    #         labels_discrete = labels
-        
-    #     label_fz = self.find_first_nonzero(labels_discrete, max_cap_val)
-    #     label_fz[label_fz == -1] = max_cap_val 
-    #     sorted_inds = torch.sort(label_fz)[1]
-    #     sorted_labels = labels.transpose(0,1)[:, torch.arange(labels.shape[0]).unsqueeze(1), sorted_inds].transpose(0, 1)
-    #     # verify_sorted_labels = self.find_first_nonzero(sorted_labels, max_cap_val)
-    #     return sorted_labels
     
     def sort_probs_and_labels(self, labels, discrete=True, thres=0.5):
         """
@@ -334,8 +299,6 @@ class SortformerEncoderBlock(nn.Module):
             output_states = self.third_sub_layer(preds) + self.p2_norm(output_states_2nd)
         else:
             output_states = output_states_2nd
-        # output_states = output_states_2nd + output_states_3rd
-        # output_states = self.third_sub_layer(sorted_output_states_short) + output_states_2nd
         output_states = self.layer_norm_2(output_states)
         return output_states, attn_score_mat, preds
     

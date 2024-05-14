@@ -803,7 +803,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         mask = row_vector < length_matrix
         return mask.float().to(context_embs.device)
 
-    def forward_infer(self, emb_seq):
+    def forward_infer(self, emb_seq, memory_sort=True):
         """
 
         Args:
@@ -912,9 +912,88 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
                 raise ValueError(f"Unknown multi-scale method: {self.cfg_e2e_diarizer_model.get('multi_scale_method', None)}")
             
         # Step 3: SortFormer Diarization Inference
-        preds, _preds, attn_score_stack, preds_list, encoder_states_list = self.forward_infer(emb_seq)
+        memory_sort = False
+        if memory_sort:
+            unit_infer_step = 240
+            total_pred_list = []
+            memory_buff, memory_label = None, None
+            for step_idx in tqdm(range(0, torch.ceil(torch.tensor(emb_seq.shape[1]/unit_infer_step)).int().item()), desc="memory and steps diar", leave=False):
+                chunk_emb_seq = emb_seq[:, step_idx*unit_infer_step:(step_idx+1)*unit_infer_step, :]
+                if step_idx > 0:
+                    new_context_embs = torch.cat([memory_buff, chunk_emb_seq], dim=1)
+                else:
+                    new_context_embs = chunk_emb_seq
+                preds_mem_new, _preds, attn_score_stack, preds_list, encoder_states_list = self.forward_infer(new_context_embs, memory_sort=memory_sort)
+                if step_idx == 0:
+                    total_pred_list.append(preds_mem_new)
+                else:
+                    total_pred_list.append(preds_mem_new[:, unit_infer_step:])
+                preds_mem_new_binary = preds_mem_new.round() 
+                memory_buff, memory_label = self._process_memory_sort(step_idx, chunk_emb_seq, prev_preds=preds_mem_new_binary, memory_buff=memory_buff, memory_label=memory_label)
+            preds = torch.cat(total_pred_list, dim=1)
+        else:
+            preds, _preds, attn_score_stack, preds_list, encoder_states_list = self.forward_infer(emb_seq, memory_sort=memory_sort)
         return preds, _preds, attn_score_stack, preds_list, encoder_states_list
     
+    def _process_memory_sort(self, step_idx, chunk_emb_seq, prev_preds, memory_buff, memory_label, eps=1e-6):
+        """
+        trans_mat:
+            Dimension: (batch_size, unit_infer_step, unit_infer_step)
+            
+        Args:
+            chunk_emb_seq:
+                Dimension: (batch_size, unit_infer_step, emb_dim)
+            prev_preds:
+                Dimension: (batch_size, max_spks, unit_infer_step)
+            memory_buff:
+                Dimension: (batch_size, mem_len, emb_dim)
+            memory_label:
+                Dimension: (batch_size, max_spks, mem_len)
+        """
+        batch_size, max_spks, emb_dim = prev_preds.shape[0], prev_preds.shape[-1], chunk_emb_seq.shape[-1]
+        step_len = chunk_emb_seq.shape[1]
+        mem_len = step_len if step_idx == 0 else memory_label.shape[1]
+        mem_size_per_spk = int(mem_len // max_spks)
+        if step_idx == 0:
+            new_memory_buff = chunk_emb_seq # [bs, step_len, emb_dim]
+            memory_label = prev_preds # [step_len]
+        else:
+            new_preds = prev_preds[:, mem_len:, :] # [bs, max_spks, step_len]
+            # Prepare repeated new_pred labels
+            memory_labels_diags = torch.diag_embed(memory_label.transpose(1,2)) # [bs, max_spks, step_len, step_len]
+            bsspk_flat_mem_labels_diags = memory_labels_diags.view(batch_size * max_spks, mem_len, mem_len)  # [bs*max_spks, step_len, step_len]
+            
+            # Prepare repeated mem_and_new_labels
+            mem_and_new_labels = torch.cat([memory_label, new_preds], dim=1) # [bs, (mem_len + step_len), max_spks]
+            mem_and_new_labels_diags= torch.diag_embed(mem_and_new_labels.transpose(1,2)) # [bs, max_spks, step_len, step_len]
+            bsspk_flat_mem_and_new_labels_diags = mem_and_new_labels_diags.view(batch_size * max_spks, (step_len+mem_len), (step_len+mem_len))  # [bs*max_spks, step_len, step_len]
+            
+            # Prepare repeated memory_buff embeddings
+            mem_and_new = torch.cat([memory_buff, chunk_emb_seq], dim=1) # [bs, (step_len + step_ln), step_len]
+            spkrep_mem_and_new = mem_and_new.unsqueeze(1).repeat(1, max_spks, 1, 1).view(batch_size * max_spks, mem_len + step_len, emb_dim)  # [bs * max_spks, step_len, emb_dim]
+            spkrep_memory_buff = memory_buff.unsqueeze(1).repeat(1, max_spks, 1, 1).view(batch_size * max_spks, mem_len, emb_dim)  # [bs * max_spks, step_len, emb_dim]
+            
+            bsspk_masked_mem_and_new_embs = torch.bmm(bsspk_flat_mem_and_new_labels_diags, spkrep_mem_and_new) # [max_spks, (mem_len + step_len), emb_dim]
+            bsspk_masked_mem_embs = torch.bmm(bsspk_flat_mem_labels_diags, spkrep_memory_buff) # [max_spks, mem_len, emb_dim]
+            
+            # Attention matrix calculation 
+            batch_attention = torch.bmm(bsspk_masked_mem_embs, bsspk_masked_mem_and_new_embs.transpose(1,2)) # [max_spks, mem_len, (step_len+mem_len)]
+            bin_norm_coeff = (batch_attention.max(dim=2)[0]).unsqueeze(2).repeat(1, 1, (step_len+mem_len)) # [max_spks, mem_len, (step_len+mem_len)]
+            bsspk_normed_batch_attention = batch_attention/(bin_norm_coeff + eps) # [max_spks, mem_len, (step_len+mem_len)]
+            
+            eye_repeated = torch.eye(max_spks).repeat_interleave((step_len+mem_len), dim=1).reshape(max_spks, max_spks, (step_len+mem_len)) # [max_spks, max_spks, (step_len+mem_len)]
+            attn_mask_for_spk = eye_repeated.repeat_interleave(mem_size_per_spk, dim=1).unsqueeze(0).repeat(batch_size, 1,1,1).to(chunk_emb_seq.device) # [bs, max_spks, step_len, (step_len+mem_len)]
+            bsspk_normed_masked_batch_attention = attn_mask_for_spk.reshape(batch_size*max_spks, mem_len, (step_len+mem_len)) * bsspk_normed_batch_attention # [bs, mem_len, (step_len+mem_len)]
+            spk_rep_mem_and_new_embs = mem_and_new.unsqueeze(1).repeat(1, max_spks, 1, 1).reshape(batch_size*max_spks, (step_len+mem_len), emb_dim) # [max_spks, mem_len + step_len, emb_dim]
+            new_memory_buff_perspk = torch.bmm(bsspk_normed_masked_batch_attention, spk_rep_mem_and_new_embs).reshape(batch_size, max_spks, mem_len, emb_dim) # [bs, max_spks, mem_len, emb_dim]
+            new_memory_buff = new_memory_buff_perspk.sum(dim=1) # [bs, mem_len, emb_dim]
+            memory_label = torch.eye(max_spks).repeat_interleave(mem_size_per_spk, dim=0).unsqueeze(0).repeat(batch_size, 1, 1).to(chunk_emb_seq.device) # [bs, mem_len, emb_dim]
+        return new_memory_buff, memory_label
+    
+    def __init_memory_buff(self, chunk_emb_seq, max_spks):
+        for spk_idx in range(max_spks):
+            pass
+         
     def find_first_nonzero(self, mat, max_cap_val=-1):
         # non zero values mask
         non_zero_mask = mat != 0
@@ -1401,7 +1480,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
                 scale_mapping=scale_mapping,
             )
             preds, _preds, attn_score_stack = preds.detach().to('cpu'), _preds.detach().to('cpu'), attn_score_stack.detach().to('cpu')
-            preds_list = [x.detach().to('cpu') for x in preds_list]
+            # preds_list = [x.detach().to('cpu') for x in preds_list]
             encoder_states_list = [x.detach().to('cpu') for x in encoder_states_list]
             if self.loss.sorted_loss:
                 # Perform arrival-time sorting (ATS)
@@ -1422,17 +1501,17 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
                 else:
                     targets_tr_loss = targets_ats
             # spk_loss = self.loss(probs=preds, labels=targets, signal_lengths=sequence_lengths)
-            mid_layer_count = len(preds_list)
-            if mid_layer_count > 0:
-                # Only mid-layer outputs 
-                preds_mid_all = torch.cat(preds_list).reshape(-1, *preds.shape)
-                torch.cat(preds_list).reshape(-1, *preds.shape)
-                preds_mean = preds_mid_all.mean(dim=0)
-                # All mid-layer outputs + final layer output
-                preds_list.append(_preds)
-                preds_all = torch.cat(preds_list)
-            else:
-                preds_mean = preds
+            # mid_layer_count = len(preds_list)
+            # if mid_layer_count > 0:
+            #     # Only mid-layer outputs 
+            #     preds_mid_all = torch.cat(preds_list).reshape(-1, *preds.shape)
+            #     torch.cat(preds_list).reshape(-1, *preds.shape)
+            #     preds_mean = preds_mid_all.mean(dim=0)
+            #     # All mid-layer outputs + final layer output
+            #     preds_list.append(_preds)
+            #     preds_all = torch.cat(preds_list)
+            # else:
+            preds_mean = preds
             self.preds_total_list.append(preds)
             # self._reset_test_f1_accs()
             preds_vad, preds_ovl, targets_vad, targets_ovl = self.compute_aux_f1(preds, targets_f1_score)

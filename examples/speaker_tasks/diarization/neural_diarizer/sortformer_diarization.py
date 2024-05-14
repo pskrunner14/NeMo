@@ -232,7 +232,6 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig]:
         accelerator = 'gpu'
         map_location = torch.device(f'cuda:{cfg.cuda}')
 
-
     diar_model = SortformerEncLabelModel.load_from_checkpoint(checkpoint_path=cfg.model_path, map_location=map_location)
     diar_model._cfg.diarizer.out_dir = cfg.tensor_image_dir
     diar_model._cfg.test_ds.session_len_sec = cfg.session_len_sec

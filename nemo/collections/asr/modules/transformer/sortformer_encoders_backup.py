@@ -435,11 +435,24 @@ class SortformerEncoder(nn.Module):
             memory_states = encoder_states
         return memory_states
 
-    def forward_memory(self, encoder_states, encoder_mask, encoder_mems_list=None, return_mems=False, memory_sort=False):
+    def forward(self, encoder_states, encoder_mask, encoder_mems_list=None, return_mems=False):
+        """
+        Args:
+            encoder_states: output of the embedding_layer (B x L_enc x H)
+            encoder_mask: encoder inputs mask (B x L_enc)
+            encoder_mems_list: list of the cached encoder hidden states
+                for fast autoregressive generation which will be used instead
+                of encoder_states as keys and values if not None
+            return_mems: bool, whether to return outputs of all encoder layers
+                or the last layer only
+        """
+
         encoder_attn_mask = form_attention_mask(encoder_mask, self.diag)
+
         memory_states = self._get_memory_states(encoder_states, encoder_mems_list, 0)
         cached_mems_list = [memory_states]
         attn_score_mat_list, encoder_states_list, preds_list = [], [], []
+        
         for i, layer in enumerate(self.layers):
             encoder_states, attn_score_mat, preds = layer(encoder_states, encoder_attn_mask, memory_states)
             attn_score_mat_list.append(attn_score_mat)
@@ -451,42 +464,12 @@ class SortformerEncoder(nn.Module):
         preds_layers = torch.stack(preds_list, dim=0)
         preds_mean = torch.mean(preds_layers, dim=0)
         
-        return cached_mems_list[-1], attn_score_mat_list, preds_list, preds_mean, encoder_states_list
-    
-    def forward(self, encoder_states, encoder_mask, encoder_mems_list=None, return_mems=False, memory_sort=False):
-        """
-        Args:
-            encoder_states: output of the embedding_layer (B x L_enc x H)
-            encoder_mask: encoder inputs mask (B x L_enc)
-            encoder_mems_list: list of the cached encoder hidden states
-                for fast autoregressive generation which will be used instead
-                of encoder_states as keys and values if not None
-            return_mems: bool, whether to return outputs of all encoder layers
-                or the last layer only
-        """
-        if memory_sort:
-            self.forward_memory(encoder_states, encoder_mask, encoder_mems_list, return_mems=False)
+        if self.final_layer_norm is not None:
+            encoder_states = self.final_layer_norm(encoder_states)
+            memory_states = self._get_memory_states(encoder_states, encoder_mems_list, i + 1)
+            cached_mems_list.append(memory_states)
+
+        if return_mems:
+            return cached_mems_list, attn_score_mat_list, preds_list, preds_mean, encoder_states_list
         else:
-            encoder_attn_mask = form_attention_mask(encoder_mask, self.diag)
-            memory_states = self._get_memory_states(encoder_states, encoder_mems_list, 0)
-            cached_mems_list = [memory_states]
-            attn_score_mat_list, encoder_states_list, preds_list = [], [], []
-            for i, layer in enumerate(self.layers):
-                encoder_states, attn_score_mat, preds = layer(encoder_states, encoder_attn_mask, memory_states)
-                attn_score_mat_list.append(attn_score_mat)
-                preds_list.append(preds)
-                memory_states = self._get_memory_states(encoder_states, encoder_mems_list, i + 1)
-                cached_mems_list.append(memory_states)
-                encoder_states_list.append(encoder_states)
-                
-            preds_layers = torch.stack(preds_list, dim=0)
-            preds_mean = torch.mean(preds_layers, dim=0)
-            
-            if self.final_layer_norm is not None:
-                encoder_states = self.final_layer_norm(encoder_states)
-                memory_states = self._get_memory_states(encoder_states, encoder_mems_list, i + 1)
-                cached_mems_list.append(memory_states)
-            if return_mems:
-                return cached_mems_list, attn_score_mat_list, preds_list, preds_mean, encoder_states_list
-            else:
-                return cached_mems_list[-1], attn_score_mat_list, preds_list, preds_mean, encoder_states_list
+            return cached_mems_list[-1], attn_score_mat_list, preds_list, preds_mean, encoder_states_list

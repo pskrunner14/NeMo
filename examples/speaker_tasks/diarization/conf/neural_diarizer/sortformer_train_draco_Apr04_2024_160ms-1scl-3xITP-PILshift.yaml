@@ -52,7 +52,6 @@ model:
   train_f1_acc_window_length: 25
   train_f1_acc_thres_pil_shift: 0.0
 
-
   train_ds:
     manifest_filepath: ???
     emb_dir: ???
@@ -69,6 +68,7 @@ model:
     mock_emb_noise_std: ${model.mock_emb_noise_std}
     mock_emb_degree_of_freedom: 8
     validation_mode: False
+  
   validation_ds:
     manifest_filepath: ???
     emb_dir: ???

@@ -993,13 +993,25 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
             self._init_spk_model()
 
             # layer normalization, ln, l2, or None
-            if 'norm' in cfg:
-                if cfg.norm == 'ln':
-                    self.asr_norm = torch.nn.LayerNorm(cfg.model_defaults.asr_enc_hidden)
-                    self.spk_norm = torch.nn.LayerNorm(cfg.model_defaults.emb_size)
-                self.norm = cfg.norm
+            self.norm = cfg.norm if 'norm' in cfg else 'ln'
+            logging.info('self.norm: ', self.norm)
+            if self.norm == 'ln':
+                logging.info('Feature nomalization: Layer Norm')
+                self.asr_norm = torch.nn.LayerNorm(cfg.model_defaults.asr_enc_hidden)
+                self.spk_norm = torch.nn.LayerNorm(cfg.model_defaults.emb_size)
+            elif self.norm == 'l2':
+                logging.info('Feature nomalization: L2 Norm')
             else:
-                self.norm = None
+                self.asr_norm = torch.nn.Identity()
+                self.spk_norm = torch.nn.Identity()
+                logging.info('Feature nomalization: None')
+
+            if 'drop_enc' in cfg:
+                logging.info('ASR encoder dropout: ', cfg.drop_enc)
+                self.drop_enc = torch.nn.Dropout(cfg.drop_enc) 
+            else:
+                logging.info('ASR encoder dropout: 0.0')
+                self.drop_enc = torch.nn.Identity()
 
             # projection layer
             proj_in_size = cfg.model_defaults.emb_size + cfg.model_defaults.asr_enc_hidden
@@ -1019,6 +1031,7 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
                 self.segment_shift = cfg.segment_shift
             else:
                 self.segment_shift = 8
+            logging.info('segment_length: ', self.segment_length, 'segment_shift: ', self.segment_shift)
         else:
             self.spk = False
 
@@ -1253,6 +1266,8 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
 
             if spk_enc_states.shape[1] > asr_enc_states.shape[1]:
                 spk_enc_states = spk_enc_states[:, :asr_enc_states.shape[1], :]
+            
+            asr_enc_states = self.drop_enc(asr_enc_states)
 
             concat_enc_states = torch.cat([asr_enc_states, spk_enc_states], dim=-1)
             enc_states = self.joint_proj(concat_enc_states)

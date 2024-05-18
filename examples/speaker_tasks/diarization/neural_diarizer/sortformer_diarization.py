@@ -11,6 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""
+
+python $BASEPATH/neural_diarizer/sortformer_diarization.py \
+    model_path=/path/to/sortformer_model.nemo \
+    batch_size=4 \
+    session_len_sec=600 \
+    interpolated_scale=0.16 \
+    save_tensor_images=True \
+    tensor_image_dir=/path/to/tensor_image_dir \
+    dataset_manifest=/path/to/diarization_path_to_manifest.json
+
+"""
+
+
 
 import pytorch_lightning as pl
 from omegaconf import OmegaConf
@@ -18,20 +32,12 @@ from pytorch_lightning import seed_everything
 
 from nemo.collections.asr.models import SortformerEncLabelModel
 from nemo.core.config import hydra_runner
-from nemo.utils import logging
-from nemo.utils.exp_manager import exp_manager
-
 from nemo.collections.asr.metrics.der import score_labels
 
-import contextlib
-import glob
-import json
 import os
-from tqdm import tqdm
 
 from dataclasses import dataclass, is_dataclass
-from tempfile import NamedTemporaryFile
-from typing import List, Optional, Union
+from typing import Optional, Union
 
 from pyannote.core import Segment, Timeline
 from nemo.collections.asr.parts.utils.vad_utils import binarization, filtering
@@ -48,10 +54,8 @@ is_overlap,
 
 import pytorch_lightning as pl
 import torch
-from omegaconf import OmegaConf, open_dict
-from nemo.collections.asr.modules.conformer_encoder import ConformerChangeConfig
+from omegaconf import OmegaConf
 from nemo.core.config import hydra_runner
-from nemo.utils import logging
 """
 Example of end-to-end diarization inference 
 """
@@ -59,15 +63,7 @@ Example of end-to-end diarization inference
 seed_everything(42)
 
 @dataclass
-class ModelChangeConfig:
-
-    # Sub-config for changes specific to the Conformer Encoder
-    conformer: ConformerChangeConfig = ConformerChangeConfig()
-
-
-
-@dataclass
-class TranscriptionConfig:
+class DiarizationConfig:
     # Required configs
     model_path: Optional[str] = None  # Path to a .nemo file
     pretrained_name: Optional[str] = None  # Name of a pretrained model
@@ -141,7 +137,6 @@ def timestamps_to_pyannote_object(timestamps, cluster_labels, uniq_id, audio_rtt
         all_reference.append([uniq_id, reference])
     return all_hypothesis, all_reference, all_uems
 
-# @hydra_runner(config_name="VadParams", schema=VadParams)
 def ts_vad_post_processing(ts_vad_binary_vec, cfg_vad_params, hop_length: int=8):
     ts_vad_binary_frames = torch.repeat_interleave(ts_vad_binary_vec, hop_length)
     speech_segments = binarization(ts_vad_binary_frames, cfg_vad_params)
@@ -159,9 +154,7 @@ def get_uem_object(uem_lines, uniq_id):
         uem_lines (list): list of session ID and start, end times.
     """
     timeline = Timeline(uri=uniq_id)
-    # lines = f.readlines()
     for uem_stt_end in uem_lines:
-        # line = line.strip()
         start_time, end_time = uem_stt_end 
         timeline.add(Segment(float(start_time), float(end_time)))
     return timeline
@@ -174,7 +167,7 @@ def convert_pred_mat_to_segments(
     hop_length:int = 5
     ):
     batch_pred_ts_segs, all_hypothesis, all_reference, all_uems = [], [], [], []
-    thres_offset = {0: 0.0, 1: 0, 2: 0, 3: 0}
+    thres_offset = {0: 0, 1: 0, 2: 0, 3: 0}
     for sample_idx, (uniq_id, audio_rttm_values) in enumerate(audio_rttm_map_dict.items()):
         spk_ts, timestamps, cluster_labels = [], [], []
         speaker_assign_mat = batch_preds[sample_idx]
@@ -194,9 +187,8 @@ def convert_pred_mat_to_segments(
 
 
 
-@hydra_runner(config_name="TranscriptionConfig", schema=TranscriptionConfig)
-def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig]:
-    # logging.info(f'Hydra config: {OmegaConf.to_yaml(cfg)}')
+@hydra_runner(config_name="DiarizationConfig", schema=DiarizationConfig)
+def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
 
     for key in cfg:
         cfg[key] = None if cfg[key] == 'None' else cfg[key]
@@ -251,9 +243,16 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig]:
     diar_model.test_batch()
     
     # Evaluation
-    output_list, all_hyps, all_refs, all_uems = convert_pred_mat_to_segments(infer_audio_rttm_dict, batch_preds=diar_model.preds_total, offset=0, hop_length=5)
-    metric, mapping_dict, itemized_errors = score_labels(AUDIO_RTTM_MAP=infer_audio_rttm_dict, all_reference=all_refs, all_hypothesis=all_hyps, all_uem=all_uems, collar=0.25, ignore_overlap=False)
+    output_list, all_hyps, all_refs, all_uems = convert_pred_mat_to_segments(infer_audio_rttm_dict, 
+                                                                             batch_preds=diar_model.preds_total, 
+                                                                             offset=0, 
+                                                                             hop_length=5)
+    metric, mapping_dict, itemized_errors = score_labels(AUDIO_RTTM_MAP=infer_audio_rttm_dict, 
+                                                         all_reference=all_refs, 
+                                                         all_hypothesis=all_hyps, 
+                                                         all_uem=all_uems, 
+                                                         collar=0.25, 
+                                                         ignore_overlap=False)
 
 if __name__ == '__main__':
-    
     main()

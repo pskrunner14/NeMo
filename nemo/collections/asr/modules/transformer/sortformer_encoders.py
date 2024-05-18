@@ -18,13 +18,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.functional import gelu
-
-from nemo.collections.asr.modules.transformer.transformer_modules import MultiHeadAttention, PositionWiseFF
+from nemo.collections.asr.modules.transformer.transformer_modules import PositionWiseFF
 from nemo.collections.common.parts import form_attention_mask
 import math
-
-import numpy as np
-from nemo.utils import logging
 
 __all__ = ["SortformerEncoder"]
 

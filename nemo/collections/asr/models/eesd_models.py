@@ -19,6 +19,7 @@ from pathlib import Path
 from statistics import mode
 from typing import Any, Dict, List, Optional, Tuple, Union
 from operator import attrgetter
+from torch import Tensor
 
 import time
 import torch
@@ -332,28 +333,12 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             self.add_speaker_model_config(cfg)
             self.loss = instantiate(self.cfg_e2e_diarizer_model.loss)
             self.affinity_loss = instantiate(self.cfg_e2e_diarizer_model.affinity_loss) 
-            self.power_p_aff = self.cfg_e2e_diarizer_model.get('power_p_aff', 3)
-            self.thres_aff = self.cfg_e2e_diarizer_model.get('thres_aff', 0.25)
-            self.mc_audio_normalize = self.cfg_e2e_diarizer_model.get('mc_audio_normalize', True)
-            self.power_p = self.cfg_e2e_diarizer_model.get('power_p', 2)
-            self.mix_count = self.cfg_e2e_diarizer_model.get('mix_count', 3)
-            self.multichannel_mixing = self.cfg_e2e_diarizer_model.get('multichannel_mixing', True)
         else:
             self._init_speaker_model()
             self.loss = instantiate(self.cfg_e2e_diarizer_model.loss)
             self.multichannel_mixing = self.cfg_e2e_diarizer_model.get('multichannel_mixing', True)
         self.alpha = self.cfg_e2e_diarizer_model.alpha
         self.affinity_weighting = self.cfg_e2e_diarizer_model.get('affinity_weighting', True)
-        self.msdd_overlap_add = self.cfg_e2e_diarizer_model.get("msdd_overlap_add", True)
-        self.use_1ch_from_ch_clus = self.cfg_e2e_diarizer_model.get("use_1ch_from_ch_clus", True)
-        if self.cfg_e2e_diarizer_model.get("multichannel", None) is not None:
-            self.power_p=self.cfg_e2e_diarizer_model.multichannel.parameters.get("power_p", 4)
-            self.mix_count=self.cfg_e2e_diarizer_model.multichannel.parameters.get("mix_count", 2) 
-        else:
-            self.power_p=4
-            self.mix_count=2
-        
-        # Call `self.save_hyperparameters` in modelPT.py again since cfg should contain speaker model's config.
         self.save_hyperparameters("cfg")
 
         self._accuracy_test = MultiBinaryAccuracy()
@@ -443,7 +428,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
                         new_group[k] = v
                     param_groups.append(new_group)
                 else:
-                    raise ValueError(f"{group} does not have parameters.")
+                    raise ValueError(f"{group_levels} does not have parameters.")
 
             other_params = []
             for n, p in self.named_parameters():
@@ -803,7 +788,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         mask = row_vector < length_matrix
         return mask.float().to(context_embs.device)
 
-    def forward_infer(self, emb_seq, memory_sort=True):
+    def forward_infer(self, emb_seq, streaming_mode=True):
         """
 
         Args:
@@ -898,7 +883,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
                 ms_seg_timestamps=ms_seg_timestamps,
                 ms_seg_counts=ms_seg_counts,
                 scale_mapping=scale_mapping,
-            ) # (batch_size, max_seg_count, msdd_scale_n, emb_dim)
+            ) # [batch_size, max_seg_count, msdd_scale_n, emb_dim]
             # Step 2: Clustering for initialization
             # Compute the cosine similarity between the input and the cluster average embeddings
             if self.cfg_e2e_diarizer_model.get("multi_scale_method", None) == "mean":
@@ -912,100 +897,62 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
                 raise ValueError(f"Unknown multi-scale method: {self.cfg_e2e_diarizer_model.get('multi_scale_method', None)}")
             
         # Step 3: SortFormer Diarization Inference
-        memory_sort = False
-        if memory_sort:
-            unit_infer_step = 240
-            total_pred_list = []
-            memory_buff, memory_label = None, None
-            for step_idx in tqdm(range(0, torch.ceil(torch.tensor(emb_seq.shape[1]/unit_infer_step)).int().item()), desc="memory and steps diar", leave=False):
-                chunk_emb_seq = emb_seq[:, step_idx*unit_infer_step:(step_idx+1)*unit_infer_step, :]
-                if step_idx > 0:
-                    new_context_embs = torch.cat([memory_buff, chunk_emb_seq], dim=1)
-                else:
-                    new_context_embs = chunk_emb_seq
-                preds_mem_new, _preds, attn_score_stack, preds_list, encoder_states_list = self.forward_infer(new_context_embs, memory_sort=memory_sort)
-                if step_idx == 0:
-                    total_pred_list.append(preds_mem_new)
-                else:
-                    total_pred_list.append(preds_mem_new[:, unit_infer_step:])
-                preds_mem_new_binary = preds_mem_new.round() 
-                memory_buff, memory_label = self._process_memory_sort(step_idx, chunk_emb_seq, prev_preds=preds_mem_new_binary, memory_buff=memory_buff, memory_label=memory_label)
-            preds = torch.cat(total_pred_list, dim=1)
+        self.mem_len, self.step_len = (2400, 2400)
+        streaming_mode = True
+        self.eval()
+        if streaming_mode:
+            preds, _preds, attn_score_stack, total_memory_list, encoder_states_list = self.forward_streaming_infer(emb_seq, streaming_mode=streaming_mode) 
         else:
-            preds, _preds, attn_score_stack, preds_list, encoder_states_list = self.forward_infer(emb_seq, memory_sort=memory_sort)
-        return preds, _preds, attn_score_stack, preds_list, encoder_states_list
+            preds, _preds, attn_score_stack, preds_list, encoder_states_list = self.forward_infer(emb_seq, streaming_mode=streaming_mode)
+            total_memory_list = []
+        return preds, _preds, attn_score_stack, total_memory_list, encoder_states_list
     
-    def _process_memory_sort(self, step_idx, chunk_emb_seq, prev_preds, memory_buff, memory_label, eps=1e-6):
-        """
-        trans_mat:
-            Dimension: (batch_size, unit_infer_step, unit_infer_step)
-            
-        Args:
-            chunk_emb_seq:
-                Dimension: (batch_size, unit_infer_step, emb_dim)
-            prev_preds:
-                Dimension: (batch_size, max_spks, unit_infer_step)
-            memory_buff:
-                Dimension: (batch_size, mem_len, emb_dim)
-            memory_label:
-                Dimension: (batch_size, max_spks, mem_len)
-        """
-        batch_size, max_spks, emb_dim = prev_preds.shape[0], prev_preds.shape[-1], chunk_emb_seq.shape[-1]
-        step_len = chunk_emb_seq.shape[1]
-        mem_len = step_len if step_idx == 0 else memory_label.shape[1]
-        mem_size_per_spk = int(mem_len // max_spks)
-        if step_idx == 0:
-            new_memory_buff = chunk_emb_seq # [bs, step_len, emb_dim]
-            memory_label = prev_preds # [step_len]
-        else:
-            new_preds = prev_preds[:, mem_len:, :] # [bs, max_spks, step_len]
-            # Prepare repeated new_pred labels
-            memory_labels_diags = torch.diag_embed(memory_label.transpose(1,2)) # [bs, max_spks, step_len, step_len]
-            bsspk_flat_mem_labels_diags = memory_labels_diags.view(batch_size * max_spks, mem_len, mem_len)  # [bs*max_spks, step_len, step_len]
-            
-            # Prepare repeated mem_and_new_labels
-            mem_and_new_labels = torch.cat([memory_label, new_preds], dim=1) # [bs, (mem_len + step_len), max_spks]
-            mem_and_new_labels_diags= torch.diag_embed(mem_and_new_labels.transpose(1,2)) # [bs, max_spks, step_len, step_len]
-            bsspk_flat_mem_and_new_labels_diags = mem_and_new_labels_diags.view(batch_size * max_spks, (step_len+mem_len), (step_len+mem_len))  # [bs*max_spks, step_len, step_len]
-            
-            # Prepare repeated memory_buff embeddings
-            mem_and_new = torch.cat([memory_buff, chunk_emb_seq], dim=1) # [bs, (step_len + step_ln), step_len]
-            spkrep_mem_and_new = mem_and_new.unsqueeze(1).repeat(1, max_spks, 1, 1).view(batch_size * max_spks, mem_len + step_len, emb_dim)  # [bs * max_spks, step_len, emb_dim]
-            spkrep_memory_buff = memory_buff.unsqueeze(1).repeat(1, max_spks, 1, 1).view(batch_size * max_spks, mem_len, emb_dim)  # [bs * max_spks, step_len, emb_dim]
-            
-            bsspk_masked_mem_and_new_embs = torch.bmm(bsspk_flat_mem_and_new_labels_diags, spkrep_mem_and_new) # [max_spks, (mem_len + step_len), emb_dim]
-            bsspk_masked_mem_embs = torch.bmm(bsspk_flat_mem_labels_diags, spkrep_memory_buff) # [max_spks, mem_len, emb_dim]
-            
-            # Attention matrix calculation 
-            batch_attention = torch.bmm(bsspk_masked_mem_embs, bsspk_masked_mem_and_new_embs.transpose(1,2)) # [max_spks, mem_len, (step_len+mem_len)]
-            bin_norm_coeff = (batch_attention.max(dim=2)[0]).unsqueeze(2).repeat(1, 1, (step_len+mem_len)) # [max_spks, mem_len, (step_len+mem_len)]
-            bsspk_normed_batch_attention = batch_attention/(bin_norm_coeff + eps) # [max_spks, mem_len, (step_len+mem_len)]
-            
-            eye_repeated = torch.eye(max_spks).repeat_interleave((step_len+mem_len), dim=1).reshape(max_spks, max_spks, (step_len+mem_len)) # [max_spks, max_spks, (step_len+mem_len)]
-            attn_mask_for_spk = eye_repeated.repeat_interleave(mem_size_per_spk, dim=1).unsqueeze(0).repeat(batch_size, 1,1,1).to(chunk_emb_seq.device) # [bs, max_spks, step_len, (step_len+mem_len)]
-            bsspk_normed_masked_batch_attention = attn_mask_for_spk.reshape(batch_size*max_spks, mem_len, (step_len+mem_len)) * bsspk_normed_batch_attention # [bs, mem_len, (step_len+mem_len)]
-            spk_rep_mem_and_new_embs = mem_and_new.unsqueeze(1).repeat(1, max_spks, 1, 1).reshape(batch_size*max_spks, (step_len+mem_len), emb_dim) # [max_spks, mem_len + step_len, emb_dim]
-            new_memory_buff_perspk = torch.bmm(bsspk_normed_masked_batch_attention, spk_rep_mem_and_new_embs).reshape(batch_size, max_spks, mem_len, emb_dim) # [bs, max_spks, mem_len, emb_dim]
-            new_memory_buff = new_memory_buff_perspk.sum(dim=1) # [bs, mem_len, emb_dim]
-            memory_label = torch.eye(max_spks).repeat_interleave(mem_size_per_spk, dim=0).unsqueeze(0).repeat(batch_size, 1, 1).to(chunk_emb_seq.device) # [bs, mem_len, emb_dim]
-        return new_memory_buff, memory_label
-    
-    def __init_memory_buff(self, chunk_emb_seq, max_spks):
-        for spk_idx in range(max_spks):
-            pass
-         
+    def forward_streaming_infer(self, emb_seq, streaming_mode=True):
+        total_pred_list, total_memory_list = [], []
+        memory_buff, memory_label = None, None
+        chunk_n = torch.ceil(torch.tensor((emb_seq.shape[1]-self.mem_len)/self.step_len)).int().item() + 1
+        for step_idx in tqdm(range(0, chunk_n), desc="memory and steps diar", leave=False):
+            if step_idx == 0:
+                new_context_embs = emb_seq[:, :self.mem_len, :]
+                memory_buff = new_context_embs
+                chunk_emb_seq = None
+            elif step_idx > 0:
+                stt_fr, end_fr = self.mem_len + (step_idx-1) *self.step_len, self.mem_len + (step_idx)*self.step_len
+                chunk_emb_seq = emb_seq[:,stt_fr:end_fr , :]
+                new_context_embs = torch.cat([memory_buff, chunk_emb_seq], dim=1)
+                
+            preds_mem_new, _preds, attn_score_stack, preds_list, encoder_states_list = self.forward_infer(new_context_embs, streaming_mode=streaming_mode)
+            del new_context_embs, _preds, attn_score_stack, preds_list, encoder_states_list
+            torch.cuda.empty_cache()
+            preds_mem_new = preds_mem_new.detach()
+            _preds, attn_score_stack, encoder_states_list = None, None, None
+            if step_idx == 0:
+                total_pred_list.append(preds_mem_new)
+            else:
+                total_pred_list.append(preds_mem_new[:, self.mem_len:]) 
+
+            preds_mem_new_binary = preds_mem_new.round() 
+            if step_idx < chunk_n - 1:
+                memory_buff, memory_label = self.sortformer_diarizer.memory_compressor(step_idx, chunk_emb_seq, prev_preds=preds_mem_new_binary, memory_buff=memory_buff, memory_label=memory_label)
+
+            total_memory_list.append(memory_label.detach().cpu())
+            quant_memory = ((5.0)*memory_buff.detach().cpu()).round()
+            self.sortformer_diarizer.embedding_list.append(quant_memory)
+            del chunk_emb_seq, preds_mem_new_binary
+            torch.cuda.empty_cache()
+        preds = torch.cat(total_pred_list, dim=1) 
+        return preds, _preds, attn_score_stack, total_memory_list, encoder_states_list  
+ 
     def find_first_nonzero(self, mat, max_cap_val=-1):
         # non zero values mask
         non_zero_mask = mat != 0
-
         # operations on the mask to find first nonzero values in the rows
         mask_max_values, mask_max_indices = torch.max(non_zero_mask, dim=1)
-
         # if the max-mask is zero, there is no nonzero value in the row
         mask_max_indices[mask_max_values == 0] = max_cap_val
         return mask_max_indices
 
-    def sort_probs_and_labels(self, labels, discrete=True, thres=0.5):
+    def sort_probs_and_labels(self, labels, discrete=True, thres=0.5, return_inds=False):
         """
         Sorts probs and labels in descending order of signal_lengths.
         """
@@ -1026,13 +973,15 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         label_fz[label_fz == -1] = max_cap_val 
         sorted_inds = torch.sort(label_fz)[1]
         sorted_labels = labels.transpose(0,1)[:, torch.arange(labels.shape[0]).unsqueeze(1), sorted_inds].transpose(0, 1)
-        return sorted_labels 
+        if return_inds:
+            return sorted_labels, sorted_inds
+        else:
+            return sorted_labels 
         
     def sort_targets_with_preds(self, labels, preds, discrete=True, thres=0.5, add_pil_loss=False, pil_loss_thres=0.1):
         """
         Sorts probs and labels in descending order of signal_lengths.
         """
-        max_cap_val = labels.shape[1] + 1 
         perm_size = self.spk_perm.shape[0] 
         permed_labels = labels[:, :, self.spk_perm]
         preds_rep = torch.unsqueeze(preds, 2).repeat(1,1, self.spk_perm.shape[0],1)
@@ -1119,12 +1068,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         else:
             targets_f1_score = targets
             targets_tr_loss = targets
-            
-        # if self._is_pil_shift():
-            # print(f"PIL shift detectedl, mean f1 acc {torch.mean(torch.tensor(self.train_f1_acc_history), dim=0)}")
-            # targets_tr_loss = targets_pil 
-            # targets_f1_score = targets_pil  
-                                          
+
         mid_layer_count = len(preds_list)
         if mid_layer_count > 0:
             torch.cat(preds_list).reshape(-1, *preds.shape)
@@ -1136,7 +1080,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             spk_loss = self.loss(probs=preds_all, labels=targets_rep, signal_lengths=sequence_lengths_rep)/(mid_layer_count+1)
         else:
             spk_loss = self.loss(probs=preds, labels=targets_tr_loss, signal_lengths=sequence_lengths)
-            preds_mean = preds
         self._reset_train_f1_accs()
         preds_vad, preds_ovl, targets_vad, targets_ovl = self.compute_aux_f1(preds, targets_f1_score)
         self._accuracy_train_vad(preds_vad, targets_vad, sequence_lengths)
@@ -1151,8 +1094,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         if len(self.train_f1_acc_history) > self.train_f1_acc_window_length:
             del self.train_f1_acc_history[0]
         self.train_f1_acc_history.append(f1_acc.item())
-        # print(f"self.train_f1_acc_history: {self.train_f1_acc_history}")
-        # print(f'Train F1 score: {f1_acc:.4f}')
+
         self.log('loss', loss, sync_dist=True)
         self.log('learning_rate', self._optimizer.param_groups[0]['lr'], sync_dist=True)
         self.log('train_f1_acc', f1_acc, sync_dist=True)
@@ -1197,7 +1139,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         cumulative_f1_prdmean_acc = self.cumulative_f1_prdmean_acc_sum / self.total_sample_counts
         cumulative_f1_vad_acc = self.cumulative_f1_vad_acc_sum / self.total_sample_counts
         cumulative_f1_ovl_acc = self.cumulative_f1_ovl_acc_sum / self.total_sample_counts
-        
         return {"cum_test_f1_acc": cumulative_f1_acc,
                 "cum_test_f1_toplyr_acc": cumulative_f1_toplyr_acc,
                 "cum_test_f1_prdmean_acc": cumulative_f1_prdmean_acc,
@@ -1253,12 +1194,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         else:
             targets_f1_score = targets
             targets_tr_loss = targets 
-        
-        # if self._is_pil_shift():
-            # targets_f1_score = targets_pil  
-            # targets_tr_loss = targets_pil 
  
-        # spk_loss = self.loss(probs=preds, labels=targets_tr_loss, signal_lengths=sequence_lengths)
         mid_layer_count = len(preds_list)
         if mid_layer_count > 0:
             # Only mid-layer outputs 
@@ -1347,7 +1283,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
                                                    discrete=True, 
                                                    add_pil_loss=self.cfg_e2e_diarizer_model.add_pil_loss, 
                                                    pil_loss_thres=self.cfg_e2e_diarizer_model.pil_loss_thres)
-        spk_loss = self.loss(probs=preds, labels=targets, signal_lengths=sequence_lengths)
         mid_layer_count = len(preds_list)
         if mid_layer_count > 0:
             # Only mid-layer outputs 
@@ -1366,15 +1301,10 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         # self._reset_test_f1_accs()
         preds_vad, preds_ovl, targets_vad, targets_ovl = self.compute_aux_f1(preds, targets)
         self._accuracy_test_vad(preds_vad, targets_vad, sequence_lengths)
-        test_f1_vad = self._accuracy_test_vad.compute()
         self._accuracy_test_ovl(preds_ovl, targets_ovl, sequence_lengths)
-        test_f1_ovl = self._accuracy_test_ovl.compute()
         self._accuracy_test(preds, targets, sequence_lengths)
-        f1_acc = self._accuracy_test.compute()
         self._accuracy_test_toplyr(_preds, targets, sequence_lengths)
-        f1_acc_toplyr = self._accuracy_test_toplyr.compute()
         self._accuracy_test_prdmean(preds_mean, targets, sequence_lengths)
-        f1_acc_prdmean = self._accuracy_test_prdmean.compute()
         return preds_all 
    
     def test_step(self, batch: list, batch_idx: int, dataloader_idx: int = 0):
@@ -1424,8 +1354,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             # All mid-layer outputs + final layer output
             preds_list.append(_preds)
             self.preds_all = torch.cat(preds_list)
-            targets_rep = targets_tr_loss.repeat(mid_layer_count+1,1,1)
-            sequence_lengths_rep = sequence_lengths.repeat(mid_layer_count+1)
         else:
             preds_mean = preds
         preds_vad, preds_ovl, targets_vad, targets_ovl = self.compute_aux_f1(preds, targets_f1_score)
@@ -1439,16 +1367,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         f1_acc_toplyr = self._accuracy_test_toplyr.compute()
         self._accuracy_test_prdmean(preds_mean, targets_f1_score, sequence_lengths, cumulative=True)
         f1_acc_prdmean = self._accuracy_test_prdmean.compute()
-        # if self.cfg_e2e_diarizer_model.get('save_tensor_images', False):
-        #     tags = f"f1acc{f1_acc:.4f}_bidx{batch_idx}".replace('0.', '0p')
-        #     print(f"Saving tensor images with tags: {tags}")
-        #     directory = self._cfg.diarizer.get('out_dir', None)
-        #     if directory is None:
-        #         raise ValueError(f"No output directory specified for tensor image saving. Please set the `out_dir` in the config file.")
-        #     else:
-        #         print(f"Saving tensor images to directory: {directory}")
-        #     torch.save(preds, f'{directory}/preds_{tags}.pt')
-        #     torch.save(targets_f1_score, f'{directory}/targets_{tags}.pt')
         self.max_f1_acc = max(self.max_f1_acc, f1_acc)
         batch_score_dict = {"f1_acc": f1_acc, "f1_toplyr_acc": f1_acc_toplyr, "f1_prdmean_acc": f1_acc_prdmean, "f1_vad_acc": test_f1_vad, "f1_ovl_acc": test_f1_ovl}
         cum_score_dict = self._cumulative_test_set_eval(score_dict=batch_score_dict, batch_idx=batch_idx, sample_count=len(sequence_lengths))
@@ -1472,16 +1390,15 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             sequence_lengths = torch.tensor([x[-1] for x in ms_seg_counts]).to(audio_signal.device)
             # targets = targets.to(self.device)
             self.validation_mode = True
-            preds, _preds, attn_score_stack, preds_list, encoder_states_list = self.forward(
+            preds, _preds, attn_score_stack, memory_list, encoder_states_list = self.forward(
                 audio_signal=audio_signal,
                 audio_signal_length=audio_signal_length,
                 ms_seg_timestamps=ms_seg_timestamps,
                 ms_seg_counts=ms_seg_counts,
                 scale_mapping=scale_mapping,
             )
-            preds, _preds, attn_score_stack = preds.detach().to('cpu'), _preds.detach().to('cpu'), attn_score_stack.detach().to('cpu')
-            # preds_list = [x.detach().to('cpu') for x in preds_list]
-            encoder_states_list = [x.detach().to('cpu') for x in encoder_states_list]
+            
+            preds = preds.detach().to('cpu')
             if self.loss.sorted_loss:
                 # Perform arrival-time sorting (ATS)
                 targets_ats = self.sort_probs_and_labels(targets.clone(), discrete=True)
@@ -1500,34 +1417,19 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
                     targets_tr_loss = targets_pil 
                 else:
                     targets_tr_loss = targets_ats
-            # spk_loss = self.loss(probs=preds, labels=targets, signal_lengths=sequence_lengths)
-            # mid_layer_count = len(preds_list)
-            # if mid_layer_count > 0:
-            #     # Only mid-layer outputs 
-            #     preds_mid_all = torch.cat(preds_list).reshape(-1, *preds.shape)
-            #     torch.cat(preds_list).reshape(-1, *preds.shape)
-            #     preds_mean = preds_mid_all.mean(dim=0)
-            #     # All mid-layer outputs + final layer output
-            #     preds_list.append(_preds)
-            #     preds_all = torch.cat(preds_list)
-            # else:
-            preds_mean = preds
+
+
             self.preds_total_list.append(preds)
             # self._reset_test_f1_accs()
             preds_vad, preds_ovl, targets_vad, targets_ovl = self.compute_aux_f1(preds, targets_f1_score)
-            # self._accuracy_test_vad(preds_vad, targets_vad, sequence_lengths)
-            # test_f1_vad = self._accuracy_test_vad.compute()
-            # self._accuracy_test_ovl(preds_ovl, targets_ovl, sequence_lengths)
-            # test_f1_ovl = self._accuracy_test_ovl.compute()
+
             self._accuracy_valid(preds, targets_f1_score, sequence_lengths)
             f1_acc = self._accuracy_valid.compute()
             self.batch_f1_accs_list.append(f1_acc)
-            # self._accuracy_test_toplyr(_preds, targets_f1_score, sequence_lengths)
-            # f1_acc_toplyr = self._accuracy_test_toplyr.compute()
-            # self._accuracy_test_prdmean(preds_mean, targets_f1_score, sequence_lengths)
-            # f1_acc_prdmean = self._accuracy_test_prdmean.compute()
-            # if self.cfg_e2e_diarizer_model.get('save_tensor_images', False):
-            if True:
+
+            if len(memory_list) > 0:
+                memory_mats = torch.cat(memory_list, dim=1)
+                embedding_mats = torch.cat(self.sortformer_diarizer.embedding_list, dim=1)
                 for pred_idx in range(preds.shape[0]):
                     global_index = batch_idx * self._test_dl.batch_size + pred_idx
                     uniq_id = self._test_dl.dataset.collection[global_index][1]
@@ -1538,8 +1440,11 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
                         raise ValueError(f"No output directory specified for tensor image saving. Please set the `out_dir` in the config file.")
                     else:
                         print(f"Saving tensor images to directory: {directory}")
-                    torch.save(preds[pred_idx], f'{directory}/preds_{tags}.pt')
-                    torch.save(targets_f1_score[pred_idx], f'{directory}/targets_{tags}.pt')
+                    torch.save(preds[pred_idx], f'{directory}/preds@{tags}.pt')
+                    torch.save(targets_f1_score[pred_idx], f'{directory}/targets@{tags}.pt')
+                    torch.save(memory_mats[pred_idx], f'{directory}/mems_mst{self.mem_len}@{tags}.pt')
+                    torch.save(embedding_mats[pred_idx], f'{directory}/embs_mst{self.mem_len}@{tags}.pt')
+                    # torch.save(targets_f1_score[pred_idx], f'{directory}/targets_{tags}.pt')
         print(f"Batch F1Acc. MEAN: {torch.mean(torch.tensor(self.batch_f1_accs_list))}") 
         self.preds_total = torch.vstack(self.preds_total_list) 
     def diarize(self,):

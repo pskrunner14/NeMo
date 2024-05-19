@@ -402,7 +402,7 @@ class _AudioMSDDTrainDataset(Dataset):
         super().__init__()
         self.collection = DiarizationSpeechLabel(
             manifests_files=manifest_filepath.split(','),
-            # emb_dict=None,
+            emb_dict=None,
             clus_label_dict=None,
             pairwise_infer=pairwise_infer,
         )
@@ -654,9 +654,9 @@ class _AudioMSDDTrainDataset(Dataset):
         audio_signal = self.featurizer.process(sample.audio_file, offset=offset, duration=duration)
         if audio_signal.shape[0] < self.session_len_sec*self.featurizer.sample_rate:
             if isinstance(sample.audio_file, str): # Mono audio
-                audio_signal = torch.nn.functional.pad(audio_signal, (0, self.session_len_sec*self.featurizer.sample_rate- audio_signal.shape[0]), mode='constant', value=0)
+                audio_signal = torch.nn.functional.pad(audio_signal, (0, int(self.session_len_sec*self.featurizer.sample_rate) - audio_signal.shape[0]), mode='constant', value=0)
             else:
-                audio_signal = torch.nn.functional.pad(audio_signal, (0, 0, 0, self.session_len_sec*self.featurizer.sample_rate - audio_signal.shape[0]), mode='constant', value=0)
+                audio_signal = torch.nn.functional.pad(audio_signal, (0, 0, 0, int(self.session_len_sec*self.featurizer.sample_rate) - audio_signal.shape[0]), mode='constant', value=0)
             
         feature_length = torch.tensor(audio_signal.shape[0]).long()
         if self.random_flip:
@@ -784,41 +784,6 @@ class _AudioMSDDInferDataset(Dataset):
 
     def __len__(self):
         return len(self.collection)
-    
-    def parse_rttm_multiscale(self, sample):
-        """
-        Generate target tensor variable by extracting groundtruth diarization labels from an RTTM file.
-        This function is only used when ``self.seq_eval_mode=True`` and RTTM files are provided. This function converts
-        (start, end, speaker_id) format into base-scale (the finest scale) segment level diarization label in a matrix
-        form to create target matrix.
-
-        Args:
-            sample:
-                DiarizationSpeechLabel instance containing sample information such as audio filepath and RTTM filepath.
-            target_spks (tuple):
-                Two Indices of targeted speakers for evaluation.
-                Example of target_spks: (2, 3)
-        Returns:
-            seg_target (torch.tensor):
-                Tensor variable containing hard-labels of speaker activity in each base-scale segment.
-        """
-        if sample.rttm_file is None:
-            raise ValueError(f"RTTM file is not provided for this sample {sample}")
-        rttm_lines = open(sample.rttm_file).readlines()
-        uniq_id = os.path.splitext(os.path.basename(sample.rttm_file))[0]
-        # mapping_dict = self.emb_dict[max(self.emb_dict.keys())][uniq_id]['mapping']
-        mapping_dict = {}
-        rttm_timestamps, sess_to_global_spkids = extract_seg_info_from_rttm(uniq_id, offset, duration, rttm_lines, mapping_dict, sample.target_spks)
-        fr_level_target = assign_frame_level_spk_vector(rttm_timestamps, 
-                                                        offset, 
-                                                        duration, 
-                                                        self.round_digits, 
-                                                        self.feat_per_sec, 
-                                                        sample.target_spks
-        )
-        seg_target = self.get_diar_target_labels_from_fr_target(uniq_id, fr_level_target)
-        return seg_target
-
     def get_diar_target_labels_from_fr_target(self, uniq_id, fr_level_target):
         """
         Generate base-scale level binary diarization label from frame-level target matrix. For the given frame-level

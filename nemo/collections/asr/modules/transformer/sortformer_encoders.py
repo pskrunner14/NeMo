@@ -18,13 +18,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.functional import gelu
-
-from nemo.collections.asr.modules.transformer.transformer_modules import MultiHeadAttention, PositionWiseFF
+from nemo.collections.asr.modules.transformer.transformer_modules import PositionWiseFF
 from nemo.collections.common.parts import form_attention_mask
 import math
-
-import numpy as np
-from nemo.utils import logging
 
 __all__ = ["SortformerEncoder"]
 
@@ -226,17 +222,6 @@ class SortformerEncoderBlock(nn.Module):
         # import ipdb; ipdb.set_trace()
         return torch.nn.functional.normalize(sorted_output_states, p=2, dim=-1)
 
-    def arrival_time_sort(self, sorted_output_states):
-        eps = 1e-5
-        # max_normed_states = sorted_output_states/torch.abs(sorted_output_states).max()
-        # softmax_states = torch.softmax(max_normed_states+eps, dim=-1)
-        ats_sorted_softmax_states = self.sort_probs_and_labels(sorted_output_states, discrete=False)
-        # binary_states = max_normed_states.sign()
-        # bs, seq_dim, short_dim = sorted_output_states.shape
-        # offsets = torch.linspace(1, seq_dim, steps=seq_dim).to(log_sm.device).unsqueeze(0).unsqueeze(2).repeat((bs,1,short_dim))
-        # offset_log_sm = log_sm + offsets
-        return ats_sorted_output_states
-   
     def find_first_nonzero(self, mat, max_cap_val=-1):
         non_zero_mask = mat != 0
         mask_max_values, mask_max_indices = torch.max(non_zero_mask, dim=1)
@@ -257,30 +242,6 @@ class SortformerEncoderBlock(nn.Module):
         output_states = self.layer_norm_2(output_states)
 
         return output_states 
-    
-    # def __sort_probs_and_labels(self, labels, discrete=True, thres=0.5):
-    #     """
-    #     Sorts probs and labels in descending order of signal_lengths.
-    #     """
-    #     max_cap_val = labels.shape[1] + 1 
-    #     if not discrete:
-    #         labels_discrete = torch.zeros_like(labels).to(labels.device)
-    #         # mean = torch.mean(labels, dim=(1,2)).detach()
-    #         # median_repeat = mean.unsqueeze(1).unsqueeze(1).repeat(1, labels.shape[1], labels.shape[2])
-    #         # thres = 0.5
-    #         # thres = torch.mean(labels, dim=(1,2)).detach()
-    #         thres = torch.mean(labels).detach()
-    #         labels_discrete[labels > thres] = 1
-    #         # labels = labels_discrete
-    #     else:
-    #         labels_discrete = labels
-        
-    #     label_fz = self.find_first_nonzero(labels_discrete, max_cap_val)
-    #     label_fz[label_fz == -1] = max_cap_val 
-    #     sorted_inds = torch.sort(label_fz)[1]
-    #     sorted_labels = labels.transpose(0,1)[:, torch.arange(labels.shape[0]).unsqueeze(1), sorted_inds].transpose(0, 1)
-    #     # verify_sorted_labels = self.find_first_nonzero(sorted_labels, max_cap_val)
-    #     return sorted_labels
     
     def sort_probs_and_labels(self, labels, discrete=True, thres=0.5):
         """
@@ -334,8 +295,6 @@ class SortformerEncoderBlock(nn.Module):
             output_states = self.third_sub_layer(preds) + self.p2_norm(output_states_2nd)
         else:
             output_states = output_states_2nd
-        # output_states = output_states_2nd + output_states_3rd
-        # output_states = self.third_sub_layer(sorted_output_states_short) + output_states_2nd
         output_states = self.layer_norm_2(output_states)
         return output_states, attn_score_mat, preds
     
@@ -472,24 +431,11 @@ class SortformerEncoder(nn.Module):
             memory_states = encoder_states
         return memory_states
 
-    def forward(self, encoder_states, encoder_mask, encoder_mems_list=None, return_mems=False):
-        """
-        Args:
-            encoder_states: output of the embedding_layer (B x L_enc x H)
-            encoder_mask: encoder inputs mask (B x L_enc)
-            encoder_mems_list: list of the cached encoder hidden states
-                for fast autoregressive generation which will be used instead
-                of encoder_states as keys and values if not None
-            return_mems: bool, whether to return outputs of all encoder layers
-                or the last layer only
-        """
-
+    def forward_memory(self, encoder_states, encoder_mask, encoder_mems_list=None, return_mems=False, memory_sort=False):
         encoder_attn_mask = form_attention_mask(encoder_mask, self.diag)
-
         memory_states = self._get_memory_states(encoder_states, encoder_mems_list, 0)
         cached_mems_list = [memory_states]
         attn_score_mat_list, encoder_states_list, preds_list = [], [], []
-        
         for i, layer in enumerate(self.layers):
             encoder_states, attn_score_mat, preds = layer(encoder_states, encoder_attn_mask, memory_states)
             attn_score_mat_list.append(attn_score_mat)
@@ -501,12 +447,42 @@ class SortformerEncoder(nn.Module):
         preds_layers = torch.stack(preds_list, dim=0)
         preds_mean = torch.mean(preds_layers, dim=0)
         
-        if self.final_layer_norm is not None:
-            encoder_states = self.final_layer_norm(encoder_states)
-            memory_states = self._get_memory_states(encoder_states, encoder_mems_list, i + 1)
-            cached_mems_list.append(memory_states)
-
-        if return_mems:
-            return cached_mems_list, attn_score_mat_list, preds_list, preds_mean, encoder_states_list
+        return cached_mems_list[-1], attn_score_mat_list, preds_list, preds_mean, encoder_states_list
+    
+    def forward(self, encoder_states, encoder_mask, encoder_mems_list=None, return_mems=False, memory_sort=False):
+        """
+        Args:
+            encoder_states: output of the embedding_layer (B x L_enc x H)
+            encoder_mask: encoder inputs mask (B x L_enc)
+            encoder_mems_list: list of the cached encoder hidden states
+                for fast autoregressive generation which will be used instead
+                of encoder_states as keys and values if not None
+            return_mems: bool, whether to return outputs of all encoder layers
+                or the last layer only
+        """
+        if memory_sort:
+            self.forward_memory(encoder_states, encoder_mask, encoder_mems_list, return_mems=False)
         else:
-            return cached_mems_list[-1], attn_score_mat_list, preds_list, preds_mean, encoder_states_list
+            encoder_attn_mask = form_attention_mask(encoder_mask, self.diag)
+            memory_states = self._get_memory_states(encoder_states, encoder_mems_list, 0)
+            cached_mems_list = [memory_states]
+            attn_score_mat_list, encoder_states_list, preds_list = [], [], []
+            for i, layer in enumerate(self.layers):
+                encoder_states, attn_score_mat, preds = layer(encoder_states, encoder_attn_mask, memory_states)
+                attn_score_mat_list.append(attn_score_mat)
+                preds_list.append(preds)
+                memory_states = self._get_memory_states(encoder_states, encoder_mems_list, i + 1)
+                cached_mems_list.append(memory_states)
+                encoder_states_list.append(encoder_states)
+                
+            preds_layers = torch.stack(preds_list, dim=0)
+            preds_mean = torch.mean(preds_layers, dim=0)
+            
+            if self.final_layer_norm is not None:
+                encoder_states = self.final_layer_norm(encoder_states)
+                memory_states = self._get_memory_states(encoder_states, encoder_mems_list, i + 1)
+                cached_mems_list.append(memory_states)
+            if return_mems:
+                return cached_mems_list, attn_score_mat_list, preds_list, preds_mean, encoder_states_list
+            else:
+                return cached_mems_list[-1], attn_score_mat_list, preds_list, preds_mean, encoder_states_list

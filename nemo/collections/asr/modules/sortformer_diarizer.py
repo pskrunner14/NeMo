@@ -18,7 +18,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from nemo.core.classes.common import typecheck
 from nemo.core.classes.exportable import Exportable
 from nemo.core.classes.module import NeuralModule
 from nemo.core.neural_types import EncodedRepresentation, LengthsType, NeuralType, SpectrogramType
@@ -56,8 +55,8 @@ class SortformerDiarizer(NeuralModule, Exportable):
             Number of the stacked LSTM layers.
         dropout_rate (float):
             Dropout rate for linear layers, CNN and LSTM.
-        cnn_output_ch (int):
-            Number of channels per each CNN layer.
+        # cnn_output_ch (int):
+        #     Number of channels per each CNN layer.
         emb_dim (int):
             Dimension of the embedding vectors.
         scale_n (int):
@@ -127,13 +126,13 @@ class SortformerDiarizer(NeuralModule, Exportable):
         context_vector_type: str = 'cos_sim',
         sort_layer_on: bool = False, 
         sort_final_layer_on: bool = False,
+        mem_len: int = 2400,
+        step_len: int = 2400,
     ):
         super().__init__()
         self._speaker_model = None
         self.sort_final_layer_on = sort_final_layer_on
-        self._vad_model = None
-        self.batch_size: int = 1
-        self.length: int = 50
+        # self.length: int = 50
         self.emb_dim: int = emb_dim
         self.num_spks: int = num_spks
         self.unit_n_spks: int = num_spks
@@ -145,17 +144,12 @@ class SortformerDiarizer(NeuralModule, Exportable):
             self.n_stream = 1
         
         self.scale_n: int = scale_n
-        self.cnn_output_ch: int = cnn_output_ch
-        self.conv_repeat: int = conv_repeat
-        self.chan: int = 2
-        self.eps: float = 1e-6
         self.num_lstm_layers: int = num_lstm_layers
-        self.use_amsl_layer: bool = use_amsl_layer
-        self.weighting_scheme: str = weighting_scheme
-        self.context_vector_type: bool = context_vector_type
-
-        self.softmax = torch.nn.Softmax(dim=2)
-        self.cos_dist = torch.nn.CosineSimilarity(dim=3, eps=self.eps)
+        self.hidden_to_spks = nn.Linear(2 * hidden_size, self.unit_n_spks)
+        self.first_hidden_to_hidden = nn.Linear(hidden_size, hidden_size)
+        self.target_to_embs = nn.Linear(hidden_size, hidden_size)
+       
+        self.W_a = nn.Linear(emb_dim, emb_dim, bias=False)
         self.lstm = nn.LSTM(
             hidden_size,
             hidden_size,
@@ -163,388 +157,152 @@ class SortformerDiarizer(NeuralModule, Exportable):
             batch_first=True,
             bidirectional=True,
             dropout=dropout_rate,
-        )
-        if self.weighting_scheme == 'conv_scale_weight':
-            self.conv = nn.ModuleList(
-                [
-                    ConvLayer(
-                        in_channels=1,
-                        out_channels=cnn_output_ch,
-                        kernel_size=(self.scale_n + self.scale_n *  self.unit_n_spks, 1),
-                        stride=(1, 1),
-                    )
-                ]
-            )
-            for conv_idx in range(1, conv_repeat + 1):
-                self.conv.append(
-                    ConvLayer(
-                        in_channels=1, out_channels=cnn_output_ch, kernel_size=(self.cnn_output_ch, 1), stride=(1, 1)
-                    )
-                )
-            self.conv_bn = nn.ModuleList()
-            for conv_idx in range(self.conv_repeat + 1):
-                self.conv_bn.append(nn.BatchNorm2d(self.emb_dim, affine=False))
-            self.conv_to_linear = nn.Linear(emb_dim * cnn_output_ch, hidden_size)
-            self.linear_to_weights = nn.Linear(hidden_size, self.scale_n)
-
-        elif self.weighting_scheme == 'attn_scale_weight':
-            self.W_a = nn.Linear(emb_dim, emb_dim, bias=False)
-            nn.init.eye_(self.W_a.weight)
-        else:
-            raise ValueError(f"No such weighting scheme as {self.weighting_scheme}")
-
-        self.hidden_to_spks = nn.Linear(2 * hidden_size, self.unit_n_spks)
-        self.first_hidden_to_hidden = nn.Linear(hidden_size, hidden_size)
-        self.target_to_embs = nn.Linear(hidden_size, hidden_size)
-        # self.single1_hidden_to_spks = nn.Linear(hidden_size, self.unit_n_spks)
+        ) 
         self.single_hidden_to_spks = nn.Linear(hidden_size, self.unit_n_spks)
-        if self.context_vector_type == "cos_sim":
-            self.dist_to_emb = nn.Linear(self.scale_n * self.unit_n_spks, hidden_size)
-            self.dist_to_emb.apply(self.init_weights)
-        elif self.context_vector_type == "cos_sim_vad":
-            self.dist_to_emb = nn.Linear(self.scale_n * self.unit_n_spks, int(hidden_size/2))
-            self.emb_of_input = nn.Linear(self.emb_dim, int(hidden_size/2))
-            self.dist_to_emb.apply(self.init_weights)
-        elif self.context_vector_type == "elem_prod":
-            self.product_to_emb = nn.Linear(self.emb_dim * self.unit_n_spks, hidden_size)
-        else:
-            raise ValueError(f"No such context vector type as {self.context_vector_type}")
-
+        self.dist_to_emb = nn.Linear(self.scale_n * self.unit_n_spks, hidden_size)
         self.dropout = nn.Dropout(dropout_rate)
         self.hidden_to_spks.apply(self.init_weights)
         self.lstm.apply(self.init_weights)
-        self.clamp_max = clamp_max
-
-    def core_model(self, ms_emb_seq, length, ms_avg_embs):
+        
+        # Streaming Sortformer parameters 
+        self.mem_len = mem_len
+        self.step_len = step_len
+        self.total_len = self.mem_len + self.step_len
+        self.embedding_list = []
+        self.eps = 1e-6
+     
+    def _zero_sub_diag(self, trans_mat, emb_win:int=10, full_upper=False):
         """
-        Core model that accepts multi-scale cosine similarity values and estimates per-speaker binary label.
-
+        if emb_win is > 0, it will shift `emb_win` number of steps above the diagonal line.
+        
         Args:
-            ms_emb_seq (Tensor):
-                Multiscale input embedding sequence
-                Shape: (batch_size, length, scale_n, emb_dim)
-            length (Tensor):
-                The actual length of embedding sequences without zero padding
-                Shape: (batch_size,)
-            ms_avg_embs (Tensor):
-                Cluster-average speaker embedding vectors.
-                Shape: (batch_size, scale_n, self.emb_dim, max_spks)
-
-        Returns:
-            preds (Tensor):
-                Predicted binary speaker label for each speaker.
-                Shape: (batch_size, feats_len, max_spks)
-            scale_weights (Tensor):
-                Multiscale weights per each base-scale segment.
-                Shape: (batch_size, length, scale_n, max_spks)
-
+            trans_mat:
+                Dimension: (batch_size, step_len, step_len)
         """
-        self.batch_size = ms_emb_seq.shape[0]
-        self.length = ms_emb_seq.shape[1]
-        self.emb_dim = ms_emb_seq.shape[-1]
-
-        _ms_emb_seq = ms_emb_seq.unsqueeze(4).expand(-1, -1, -1, -1, self.unit_n_spks)
-        ms_emb_seq_single = ms_emb_seq
-        ms_avg_embs = ms_avg_embs.unsqueeze(1).expand(-1, self.length, -1, -1, -1)
-
-        ms_avg_embs_perm = ms_avg_embs.permute(0, 1, 2, 4, 3).reshape(self.batch_size, self.length, -1, self.emb_dim)
-
-        if self.weighting_scheme == "conv_scale_weight":
-            scale_weights = self.conv_scale_weights(ms_avg_embs_perm, ms_emb_seq_single)
-        elif self.weighting_scheme == "attn_scale_weight":
-            scale_weights = self.attention_scale_weights(ms_avg_embs_perm, ms_emb_seq_single)
+        mask1 = torch.triu(torch.ones_like(trans_mat[0], dtype=torch.bool),  diagonal=0).to(trans_mat.device)
+        mask2 = torch.triu(torch.ones_like(trans_mat[0], dtype=torch.bool),  diagonal=-1*emb_win).T.to(trans_mat.device)
+        if full_upper:
+            ext_mask = mask1
         else:
-            raise ValueError(f"No such weighting scheme as {self.weighting_scheme}")
-        scale_weights = scale_weights.to(ms_emb_seq.device)
+            ext_mask = (mask1 * mask2).unsqueeze(0).repeat(trans_mat.shape[0], 1, 1)
+        return trans_mat * ext_mask
+    
+    def _attention_score_compressor(self, 
+        batch_size: int, 
+        mem_and_new_embs: torch.Tensor, 
+        compress_ratio: int,
+        ):
+        """
+        Use attention score to compress the new incoming embeddings with the memory embeddings.
 
-        if self.context_vector_type == "cos_sim":
-            context_emb = self.cosine_similarity(scale_weights, ms_avg_embs, _ms_emb_seq)
-        elif self.context_vector_type == "cos_sim_vad":
-            context_emb_diar = self.cosine_similarity(scale_weights, ms_avg_embs, _ms_emb_seq)
-            scale_w_ms_emb_seq = self.get_scale_weighted_ms_seq(scale_weights, ms_emb_seq)
-            context_emb_vad = self.emb_of_input(scale_w_ms_emb_seq)
-            context_emb_vad = context_emb_vad.reshape(self.batch_size, self.length, -1)
-            context_emb = torch.cat((context_emb_vad, context_emb_diar), dim=2)
-        elif self.context_vector_type == "elem_prod":
-            context_emb = self.element_wise_product(scale_weights, ms_avg_embs, _ms_emb_seq)
+        Args:
+            batch_size (int):
+                Batch size of the infereced embeddings.
+            mem_and_new_embs (torch.Tensor):
+                Concatenated memory embeddings and new incoming embeddings.
+                Dimension: [batch_size, mem_len + step_len, emb_dim]
+            compress_ratio (int):
+                The ratio of compressing the new incoming embeddings.
+                
+        Returns:
+            Assigner matrix which selects the embeddings for the next-steps from the memory embeddings and new incoming embeddings.
+        """
+        selection_mask = torch.eye(self.step_len).repeat(batch_size, compress_ratio, compress_ratio)
+        total_len_eye = torch.eye(self.total_len).unsqueeze(0).repeat(batch_size, 1, 1).to(mem_and_new_embs.device)
+        batch_attention_raw = torch.bmm(mem_and_new_embs, mem_and_new_embs.transpose(1,2)).cpu()
+        batch_attention = selection_mask * batch_attention_raw
+        batch_unit_win_max_inds = batch_attention.sum(dim=2).reshape(batch_size, -1, compress_ratio).max(dim=2)[1]
+        batch_target_remove_inds = batch_unit_win_max_inds + (torch.arange(self.step_len)*compress_ratio).unsqueeze(0).repeat(batch_size, 1)
+        batch_inds_for_masker = torch.arange(batch_size).unsqueeze(1).expand_as(batch_target_remove_inds) 
+        masker = torch.ones((batch_size, self.total_len)).bool().to(mem_and_new_embs.device)
+        masker[batch_inds_for_masker, batch_target_remove_inds] = False
+        assinger_mat = total_len_eye.view(batch_size * self.total_len, -1)[masker.view(-1), :].reshape(batch_size, self.mem_len, -1) 
+        return assinger_mat
+    
+    def _drop_to_compress(
+        self, 
+        chunk_emb_seq: torch.Tensor, 
+        mem_and_new_embs: torch.Tensor, 
+        mem_and_new_labels: torch.Tensor, 
+        compress_ratio: int,
+        thres: float =0.95,
+        ):
+        overlap_bool_nl = mem_and_new_labels.sum(dim=2) > 1
+        mnl_noovl = mem_and_new_labels.clone()
+        mnl_noovl[overlap_bool_nl] = 0
+        sil_bools = (mnl_noovl.sum(dim=2) == 0)
+        silaug_mnl_noovl = torch.cat((mnl_noovl, torch.zeros_like(mnl_noovl[:,:,0].unsqueeze(2))), dim=2)
+        silaug_mnl_noovl[torch.arange(sil_bools.shape[0]).unsqueeze(1), :, -1].squeeze(1)[sil_bools] = 1
+        trans_label_mask = torch.bmm(silaug_mnl_noovl, silaug_mnl_noovl.transpose(1,2)) 
+        trans_label_mask_zeroed = self._zero_sub_diag(trans_label_mask, emb_win=0).detach().cpu()
+        compression_mask_inds = (torch.arange(trans_label_mask.size(1)) % (compress_ratio) != 1).cpu()
+        trans_label_mask_zerocomp = trans_label_mask_zeroed[:, compression_mask_inds, :]
+        row_maxs = trans_label_mask_zerocomp.max(dim=2, keepdim=True)[0]
+        normalized_compress_mat = trans_label_mask_zerocomp / (row_maxs + self.eps) # [bs, mem_len, (mem_len + step_len)]
+        assinger_mat = torch.zeros_like(normalized_compress_mat).to(chunk_emb_seq.device)
+        assinger_mat[(normalized_compress_mat >= thres)] = 1
+        row_maxs_post = assinger_mat.sum(dim=2).unsqueeze(2)
+        assinger_mat = assinger_mat / (row_maxs_post + self.eps)
+        return assinger_mat
+    
+    def memory_compressor(
+        self,
+        step_idx: int,
+        chunk_emb_seq: torch.Tensor,
+        prev_preds: torch.Tensor,
+        memory_buff: torch.Tensor,
+        memory_label: torch.Tensor,
+        compress_rate: int = 2,
+        UNIT_LEN: int = 10,
+        time_compress: bool = True,
+        use_attn_score: bool = True,
+        ):
+        """
+        trans_mat:
+            Dimension: (batch_size, step_len, step_len)
+            
+        Args:
+            chunk_emb_seq:
+                Dimension: (batch_size, step_len, emb_dim)
+            prev_preds:
+                Dimension: (batch_size, max_spks, step_len)
+            memory_buff:
+                Dimension: (batch_size, mem_len, emb_dim)
+            memory_label:
+                Dimension: (batch_size, max_spks, mem_len)
+        """
+        chunk_emb_seq = chunk_emb_seq.detach() if chunk_emb_seq is not None else None
+        memory_buff = memory_buff.detach() if memory_buff is not None else None
+        memory_label = memory_label.detach() if memory_label is not None else None
+        mem_int, mnl_int = int(self.mem_len/UNIT_LEN), int(self.step_len/UNIT_LEN)
+        compress_ratio = (mem_int+mnl_int)//mnl_int
+        if step_idx == 0:
+            # First trial, we only calculate mem_len 
+            new_memory_buff = memory_buff # [bs, step_len, emb_dim]
+            new_memory_label = prev_preds # [step_len]
         else:
-            raise ValueError(f"No such context vector type as {self.context_vector_type}")
-        return context_emb, scale_weights
+            batch_size = chunk_emb_seq.shape[0]
+            new_preds = prev_preds[:, self.mem_len:, :] # [bs, max_spks, step_len]
+            # Prepare repeated mem_and_new_labels
+            mem_and_new_labels = torch.cat([memory_label, new_preds], dim=1) # [bs, (mem_len + step_len), max_spks]
+            mem_and_new_embs = torch.cat([memory_buff, chunk_emb_seq], dim=1) # [bs, (mem_len + step_len), step_len]
+            if time_compress:
+                if use_attn_score:
+                    assinger_mat = self._attention_score_compressor(batch_size, mem_and_new_embs, compress_ratio)
+                else:
+                    assinger_mat = self._drop_to_compress(chunk_emb_seq, mem_and_new_embs, mem_and_new_labels, compress_ratio)
+                assinger_mat = assinger_mat.to(mem_and_new_embs.device) 
+                new_memory_buff = torch.bmm(assinger_mat, mem_and_new_embs)
+                new_memory_label = torch.bmm(assinger_mat, mem_and_new_labels).bool().float() # [bs, max_spks, (mem_len + step_len)]
+            else: 
+                raise NotImplementedError
+        return new_memory_buff, new_memory_label
+ 
 
-    def lstm_classifier(self, context_emb, scale_weights):
-        lstm_output = self.lstm(context_emb)
-        lstm_hidden_out = self.dropout(F.relu(lstm_output[0]))
-        spk_preds = self.hidden_to_spks(lstm_hidden_out)
-        preds = nn.Sigmoid()(spk_preds)
-        return preds, scale_weights
-    
-    def apply_attention_weight(self, ms_emb_seq):
-        """
-        Use weighted inner product for calculating each scale weight. W_a matrix has (emb_dim * emb_dim) learnable parameters
-        and W_a matrix is initialized with an identity matrix. Compared to "conv_scale_weight" method, this method shows more evenly
-        distributed scale weights.
-
-        Args:
-            ms_avg_embs_perm (Tensor):
-                Tensor containing cluster-average speaker embeddings for each scale.
-                Shape: (batch_size, length, scale_n, emb_dim)
-            ms_emb_seq (Tensor):
-                Tensor containing multi-scale speaker embedding sequences. `ms_emb_seq` is input from the
-                given audio stream input.
-                Shape: (batch_size, length, unit_n_spks, emb_dim)
-
-        Returns:
-            scale_weights (Tensor):
-                Weight vectors that determine the weight of each scale.
-                Shape: (batch_size, length, unit_n_spks, emb_dim)
-        """
-        self.W_a(ms_emb_seq.flatten(0, 1))
-        mat_a = self.W_a(ms_emb_seq.flatten(0, 1))
-        # mat_b = ms_avg_embs_perm.flatten(0, 1).permute(0, 2, 1)
-        # mat_b = mat_a.permute(0, 2, 1)
-        mat_b = mat_a[:, -1, :].unsqueeze(1).repeat(1, ms_emb_seq.shape[2], 1).permute(0, 2, 1)
-
-        weighted_corr = torch.matmul(mat_a, mat_b).reshape(ms_emb_seq.shape[0],-1, self.scale_n, self.scale_n) 
-        weight_sum = weighted_corr.sum(dim=2).unsqueeze(2).repeat(1,1,self.scale_n,1)
-        flatten_scale_weights = torch.div(weighted_corr, weight_sum)[:,:,:,0].unsqueeze(2).flatten(0, 1)
-        flat_ms_emb_seq = ms_emb_seq.flatten(0, 1)
-        merged_ms_emb_seq = torch.matmul(flatten_scale_weights, flat_ms_emb_seq).reshape(ms_emb_seq.shape[0], ms_emb_seq.shape[1], self.emb_dim)
-        scale_weights = flatten_scale_weights.reshape(ms_emb_seq.shape[0], ms_emb_seq.shape[1], self.scale_n)
-        return merged_ms_emb_seq, scale_weights
-
-    def get_scale_weighted_ms_seq(self, scale_weights, ms_emb_seq):
-        """
-        Calculate scale-weighted multi-scale embedding sequence.
-
-        Args:
-            scale_weights (Tensor):
-                Multiscale weights per each base-scale segment.
-            ms_emb_seq (Tensor):
-                Multiscale input embedding sequence
-
-        Returns:
-            scale_w_ms_emb_seq (Tensor):
-                Scale-weighted multi-scale embedding sequence.
-        """
-        scale_weight_flatten = scale_weights.reshape(self.batch_size * self.length, self.unit_n_spks, self.scale_n).mean(dim=1)
-        ms_emb_seq_flatten = ms_emb_seq.reshape(-1, self.scale_n, self.emb_dim)
-        scale_w_ms_emb_seq = torch.bmm(
-        scale_weight_flatten.reshape(self.batch_size * self.length, 1, self.scale_n),
-        ms_emb_seq_flatten.reshape(self.batch_size * self.length, self.scale_n, self.emb_dim)
-        )
-        return scale_w_ms_emb_seq
-
-    def element_wise_product(self, scale_weights, ms_avg_embs, ms_emb_seq):
-        """
-        Calculate element wise product values among cluster-average embedding vectors and input embedding vector sequences.
-        This function is selected by assigning `self.context_vector_type = "elem_prod"`. `elem_prod` method usually takes more
-        time to converge compared to `cos_sim` method.
-
-        Args:
-            scale_weights (Tensor):
-                Multiscale weight vector.
-                Shape: (batch_size, feats_len, scale_n, max_spks)
-            ms_avg_embs_perm (Tensor):
-                Tensor containing cluster-average speaker embeddings for each scale.
-                Shape: (batch_size, length, scale_n, emb_dim)
-            ms_emb_seq (Tensor):
-                Tensor containing multi-scale speaker embedding sequences. `ms_emb_seq` is a single channel input from the
-                given audio stream input.
-                Shape: (batch_size, length, unit_n_spks, emb_dim)
-
-        Returns:
-            context_emb (Tensor):
-                Output of `dist_to_emb` linear layer containing context for speaker label estimation.
-        """
-        scale_weight_flatten = scale_weights.reshape(self.batch_size * self.length, self.unit_n_spks, self.scale_n)
-        ms_avg_embs_flatten = ms_avg_embs.reshape(
-            self.batch_size * self.length, self.scale_n, self.emb_dim, self.unit_n_spks
-        )
-        ms_emb_seq_flatten = ms_emb_seq.reshape(-1, self.scale_n, self.emb_dim)
-        ms_emb_seq_flatten_rep = ms_emb_seq_flatten.unsqueeze(3).reshape(-1, self.scale_n, self.emb_dim, self.unit_n_spks)
-        elemwise_product = ms_avg_embs_flatten * ms_emb_seq_flatten_rep
-        context_vectors = torch.bmm(
-            scale_weight_flatten.reshape(self.batch_size * self.unit_n_spks * self.length, 1, self.scale_n),
-            elemwise_product.reshape(self.batch_size * self.unit_n_spks * self.length, self.scale_n, self.emb_dim),
-        )
-        context_vectors = context_vectors.reshape(self.batch_size, self.length, self.emb_dim * self.unit_n_spks)
-        context_emb = self.product_to_emb(context_vectors)
-        return context_emb
-
-    def cosine_similarity(self, scale_weights, ms_avg_embs, _ms_emb_seq):
-        """
-        Calculate cosine similarity values among cluster-average embedding vectors and input embedding vector sequences.
-        This function is selected by assigning self.context_vector_type = "cos_sim".
-
-        Args:
-            scale_weights (Tensor):
-                Multiscale weight vector.
-                Shape: (batch_size, feats_len, scale_n, max_spks)
-            ms_avg_embs_perm (Tensor):
-                Tensor containing cluster-average speaker embeddings for each scale.
-                Shape: (batch_size, length, scale_n, emb_dim)
-            _ms_emb_seq (Tensor):
-                Tensor containing multi-scale speaker embedding sequences. `ms_emb_seq` is a single channel input from the
-                given audio stream input.
-                Shape: (batch_size, length, unit_n_spks, emb_dim)
-
-        Returns:
-            context_emb (Tensor):
-                Output of `dist_to_emb` linear layer containing context for speaker label estimation.
-        """
-        cos_dist_seq = self.cos_dist(_ms_emb_seq, ms_avg_embs)
-        context_vectors = torch.mul(scale_weights, cos_dist_seq)
-        context_vectors = context_vectors.view(self.batch_size, self.length, -1)
-        context_emb = self.dist_to_emb(context_vectors)
-        return context_emb
-
-    def attention_scale_weights(self, ms_avg_embs_perm, ms_emb_seq):
-        """
-        Use weighted inner product for calculating each scale weight. W_a matrix has (emb_dim * emb_dim) learnable parameters
-        and W_a matrix is initialized with an identity matrix. Compared to "conv_scale_weight" method, this method shows more evenly
-        distributed scale weights.
-
-        Args:
-            ms_avg_embs_perm (Tensor):
-                Tensor containing cluster-average speaker embeddings for each scale.
-                Shape: (batch_size, length, scale_n, emb_dim)
-            ms_emb_seq (Tensor):
-                Tensor containing multi-scale speaker embedding sequences. `ms_emb_seq` is input from the
-                given audio stream input.
-                Shape: (batch_size, length, unit_n_spks, emb_dim)
-
-        Returns:
-            scale_weights (Tensor):
-                Weight vectors that determine the weight of each scale.
-                Shape: (batch_size, length, unit_n_spks, emb_dim)
-        """
-        self.W_a(ms_emb_seq.flatten(0, 1))
-        mat_a = self.W_a(ms_emb_seq.flatten(0, 1))
-        mat_b = ms_avg_embs_perm.flatten(0, 1).permute(0, 2, 1)
-
-        weighted_corr = torch.matmul(mat_a, mat_b).reshape(-1, self.scale_n, self.scale_n, self.unit_n_spks)
-        scale_weights = torch.sigmoid(torch.diagonal(weighted_corr, dim1=1, dim2=2))
-        scale_weights = scale_weights.reshape(self.batch_size, self.length, self.scale_n, self.unit_n_spks)
-        scale_weights = self.softmax(scale_weights)
-        return scale_weights
-
-    def conv_scale_weights(self, ms_avg_embs_perm, ms_emb_seq_single):
-        """
-        Use multiple Convnet layers to estimate the scale weights based on the cluster-average embedding and
-        input embedding sequence.
-
-        Args:
-            ms_avg_embs_perm (Tensor):
-                Tensor containing cluster-average speaker embeddings for each scale.
-                Shape: (batch_size, length, scale_n, emb_dim)
-            ms_emb_seq_single (Tensor):
-                Tensor containing multi-scale speaker embedding sequences. ms_emb_seq_single is input from the
-                given audio stream input.
-                Shape: (batch_size, length, unit_n_spks, emb_dim)
-
-        Returns:
-            scale_weights (Tensor):
-                Weight vectors that determine the weight of each scale.
-                Shape: (batch_size, length, unit_n_spks, emb_dim)
-        """
-        ms_cnn_input_seq = torch.cat([ms_avg_embs_perm, ms_emb_seq_single], dim=2)
-        ms_cnn_input_seq = ms_cnn_input_seq.unsqueeze(2).flatten(0, 1)
-
-        conv_out = self.conv_forward(
-            ms_cnn_input_seq, conv_module=self.conv[0], bn_module=self.conv_bn[0], first_layer=True
-        )
-        for conv_idx in range(1, self.conv_repeat + 1):
-            conv_out = self.conv_forward(
-                conv_input=conv_out,
-                conv_module=self.conv[conv_idx],
-                bn_module=self.conv_bn[conv_idx],
-                first_layer=False,
-            )
-
-        lin_input_seq = conv_out.view(self.batch_size, self.length, self.cnn_output_ch * self.emb_dim)
-        hidden_seq = self.conv_to_linear(lin_input_seq)
-        hidden_seq = self.dropout(F.leaky_relu(hidden_seq))
-        scale_weights = self.softmax(self.linear_to_weights(hidden_seq))
-        scale_weights = scale_weights.unsqueeze(3).expand(-1, -1, -1, self.unit_n_spks)
-        return scale_weights
-
-    def conv_forward(self, conv_input, conv_module, bn_module, first_layer=False):
-        """
-        A module for convolutional neural networks with 1-D filters. As a unit layer batch normalization, non-linear layer and dropout
-        modules are included.
-
-        Note:
-            If `first_layer=True`, the input shape is set for processing embedding input.
-            If `first_layer=False`, then the input shape is set for processing the output from another `conv_forward` module.
-
-        Args:
-            conv_input (Tensor):
-                Reshaped tensor containing cluster-average embeddings and multi-scale embedding sequences.
-                Shape: (batch_size*length, 1, scale_n*(unit_n_spks+1), emb_dim)
-            conv_module (ConvLayer):
-                ConvLayer instance containing torch.nn.modules.conv modules.
-            bn_module (torch.nn.modules.batchnorm.BatchNorm2d):
-                Predefined Batchnorm module.
-            first_layer (bool):
-                Boolean for switching between the first layer and the others.
-                Default: `False`
-
-        Returns:
-            conv_out (Tensor):
-                Convnet output that can be fed to another ConvLayer module or linear layer.
-                Shape: (batch_size*length, 1, cnn_output_ch, emb_dim)
-        """
-        conv_out = conv_module(conv_input)
-        conv_out = conv_out.permute(0, 2, 1, 3) if not first_layer else conv_out
-        conv_out = conv_out.reshape(self.batch_size, self.length, self.cnn_output_ch, self.emb_dim)
-        conv_out = conv_out.unsqueeze(2).flatten(0, 1)
-        conv_out = bn_module(conv_out.permute(0, 3, 2, 1)).permute(0, 3, 2, 1)
-        conv_out = self.dropout(F.leaky_relu(conv_out))
-        return conv_out
-
-    @typecheck()
-    def forward(self, ms_emb_seq, length, ms_avg_embs):
-        if self.n_stream > 1:
-            split_tup = (self.unit_n_spks,) * (self.n_stream - 1)
-            ms_avg_embs_concat = torch.cat(torch.tensor_split(ms_avg_embs, split_tup, dim=3), dim=0)
-            ms_emb_seq = ms_emb_seq.repeat(self.n_stream, 1, 1, 1)  
-            length = length.repeat(self.n_stream)
-            ms_avg_embs = ms_avg_embs_concat
-
-        context_emb, scale_weights = self.core_model(ms_emb_seq, length, ms_avg_embs)
-        preds, scale_weights = self.lstm_classifier(context_emb, scale_weights)
-
-        if self.n_stream > 1:
-            preds_split_tup = (int(preds.shape[0]/self.n_stream),) * (self.n_stream - 1)
-            preds_reshaped = torch.cat(torch.tensor_split(preds, preds_split_tup, dim=0), dim=2)
-            scale_weights_reshaped = torch.cat(torch.tensor_split(scale_weights, preds_split_tup, dim=0), dim=3)
-            preds, scale_weights = preds_reshaped, scale_weights_reshaped
-        return preds, scale_weights
-    
     def forward_context(self, ms_emb_seq, length, ms_avg_embs):
-        # if self.n_stream > 1:
-        #     seg_split_tup = (self.unit_n_spks,) * (self.n_stream - 1)
-        #     ms_avg_embs_concat = torch.cat(torch.tensor_split(ms_avg_embs, seg_split_tup, dim=3), dim=0)
-        #     ms_emb_seq = ms_emb_seq.repeat(self.n_stream, 1, 1, 1)  
-        #     length = length.repeat(self.n_stream)
-        #     ms_avg_embs = ms_avg_embs_concat
-
         context_emb, scale_weights = self.core_model(ms_emb_seq, length, ms_avg_embs)
         context_emb = self.dropout(F.relu(context_emb))
         return context_emb, scale_weights
-
-    # def forward_speaker_logits(self, lstm_output, scale_weights):
-    #     lstm_hidden_out = self.dropout(F.relu(lstm_output))
-    #     spk_preds = self.single_hidden_to_spks(lstm_hidden_out)
-    #     preds = nn.Sigmoid()(spk_preds)
-
-    #     if self.n_stream > 1:
-    #         preds_split_tup = (int(preds.shape[0]/self.n_stream),) * (self.n_stream - 1)
-    #         preds_reshaped = torch.cat(torch.tensor_split(preds, preds_split_tup, dim=0), dim=2)
-    #         scale_weights_reshaped = torch.cat(torch.tensor_split(scale_weights, preds_split_tup, dim=0), dim=3)
-    #         preds, scale_weights = preds_reshaped, scale_weights_reshaped
-    #     return preds, scale_weights
-     
     
     def sort_output_states(self, output_states):
         bs, seq_len, emb_dim = output_states.shape
@@ -559,8 +317,6 @@ class SortformerDiarizer(NeuralModule, Exportable):
     def forward_speaker_sigmoids(self, hidden_out):
         if self.sort_final_layer_on:
             hidden_out = self.sort_output_states(hidden_out)
-        # hidden_out = self.dropout(F.relu(hidden_out))
-        # hidden_out = self.first_hidden_to_hidden(hidden_out)
         hidden_out = self.dropout(F.relu(hidden_out))
         hidden_out = self.first_hidden_to_hidden(hidden_out)
         if self.sort_final_layer_on:
@@ -580,7 +336,7 @@ class SortformerDiarizer(NeuralModule, Exportable):
         mock_embs = self.target_to_embs(emb_seq) 
         return mock_embs 
     
-    def input_example(self):
+    def input_example(self, lens=100):
         """
         Generate input examples for tracing etc.
 
@@ -588,7 +344,7 @@ class SortformerDiarizer(NeuralModule, Exportable):
             A tuple of input examples.
         """
         device = next(self.parameters()).device
-        lens = torch.full(size=(input_example.shape[0],), fill_value=123, device=device)
         input_example = torch.randn(1, lens, self.scale_n, self.emb_dim, device=device)
+        lens = torch.full(size=(input_example.shape[0],), fill_value=123, device=device)
         avg_embs = torch.randn(1, self.scale_n, self.emb_dim, self.num_spks, device=device)
         return tuple([input_example, lens, avg_embs])

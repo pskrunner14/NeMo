@@ -11,6 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""
+
+python $BASEPATH/neural_diarizer/sortformer_diarization.py \
+    model_path=/path/to/sortformer_model.nemo \
+    batch_size=4 \
+    session_len_sec=600 \
+    interpolated_scale=0.16 \
+    save_tensor_images=True \
+    tensor_image_dir=/path/to/tensor_image_dir \
+    dataset_manifest=/path/to/diarization_path_to_manifest.json
+
+"""
+
+
 
 import pytorch_lightning as pl
 from omegaconf import OmegaConf
@@ -18,40 +32,30 @@ from pytorch_lightning import seed_everything
 
 from nemo.collections.asr.models import SortformerEncLabelModel
 from nemo.core.config import hydra_runner
-from nemo.utils import logging
-from nemo.utils.exp_manager import exp_manager
+from nemo.collections.asr.metrics.der import score_labels
 
-import contextlib
-import glob
-import json
 import os
+
 from dataclasses import dataclass, is_dataclass
-from tempfile import NamedTemporaryFile
-from typing import List, Optional, Union
+from typing import Optional, Union
+
+from pyannote.core import Segment, Timeline
+from nemo.collections.asr.parts.utils.vad_utils import binarization, filtering
+from nemo.collections.asr.parts.utils.speaker_utils import audio_rttm_map as get_audio_rttm_map
+from nemo.collections.asr.parts.utils.speaker_utils import (
+labels_to_pyannote_object,
+generate_cluster_labels,
+rttm_to_labels,
+get_overlap_range,
+is_overlap,
+)
+
+
 
 import pytorch_lightning as pl
 import torch
-from omegaconf import OmegaConf, open_dict
-
-from nemo.collections.asr.models import EncDecCTCModel, EncDecHybridRNNTCTCModel
-from nemo.collections.asr.modules.conformer_encoder import ConformerChangeConfig
-# from nemo.collections.asr.parts.submodules.ctc_decoding import CTCDecodingConfig
-# from nemo.collections.asr.parts.submodules.multitask_decoding import MultiTaskDecoding, MultiTaskDecodingConfig
-# from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTDecodingConfig
-# from nemo.collections.asr.parts.utils.eval_utils import cal_write_wer
-from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
-from nemo.collections.asr.parts.utils.transcribe_utils import (
-    compute_output_filename,
-    prepare_audio_data,
-    # read_and_maybe_sort_manifest,
-    # restore_transcription_order,
-    setup_model,
-    transcribe_partial_audio,
-    write_transcription,
-)
-from nemo.collections.common.parts.preprocessing.manifest import get_full_path
+from omegaconf import OmegaConf
 from nemo.core.config import hydra_runner
-from nemo.utils import logging
 """
 Example of end-to-end diarization inference 
 """
@@ -59,19 +63,13 @@ Example of end-to-end diarization inference
 seed_everything(42)
 
 @dataclass
-class ModelChangeConfig:
-
-    # Sub-config for changes specific to the Conformer Encoder
-    conformer: ConformerChangeConfig = ConformerChangeConfig()
-
-
-@dataclass
-class TranscriptionConfig:
+class DiarizationConfig:
     # Required configs
     model_path: Optional[str] = None  # Path to a .nemo file
     pretrained_name: Optional[str] = None  # Name of a pretrained model
     audio_dir: Optional[str] = None  # Path to a directory which contains audio files
     tensor_image_dir: Optional[str] = None  # Path to a directory which contains tensor images
+    save_tensor_images: bool = False  # If True, saves tensor images to disk for debugging purposes
     dataset_manifest: Optional[str] = None  # Path to dataset's JSON manifest
     channel_selector: Optional[
         Union[int, str]
@@ -79,25 +77,15 @@ class TranscriptionConfig:
     audio_key: str = 'audio_filepath'  # Used to override the default audio key in dataset_manifest
     eval_config_yaml: Optional[str] = None  # Path to a yaml file of config of evaluation
     presort_manifest: bool = True  # Significant inference speedup on short-form data due to padding reduction
-
+    interpolated_scale:float=0.16
+    
     # General configs
     output_filename: Optional[str] = None
+    session_len_sec: float = 60 # End-to-end diarization session length in seconds
     batch_size: int = 4
     num_workers: int = 0
-    append_pred: bool = False  # Sets mode of work, if True it will add new field transcriptions.
-    pred_name_postfix: Optional[str] = None  # If you need to use another model name, rather than standard one.
     random_seed: Optional[int] = None  # seed number going to be used in seed_everything()
 
-    # Set to True to output greedy timestamp information (only supported models)
-    compute_timestamps: bool = False
-    # set to True if need to return full alignment information
-    preserve_alignment: bool = False
-
-    # Set to True to output language ID information
-    compute_langs: bool = False
-
-    # Set `cuda` to int to define CUDA device. If 'None', will look for CUDA
-    # device anyway, and do inference on CPU only if CUDA device is not found.
     # If `cuda` is a negative number, inference will be on CPU only.
     cuda: Optional[int] = None
     allow_mps: bool = False  # allow to select MPS device (Apple Silicon M-series GPU)
@@ -106,41 +94,101 @@ class TranscriptionConfig:
     matmul_precision: str = "highest"  # Literal["highest", "high", "medium"]
     audio_type: str = "wav"
 
-    # Recompute model transcription, even if the output folder exists with scores.
-    overwrite_transcripts: bool = True
 
 
-    # decoder type: ctc or rnnt, can be used to switch between CTC and RNNT decoder for Hybrid RNNT/CTC models
-    decoder_type: Optional[str] = None
-    # att_context_size can be set for cache-aware streaming models with multiple look-aheads
-    att_context_size: Optional[list] = None
+@dataclass
+class VadParams:
+    window_length_in_sec: float = 0.15
+    shift_length_in_sec: float = 0.01
+    smoothing: str = "median"
+    overlap: float = 0.5
+    onset: float = 0.5
+    offset: float = 0.5
+    pad_onset: float = 0.05
+    pad_offset: float = 0.05
+    min_duration_on: float = 0.05
+    min_duration_off: float = 0.0
+    filter_speech_first: bool = True
 
-    # Config for word / character error rate calculation
-    calculate_wer: bool = True
-    clean_groundtruth_text: bool = False
-    langid: str = "en"  # specify this for convert_num_to_words step in groundtruth cleaning
-    use_cer: bool = False
+def get_overlapping_list(source_range_list, target_range):
+    out_range = []
+    for line_str in source_range_list:
+        _stt, _end, spk = line_str.split()
+        s_range = (float(_stt), float(_end))
+        if is_overlap(s_range, target_range):
+            ovl_range = get_overlap_range(s_range, target_range)
+            out_range.append(f"{ovl_range[0]} {ovl_range[1]} {spk}")
+    return out_range
 
-    # can be set to True to return list of transcriptions instead of the config
-    # if True, will also skip writing anything to the output file
-    return_transcriptions: bool = False
+def timestamps_to_pyannote_object(timestamps, cluster_labels, uniq_id, audio_rttm_values, all_hypothesis, all_reference, all_uems):
+    labels, lines = generate_cluster_labels(timestamps, cluster_labels)
+    hypothesis = labels_to_pyannote_object(labels, uniq_name=uniq_id)
+    all_hypothesis.append([uniq_id, hypothesis])
+    rttm_file = audio_rttm_values.get('rttm_filepath', None)
+    
+    if rttm_file is not None and os.path.exists(rttm_file):
+        offset, dur = float(audio_rttm_values.get('offset', None)), float(audio_rttm_values.get('duration', None))
+        uem_lines = [[offset, dur+offset]] 
+        org_ref_labels = rttm_to_labels(rttm_file)
+        ref_labels = org_ref_labels
+        reference = labels_to_pyannote_object(ref_labels, uniq_name=uniq_id)
+        uem_obj = get_uem_object(uem_lines, uniq_id=uniq_id)
+        all_uems.append(uem_obj)
+        all_reference.append([uniq_id, reference])
+    return all_hypothesis, all_reference, all_uems
 
-    # Set to False to return text instead of hypotheses from the transcribe function, so as to save memory
-    return_hypotheses: bool = True
+def ts_vad_post_processing(ts_vad_binary_vec, cfg_vad_params, hop_length: int=8):
+    ts_vad_binary_frames = torch.repeat_interleave(ts_vad_binary_vec, hop_length)
+    speech_segments = binarization(ts_vad_binary_frames, cfg_vad_params)
+    speech_segments = filtering(speech_segments, cfg_vad_params)
+    return speech_segments
 
-    # key for groundtruth text in manifest
-    gt_text_attr_name: str = "text"
-    gt_lang_attr_name: str = "lang"
+def get_uem_object(uem_lines, uniq_id):
+    """
+    Generate pyannote timeline segments for uem file
+    
+     <UEM> file format
+     UNIQ_SPEAKER_ID CHANNEL START_TIME END_TIME
+     
+    Args:
+        uem_lines (list): list of session ID and start, end times.
+    """
+    timeline = Timeline(uri=uniq_id)
+    for uem_stt_end in uem_lines:
+        start_time, end_time = uem_stt_end 
+        timeline.add(Segment(float(start_time), float(end_time)))
+    return timeline
 
-    # Use model's transcribe() function instead of transcribe_partial_audio() by default
-    # Only use transcribe_partial_audio() when the audio is too long to fit in memory
-    # Your manifest input should have `offset` field to use transcribe_partial_audio()
-    allow_partial_transcribe: bool = False
+
+def convert_pred_mat_to_segments(
+    audio_rttm_map_dict, 
+    batch_preds: torch.Tensor, 
+    offset: float, 
+    hop_length:int = 5
+    ):
+    batch_pred_ts_segs, all_hypothesis, all_reference, all_uems = [], [], [], []
+    thres_offset = {0: 0, 1: 0, 2: 0, 3: 0}
+    for sample_idx, (uniq_id, audio_rttm_values) in enumerate(audio_rttm_map_dict.items()):
+        spk_ts, timestamps, cluster_labels = [], [], []
+        speaker_assign_mat = batch_preds[sample_idx]
+        for spk_id in range(speaker_assign_mat.shape[-1]):
+            cfg_vad_params = OmegaConf.structured(VadParams())
+            cfg_vad_params.onset = cfg_vad_params.onset + thres_offset[spk_id]
+            cfg_vad_params.offset = cfg_vad_params.offset + thres_offset[spk_id]
+            ts_mat = ts_vad_post_processing(speaker_assign_mat[:, spk_id], cfg_vad_params, hop_length=8)
+            ts_mat = ts_mat + offset
+            ts_seg_list = ts_mat.tolist()
+            spk_ts.append(ts_seg_list)
+            cluster_labels.extend([ spk_id for _ in range(len(ts_seg_list))])
+            timestamps.extend(ts_seg_list)
+        all_hypothesis, all_reference, all_uems = timestamps_to_pyannote_object(timestamps, cluster_labels, uniq_id, audio_rttm_values, all_hypothesis, all_reference, all_uems)
+        batch_pred_ts_segs.append(spk_ts) 
+    return batch_pred_ts_segs, all_hypothesis, all_reference, all_uems
 
 
-@hydra_runner(config_name="TranscriptionConfig", schema=TranscriptionConfig)
-def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig]:
-    logging.info(f'Hydra config: {OmegaConf.to_yaml(cfg)}')
+
+@hydra_runner(config_name="DiarizationConfig", schema=DiarizationConfig)
+def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
 
     for key in cfg:
         cfg[key] = None if cfg[key] == 'None' else cfg[key]
@@ -156,13 +204,6 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig]:
     if cfg.audio_dir is None and cfg.dataset_manifest is None:
         raise ValueError("Both cfg.audio_dir and cfg.dataset_manifest cannot be None!")
 
-    # Load augmentor from exteranl yaml file which contains eval info, could be extend to other feature such VAD, P&C
-    augmentor = None
-    if cfg.eval_config_yaml:
-        eval_config = OmegaConf.load(cfg.eval_config_yaml)
-        augmentor = eval_config.test_ds.get("augmentor")
-        logging.info(f"Will apply on-the-fly augmentation on samples during transcription: {augmentor} ")
-
     # setup GPU
     torch.set_float32_matmul_precision(cfg.matmul_precision)
     if cfg.cuda is None:
@@ -171,10 +212,6 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig]:
             accelerator = 'gpu'
             map_location = torch.device('cuda:0')
         elif cfg.allow_mps and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            logging.warning(
-                "MPS device (Apple Silicon M-series GPU) support is experimental."
-                " Env variable `PYTORCH_ENABLE_MPS_FALLBACK=1` should be set in most cases to avoid failures."
-            )
             device = [0]
             accelerator = 'mps'
             map_location = torch.device('mps')
@@ -187,21 +224,35 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig]:
         accelerator = 'gpu'
         map_location = torch.device(f'cuda:{cfg.cuda}')
 
-    logging.info(f"Inference will be done on device: {map_location}")
-
-    # diar_model, model_name = setup_model(cfg, map_location)
-    # diar_model = SortformerEncLabelModel.restore_from(restore_path=cfg.model_path)
     diar_model = SortformerEncLabelModel.load_from_checkpoint(checkpoint_path=cfg.model_path, map_location=map_location)
-    # diar_model.cfg_e2e_diarizer_model.tensor_image_dir 
     diar_model._cfg.diarizer.out_dir = cfg.tensor_image_dir
+    diar_model._cfg.test_ds.session_len_sec = cfg.session_len_sec
     trainer = pl.Trainer(devices=device, accelerator=accelerator)
     diar_model.set_trainer(trainer)
     diar_model = diar_model.eval()
     diar_model._cfg.test_ds.manifest_filepath = cfg.dataset_manifest
+    infer_audio_rttm_dict = get_audio_rttm_map(cfg.dataset_manifest)
     diar_model._cfg.test_ds.batch_size = cfg.batch_size
+    
+    # Force the model to use the designated hop length
+    scale_n = len(diar_model.msdd_multiscale_args_dict['scale_dict'])
+    diar_model.msdd_multiscale_args_dict['scale_dict'][scale_n-1] = (float(cfg.interpolated_scale), float(cfg.interpolated_scale/2))
+    
+    # Model setup for inference 
     diar_model.setup_test_data(test_data_config=diar_model._cfg.test_ds)    
-    trainer.test(diar_model)
+    diar_model.test_batch()
+    
+    # Evaluation
+    output_list, all_hyps, all_refs, all_uems = convert_pred_mat_to_segments(infer_audio_rttm_dict, 
+                                                                             batch_preds=diar_model.preds_total, 
+                                                                             offset=0, 
+                                                                             hop_length=5)
+    metric, mapping_dict, itemized_errors = score_labels(AUDIO_RTTM_MAP=infer_audio_rttm_dict, 
+                                                         all_reference=all_refs, 
+                                                         all_hypothesis=all_hyps, 
+                                                         all_uem=all_uems, 
+                                                         collar=0.25, 
+                                                         ignore_overlap=False)
 
 if __name__ == '__main__':
-    
     main()

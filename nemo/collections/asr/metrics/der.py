@@ -130,7 +130,13 @@ def uem_timeline_from_file(uem_file, uniq_name=''):
 
 
 def score_labels(
-    AUDIO_RTTM_MAP, all_reference, all_hypothesis, collar=0.25, ignore_overlap=True, verbose: bool = True
+    AUDIO_RTTM_MAP, 
+    all_reference, 
+    all_hypothesis,  
+    all_uem: List[List[float]], 
+    collar:float=0.25, 
+    ignore_overlap: bool=True, 
+    verbose: bool = True
 ) -> Optional[Tuple[DiarizationErrorRate, Dict]]:
     """
     Calculate DER, CER, FA and MISS rate from hypotheses and references. Hypothesis results are
@@ -158,17 +164,22 @@ def score_labels(
         metric = DiarizationErrorRate(collar=2 * collar, skip_overlap=ignore_overlap)
 
         mapping_dict, correct_spk_count = {}, 0
-        for (reference, hypothesis) in zip(all_reference, all_hypothesis):
+        for idx, (reference, hypothesis) in enumerate(zip(all_reference, all_hypothesis)):
             ref_key, ref_labels = reference
             _, hyp_labels = hypothesis
             if len(ref_labels.labels()) == len(hyp_labels.labels()):
                 correct_spk_count += 1
             if verbose and len(ref_labels.labels()) != len(hyp_labels.labels()):
                 logging.info(f"Wrong Spk. Count with uniq_id:...{ref_key[-10:]}, Ref: {len(ref_labels.labels())}, Hyp: {len(hyp_labels.labels())}")
-            uem = AUDIO_RTTM_MAP[ref_key].get('uem_filepath', None)
-            if uem is not None:
-                uem = uem_timeline_from_file(uem_file=uem, uniq_name=ref_key)
-            metric(ref_labels, hyp_labels, uem=uem, detailed=True)
+            uem_obj = None
+            if all_uem is not None:
+                metric(ref_labels, hyp_labels, uem=all_uem[idx], detailed=True)
+            elif AUDIO_RTTM_MAP[ref_key].get('uem_filepath', None) is not None:
+                uem_file = AUDIO_RTTM_MAP[ref_key].get('uem_filepath', None)
+                uem_obj = uem_timeline_from_file(uem_file=uem_file, uniq_name=ref_key)
+                metric(ref_labels, hyp_labels, uem=uem_obj, detailed=True)
+            else:
+                metric(ref_labels, hyp_labels, detailed=True)
             mapping_dict[ref_key] = metric.optimal_mapping(ref_labels, hyp_labels)
 
         spk_count_acc = correct_spk_count / len(all_reference)

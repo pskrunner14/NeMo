@@ -114,6 +114,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         self.cfg_e2e_diarizer_model = cfg
         self.encoder_infer_mode = False
         
+        self._init_segmentation_info()
         if self._trainer:
             self.world_size = trainer.num_nodes * trainer.num_devices
             self.pairwise_infer = False
@@ -121,6 +122,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             self.world_size = 1
             self.pairwise_infer = True
 
+        self._init_msdd_scales()  
         if self._trainer is not None and self.cfg_e2e_diarizer_model.get('augmentor', None) is not None:
             self.augmentor = process_augmentations(self.cfg_e2e_diarizer_model.augmentor)
         else:
@@ -190,7 +192,18 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
 
         speaker_inds = list(range(self.cfg_e2e_diarizer_model.max_num_of_spks))
         self.spk_perm = torch.tensor(list(itertools.permutations(speaker_inds))) # Get all permutations
-        
+
+    def _init_segmentation_info(self):
+        """Initialize segmentation settings: window, shift and multiscale weights.
+        """
+        self._diarizer_params = self.cfg_e2e_diarizer_model.diarizer
+        self.multiscale_args_dict = parse_scale_configs(
+            self._diarizer_params.speaker_embeddings.parameters.window_length_in_sec,
+            self._diarizer_params.speaker_embeddings.parameters.shift_length_in_sec,
+            self._diarizer_params.speaker_embeddings.parameters.multiscale_weights,
+        )
+
+ 
     def _init_msdd_scales(self,):
         window_length_in_sec = self.cfg_e2e_diarizer_model.diarizer.speaker_embeddings.parameters.window_length_in_sec
         self.msdd_multiscale_args_dict = self.multiscale_args_dict

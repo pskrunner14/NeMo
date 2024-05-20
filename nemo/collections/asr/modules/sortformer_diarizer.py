@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
+#            preds_mean = preds Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -126,6 +126,7 @@ class SortformerDiarizer(NeuralModule, Exportable):
         context_vector_type: str = 'cos_sim',
         sort_layer_on: bool = False, 
         sort_final_layer_on: bool = False,
+        merge_unit_count: int = 1,
         mem_len: int = 2400,
         step_len: int = 2400,
     ):
@@ -167,17 +168,29 @@ class SortformerDiarizer(NeuralModule, Exportable):
         # Streaming Sortformer parameters 
         self.mem_len = mem_len
         self.step_len = step_len
-        self.total_len = self.mem_len + self.step_len
         self.embedding_list = []
         self.eps = 1e-6
+        self.memory_compress_pool_size = 2
      
     def _zero_sub_diag(self, trans_mat, emb_win:int=10, full_upper=False):
         """
-        if emb_win is > 0, it will shift `emb_win` number of steps above the diagonal line.
-        
+        Zeroes out elements below a certain diagonal in a matrix.
+
+        This method creates a mask to zero out elements below a specified diagonal in the input matrix `trans_mat`.
+        If `emb_win` is greater than 0, it will shift `emb_win` number of steps above the diagonal line.
+
         Args:
-            trans_mat:
+            trans_mat (torch.Tensor): 
+                The input matrix to be masked. 
                 Dimension: (batch_size, step_len, step_len)
+            emb_win (int): 
+                The number of steps above the diagonal line to start zeroing out elements. Default is 10.
+            full_upper (bool): 
+                If True, the entire upper triangular part of the matrix is retained. Default is False.
+
+        Returns:
+            total_mask(torch.Tensor): 
+                The masked matrix with elements below the specified diagonal zeroed out.
         """
         mask1 = torch.triu(torch.ones_like(trans_mat[0], dtype=torch.bool),  diagonal=0).to(trans_mat.device)
         mask2 = torch.triu(torch.ones_like(trans_mat[0], dtype=torch.bool),  diagonal=-1*emb_win).T.to(trans_mat.device)
@@ -185,9 +198,11 @@ class SortformerDiarizer(NeuralModule, Exportable):
             ext_mask = mask1
         else:
             ext_mask = (mask1 * mask2).unsqueeze(0).repeat(trans_mat.shape[0], 1, 1)
-        return trans_mat * ext_mask
+        total_mask = trans_mat * ext_mask
+        return total_mask
     
-    def _attention_score_compressor(self, 
+    def _attention_score_compressor(
+        self, 
         batch_size: int, 
         mem_and_new_embs: torch.Tensor, 
         compress_ratio: int,
@@ -205,18 +220,24 @@ class SortformerDiarizer(NeuralModule, Exportable):
                 The ratio of compressing the new incoming embeddings.
                 
         Returns:
-            Assigner matrix which selects the embeddings for the next-steps from the memory embeddings and new incoming embeddings.
+            assigner_mat (torch.Tensor):
+                Assigner matrix that selects the embedding vectors need to be removed.
+                Dimension: [batch_size, mem_len, (mem_len+step_len)]
         """
-        selection_mask = torch.eye(self.step_len).repeat(batch_size, compress_ratio, compress_ratio)
-        total_len_eye = torch.eye(self.total_len).unsqueeze(0).repeat(batch_size, 1, 1).to(mem_and_new_embs.device)
-        batch_attention_raw = torch.bmm(mem_and_new_embs, mem_and_new_embs.transpose(1,2)).cpu()
-        batch_attention = selection_mask * batch_attention_raw
-        batch_unit_win_max_inds = batch_attention.sum(dim=2).reshape(batch_size, -1, compress_ratio).max(dim=2)[1]
-        batch_target_remove_inds = batch_unit_win_max_inds + (torch.arange(self.step_len)*compress_ratio).unsqueeze(0).repeat(batch_size, 1)
-        batch_inds_for_masker = torch.arange(batch_size).unsqueeze(1).expand_as(batch_target_remove_inds) 
-        masker = torch.ones((batch_size, self.total_len)).bool().to(mem_and_new_embs.device)
-        masker[batch_inds_for_masker, batch_target_remove_inds] = False
-        assinger_mat = total_len_eye.view(batch_size * self.total_len, -1)[masker.view(-1), :].reshape(batch_size, self.mem_len, -1) 
+        # Create a block matrix of all-ones matrices.
+        selection_mask = torch.eye(self.step_len).repeat(batch_size, compress_ratio, compress_ratio)  # [batch_size, (mem_len+step_len), (mem_len+step_len)]
+        total_len_eye = torch.eye(self.step_len+self.mem_len).unsqueeze(0).repeat(batch_size, 1, 1).to(mem_and_new_embs.device)  # [batch_size, (mem_len+step_len), (mem_len+step_len)]
+        # Calculate the attention score between the memory embeddings and the new incoming embeddings.
+        batch_attention_raw = torch.bmm(mem_and_new_embs, mem_and_new_embs.transpose(1, 2)).cpu()  # [batch_size, (mem_len+step_len), (mem_len+step_len)]
+        batch_attention = selection_mask * batch_attention_raw  # [batch_size, (mem_len+step_len), (mem_len+step_len)]
+        # For every `compress_ratio` rows, find a row with the highest attention score, which means the most redundant sample.
+        batch_unit_win_max_inds = batch_attention.sum(dim=2).reshape(batch_size, -1, compress_ratio).max(dim=2)[1]  # [batch_size, step_len]
+        batch_target_remove_inds = batch_unit_win_max_inds + (torch.arange(self.step_len) * compress_ratio).unsqueeze(0).repeat(batch_size, 1) # [batch_size, step_len]
+        batch_inds_for_masker = torch.arange(batch_size).unsqueeze(1).expand_as(batch_target_remove_inds)  # [batch_size, step_len]
+        # Create a masker matrix that selects the embedding vectors need to be removed.
+        masker = torch.ones((batch_size, self.mem_len+self.step_len)).bool().to(mem_and_new_embs.device)  # [batch_size, (mem_len+step_len)]
+        masker[batch_inds_for_masker, batch_target_remove_inds] = False  # [batch_size, (mem_len+step_len)]
+        assinger_mat = total_len_eye.view(batch_size * (self.mem_len+self.step_len), -1)[masker.view(-1), :].reshape(batch_size, self.mem_len, -1) # [batch_size, mem_len, mem_len + step_len]
         return assinger_mat
     
     def _drop_to_compress(
@@ -227,22 +248,47 @@ class SortformerDiarizer(NeuralModule, Exportable):
         compress_ratio: int,
         thres: float =0.95,
         ):
-        overlap_bool_nl = mem_and_new_labels.sum(dim=2) > 1
-        mnl_noovl = mem_and_new_labels.clone()
-        mnl_noovl[overlap_bool_nl] = 0
-        sil_bools = (mnl_noovl.sum(dim=2) == 0)
-        silaug_mnl_noovl = torch.cat((mnl_noovl, torch.zeros_like(mnl_noovl[:,:,0].unsqueeze(2))), dim=2)
-        silaug_mnl_noovl[torch.arange(sil_bools.shape[0]).unsqueeze(1), :, -1].squeeze(1)[sil_bools] = 1
-        trans_label_mask = torch.bmm(silaug_mnl_noovl, silaug_mnl_noovl.transpose(1,2)) 
-        trans_label_mask_zeroed = self._zero_sub_diag(trans_label_mask, emb_win=0).detach().cpu()
-        compression_mask_inds = (torch.arange(trans_label_mask.size(1)) % (compress_ratio) != 1).cpu()
-        trans_label_mask_zerocomp = trans_label_mask_zeroed[:, compression_mask_inds, :]
-        row_maxs = trans_label_mask_zerocomp.max(dim=2, keepdim=True)[0]
-        normalized_compress_mat = trans_label_mask_zerocomp / (row_maxs + self.eps) # [bs, mem_len, (mem_len + step_len)]
-        assinger_mat = torch.zeros_like(normalized_compress_mat).to(chunk_emb_seq.device)
-        assinger_mat[(normalized_compress_mat >= thres)] = 1
-        row_maxs_post = assinger_mat.sum(dim=2).unsqueeze(2)
-        assinger_mat = assinger_mat / (row_maxs_post + self.eps)
+        """
+        Compress the memory and new embeddings by dropping less significant embeddings based on a threshold.
+
+        Args:
+            chunk_emb_seq (torch.Tensor): 
+                The chunk of embedding sequences. Dimension: [batch_size, step_len, emb_dim].
+            mem_and_new_embs (torch.Tensor): 
+                Concatenated memory embeddings and new incoming embeddings. 
+                Dimension: [batch_size, mem_len + step_len, emb_dim].
+            mem_and_new_labels (torch.Tensor): 
+                Concatenated memory labels and new incoming labels. 
+                Dimension: [batch_size, mem_len + step_len, label_dim].
+            compress_ratio (int): 
+                The ratio of compressing the new incoming embeddings.
+            thres (float): 
+                Threshold for determining significant embeddings. Default is 0.95.
+
+        Returns:
+            assinger_mat (torch.Tensor): 
+                Assigner matrix that selects the embedding vectors to be removed. 
+                Dimension: [batch_size, compressed_len, (mem_len+step_len)].
+        """
+        # Remove the labels that are classified as overlaps.
+        overlap_bool_nl = mem_and_new_labels.sum(dim=2) > 1  # [batch_size, (mem_len+step_len)]
+        mnl_noovl = mem_and_new_labels.clone()  # [batch_size, (mem_len+step_len), label_dim]
+        mnl_noovl[overlap_bool_nl] = 0  # [batch_size, (mem_len+step_len), label_dim]
+        # Include silence to the label and add another dimension for silence
+        sil_bools = (mnl_noovl.sum(dim=2) == 0)  # [batch_size, (mem_len+step_len)]
+        silaug_mnl_noovl = torch.cat((mnl_noovl, torch.zeros_like(mnl_noovl[:, :, 0].unsqueeze(2))), dim=2)  # [batch_size, (mem_len+step_len), label_dim + 1]
+        silaug_mnl_noovl[torch.arange(sil_bools.shape[0]).unsqueeze(1), :, -1].squeeze(1)[sil_bools] = 1  # [batch_size, (mem_len+step_len), label_dim + 1]
+        trans_label_mask = torch.bmm(silaug_mnl_noovl, silaug_mnl_noovl.transpose(1, 2))  # [batch_size, (mem_len+step_len), (mem_len+step_len)]
+        trans_label_mask_zeroed = self._zero_sub_diag(trans_label_mask, emb_win=0).detach().cpu()  # [batch_size, (mem_len+step_len), (mem_len+step_len)]
+        # Create compression mask matrix that selects ones and zeros
+        compression_mask_inds = (torch.arange(trans_label_mask.size(1)) % compress_ratio != 1).cpu()  # [(mem_len+step_len)]
+        trans_label_mask_zerocomp = trans_label_mask_zeroed[:, compression_mask_inds, :]  # [batch_size, compressed_len, (mem_len+step_len)]
+        row_maxs = trans_label_mask_zerocomp.max(dim=2, keepdim=True)[0]  # [batch_size, compressed_len, 1]
+        normalized_compress_mat = trans_label_mask_zerocomp / (row_maxs + self.eps)  # [batch_size, compressed_len, (mem_len+step_len)]
+        assinger_mat = torch.zeros_like(normalized_compress_mat).to(chunk_emb_seq.device)  # [batch_size, compressed_len, (mem_len+step_len)]
+        assinger_mat[(normalized_compress_mat >= thres)] = 1  # [batch_size, compressed_len, (mem_len+step_len)]
+        row_maxs_post = assinger_mat.sum(dim=2).unsqueeze(2)  # [batch_size, compressed_len, 1]
+        assinger_mat = assinger_mat / (row_maxs_post + self.eps)  # [batch_size, compressed_len, (mem_len+step_len)]
         return assinger_mat
     
     def memory_compressor(
@@ -254,13 +300,10 @@ class SortformerDiarizer(NeuralModule, Exportable):
         memory_label: torch.Tensor,
         compress_rate: int = 2,
         UNIT_LEN: int = 10,
-        time_compress: bool = True,
         use_attn_score: bool = True,
         ):
         """
-        trans_mat:
-            Dimension: (batch_size, step_len, step_len)
-            
+
         Args:
             chunk_emb_seq:
                 Dimension: (batch_size, step_len, emb_dim)
@@ -279,23 +322,20 @@ class SortformerDiarizer(NeuralModule, Exportable):
         if step_idx == 0:
             # First trial, we only calculate mem_len 
             new_memory_buff = memory_buff # [bs, step_len, emb_dim]
-            new_memory_label = prev_preds # [step_len]
+            new_memory_label = prev_preds # [bs, step_len]
         else:
             batch_size = chunk_emb_seq.shape[0]
-            new_preds = prev_preds[:, self.mem_len:, :] # [bs, max_spks, step_len]
+            new_preds = prev_preds[:, self.mem_len:, :] # [batch_size, max_spks, step_len]
             # Prepare repeated mem_and_new_labels
-            mem_and_new_labels = torch.cat([memory_label, new_preds], dim=1) # [bs, (mem_len + step_len), max_spks]
-            mem_and_new_embs = torch.cat([memory_buff, chunk_emb_seq], dim=1) # [bs, (mem_len + step_len), step_len]
-            if time_compress:
-                if use_attn_score:
-                    assinger_mat = self._attention_score_compressor(batch_size, mem_and_new_embs, compress_ratio)
-                else:
-                    assinger_mat = self._drop_to_compress(chunk_emb_seq, mem_and_new_embs, mem_and_new_labels, compress_ratio)
-                assinger_mat = assinger_mat.to(mem_and_new_embs.device) 
-                new_memory_buff = torch.bmm(assinger_mat, mem_and_new_embs)
-                new_memory_label = torch.bmm(assinger_mat, mem_and_new_labels).bool().float() # [bs, max_spks, (mem_len + step_len)]
-            else: 
-                raise NotImplementedError
+            mem_and_new_labels = torch.cat([memory_label, new_preds], dim=1) # [batch_size, (mem_len + step_len), max_spks]
+            mem_and_new_embs = torch.cat([memory_buff, chunk_emb_seq], dim=1) # [batch_size, (mem_len + step_len), step_len]
+            if use_attn_score:
+                assinger_mat = self._attention_score_compressor(batch_size, mem_and_new_embs, compress_ratio)
+            else:
+                assinger_mat = self._drop_to_compress(chunk_emb_seq, mem_and_new_embs, mem_and_new_labels, compress_ratio)
+            assinger_mat = assinger_mat.to(mem_and_new_embs.device) 
+            new_memory_buff = torch.bmm(assinger_mat, mem_and_new_embs)
+            new_memory_label = torch.bmm(assinger_mat, mem_and_new_labels).bool().float() # [batch_size, max_spks, (mem_len + step_len)]
         return new_memory_buff, new_memory_label
  
 

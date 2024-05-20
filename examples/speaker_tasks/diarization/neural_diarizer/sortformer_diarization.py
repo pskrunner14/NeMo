@@ -85,6 +85,11 @@ class DiarizationConfig:
     batch_size: int = 4
     num_workers: int = 0
     random_seed: Optional[int] = None  # seed number going to be used in seed_everything()
+    
+    # Streaming diarization configs
+    streaming_mode: bool = True # If True, streaming diarization will be used. For long-form audio, set mem_len=step_len
+    mem_len: int = 2000
+    step_len: int = 2000
 
     # If `cuda` is a negative number, inference will be on CPU only.
     cuda: Optional[int] = None
@@ -170,7 +175,10 @@ def convert_pred_mat_to_segments(
     thres_offset = {0: 0, 1: 0, 2: 0, 3: 0}
     for sample_idx, (uniq_id, audio_rttm_values) in enumerate(audio_rttm_map_dict.items()):
         spk_ts, timestamps, cluster_labels = [], [], []
-        speaker_assign_mat = batch_preds[sample_idx]
+        try:
+            speaker_assign_mat = batch_preds[sample_idx]
+        except:
+            import ipdb; ipdb.set_trace()
         for spk_id in range(speaker_assign_mat.shape[-1]):
             cfg_vad_params = OmegaConf.structured(VadParams())
             cfg_vad_params.onset = cfg_vad_params.onset + thres_offset[spk_id]
@@ -229,7 +237,6 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     diar_model._cfg.test_ds.session_len_sec = cfg.session_len_sec
     trainer = pl.Trainer(devices=device, accelerator=accelerator)
     diar_model.set_trainer(trainer)
-    diar_model = diar_model.eval()
     diar_model._cfg.test_ds.manifest_filepath = cfg.dataset_manifest
     infer_audio_rttm_dict = get_audio_rttm_map(cfg.dataset_manifest)
     diar_model._cfg.test_ds.batch_size = cfg.batch_size
@@ -240,6 +247,10 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     
     # Model setup for inference 
     diar_model.setup_test_data(test_data_config=diar_model._cfg.test_ds)    
+    diar_model.streaming_mode = cfg.streaming_mode
+    diar_model.sortformer_diarizer.step_len = cfg.step_len
+    diar_model.sortformer_diarizer.mem_len = cfg.mem_len
+    diar_model.save_tensor_images = cfg.save_tensor_images
     diar_model.test_batch()
     
     # Evaluation

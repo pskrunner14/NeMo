@@ -105,14 +105,16 @@ class DiarizationConfig:
 class VadParams:
     window_length_in_sec: float = 0.15
     shift_length_in_sec: float = 0.01
-    smoothing: str = "median"
+    smoothing: str = False
     overlap: float = 0.5
-    onset: float = 0.5
-    offset: float = 0.5
+    # onset: float = 0.725
+    # offset: float = 0.55
+    onset: float = 0.65
+    offset: float = 0.55
     pad_onset: float = 0.05
     pad_offset: float = 0.05
-    min_duration_on: float = 0.05
-    min_duration_off: float = 0.0
+    min_duration_on: float = 0.2
+    min_duration_off: float = 0.2
     filter_speech_first: bool = True
 
 def get_overlapping_list(source_range_list, target_range):
@@ -126,16 +128,19 @@ def get_overlapping_list(source_range_list, target_range):
     return out_range
 
 def timestamps_to_pyannote_object(timestamps, cluster_labels, uniq_id, audio_rttm_values, all_hypothesis, all_reference, all_uems):
-    labels, lines = generate_cluster_labels(timestamps, cluster_labels)
+    offset, dur = float(audio_rttm_values.get('offset', None)), float(audio_rttm_values.get('duration', None))
+    if offset is not None:
+        labels, lines = generate_cluster_labels(timestamps, cluster_labels, offset=offset)
+    else:
+        labels, lines = generate_cluster_labels(timestamps, cluster_labels)
     hypothesis = labels_to_pyannote_object(labels, uniq_name=uniq_id)
     all_hypothesis.append([uniq_id, hypothesis])
     rttm_file = audio_rttm_values.get('rttm_filepath', None)
-    
     if rttm_file is not None and os.path.exists(rttm_file):
-        offset, dur = float(audio_rttm_values.get('offset', None)), float(audio_rttm_values.get('duration', None))
         uem_lines = [[offset, dur+offset]] 
         org_ref_labels = rttm_to_labels(rttm_file)
         ref_labels = org_ref_labels
+        
         reference = labels_to_pyannote_object(ref_labels, uniq_name=uniq_id)
         uem_obj = get_uem_object(uem_lines, uniq_id=uniq_id)
         all_uems.append(uem_obj)
@@ -175,10 +180,7 @@ def convert_pred_mat_to_segments(
     thres_offset = {0: 0, 1: 0, 2: 0, 3: 0}
     for sample_idx, (uniq_id, audio_rttm_values) in enumerate(audio_rttm_map_dict.items()):
         spk_ts, timestamps, cluster_labels = [], [], []
-        try:
-            speaker_assign_mat = batch_preds[sample_idx]
-        except:
-            import ipdb; ipdb.set_trace()
+        speaker_assign_mat = batch_preds[sample_idx]
         for spk_id in range(speaker_assign_mat.shape[-1]):
             cfg_vad_params = OmegaConf.structured(VadParams())
             cfg_vad_params.onset = cfg_vad_params.onset + thres_offset[spk_id]
@@ -264,6 +266,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
                                                          all_uem=all_uems, 
                                                          collar=0.25, 
                                                          ignore_overlap=False)
+    print("VadParams:", VadParams())
 
 if __name__ == '__main__':
     main()

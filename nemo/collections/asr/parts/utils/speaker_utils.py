@@ -398,7 +398,7 @@ def convert_rttm_line(rttm_line, round_digits=3):
     return start, end, speaker
 
 
-def rttm_to_labels(rttm_filename):
+def rttm_to_labels(rttm_filename, offset=0):
     """
     Prepare time stamps label list from rttm file
     """
@@ -406,6 +406,9 @@ def rttm_to_labels(rttm_filename):
     with open(rttm_filename, 'r') as f:
         for line in f.readlines():
             start, end, speaker = convert_rttm_line(line, round_digits=3)
+            if offset > 0:
+                start += offset
+                end += offset
             labels.append('{} {} {}'.format(start, end, speaker))
     return labels
 
@@ -426,7 +429,7 @@ def write_cluster_labels(base_scale_idx, lines_cluster_labels, out_rttm_dir):
             f.write(clus_label_line)
 
 
-def generate_cluster_labels(segment_ranges: List[str], cluster_labels: List[int]):
+def generate_cluster_labels(segment_ranges: List[str], cluster_labels: List[int], offset: float= None):
     """
     Generate cluster (speaker labels) from the segment_range list and cluster label list.
 
@@ -450,6 +453,9 @@ def generate_cluster_labels(segment_ranges: List[str], cluster_labels: List[int]
     for idx, label in enumerate(cluster_labels):
         tag = 'speaker_' + str(label)
         stt, end = segment_ranges[idx]
+        if offset is not None:
+            stt = float(stt) + offset
+            end = float(end) + offset
         lines.append(f"{stt} {end} {tag}")
     cont_lines = get_contiguous_stamps(lines)
     diar_hyp = merge_stamps(cont_lines)

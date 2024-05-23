@@ -50,7 +50,9 @@ class MultiScaleLayer:
             self.emb_scale_n = self.cfg_e2e_diarizer_model.scale_n
             self.msdd_scale_n = self.cfg_e2e_diarizer_model.scale_n
         self.scale_n = len(self.multiscale_args_dict['scale_dict'])
+        self.frame_hop = self.cfg_e2e_diarizer_model.interpolated_scale/2 
         self.scale_dict = {int(k): v for k, v in self.multiscale_args_dict['scale_dict'].items()}
+        self.longest_scale = self.msdd_multiscale_args_dict['scale_dict'][0][0]
         self.frame_per_sec = (1 / self.preprocessor_cfg.window_stride)
         self.feat_per_sec = self.frame_per_sec
         self.feat_dim = self.preprocessor_cfg.features
@@ -179,10 +181,7 @@ class MultiScaleLayer:
         interpolated_weights = ((dist_delta ** 2).t() / torch.sum(dist_delta ** 2, dim=1).t()).t()  
         return interpolated_weights 
  
-    def get_ms_emb_fixed(
-        self, 
-        embs: torch.Tensor, 
-    ):
+    def get_ms_emb_fixed(self, embs: torch.Tensor):
         batch_size = self.scale_mapping.shape[0]
         split_emb_tup = torch.split(embs, self.ms_seg_counts[:, :self.emb_scale_n].flatten().tolist(), dim=0)
 
@@ -230,7 +229,6 @@ class MultiScaleLayer:
         batch_size = scale_mapping.shape[0]
         repeat_mats_ext = scale_mapping[0][:self.emb_scale_n].to(embs.device)
         all_seq_len = ms_seg_counts[0][-1].to(embs.device) 
-        
         scale_count_offsets = torch.tensor([0] + torch.cumsum(ms_seg_counts[0][:self.emb_scale_n-1], dim=0).tolist())
         repeat_mats_ext = repeat_mats_ext + (scale_count_offsets.to(embs.device)).unsqueeze(1).repeat(1, all_seq_len).to(embs.device)
         extracted_embs = target_embs[:, repeat_mats_ext.flatten(), :].reshape(batch_size, self.emb_scale_n, -1, embs.shape[-1])
@@ -279,10 +277,8 @@ class MultiScaleLayer:
         processed_signal_len, 
         ):
         bs = processed_signal.shape[0]
-        actual_sess_len_sec = (processed_signal.shape[2] / self.frame_per_sec) 
-        session_len_sec = torch.tensor(actual_sess_len_sec).floor().item()
-        # torch.nn.functional.pad()
-        ms_seg_timestamps, ms_seg_counts = self.get_ms_seg_timestamps(duration=session_len_sec,
+        frame_count = torch.floor(torch.tensor((processed_signal_len.max().item() / self.frame_per_sec)/self.frame_hop)).to(int).item()
+        ms_seg_timestamps, ms_seg_counts = self.get_ms_seg_timestamps(duration=(frame_count * self.frame_hop),
                                                                       min_subsegment_duration=self.interpolated_scale)
         scale_mapping = torch.stack(get_argmin_mat(ms_seg_timestamps))
         self.ms_seg_timestamps = ms_seg_timestamps.unsqueeze(0).repeat(bs, 1, 1, 1).to(processed_signal.device)
@@ -294,7 +290,7 @@ class MultiScaleLayer:
                                                                       ms_seg_counts=self.ms_seg_counts, 
                                                                       device=processed_signal.device)
 
-        embs, pools = self.forward_multi_decoder(processed_signal=processed_signal, 
+        _embs, pools = self.forward_multi_decoder(processed_signal=processed_signal, 
                                             processed_signal_len=processed_signal_len, 
                                             total_seg_count=tsc,
                                             ms_seg_count_frame_range=mscfr, 
@@ -304,9 +300,9 @@ class MultiScaleLayer:
                                             feature_count_range=fcr,
                                             device=processed_signal.device,
                                             )
-
-        import ipdb; ipdb.set_trace()
-        return embs, pools
+        # Reshape the embedding vectors into multi-scale inputs
+        ms_emb_seq = self.get_ms_emb_fixed(embs=_embs)
+        return ms_emb_seq
 
     def forward_multi_decoder(
         self,

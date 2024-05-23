@@ -513,15 +513,12 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         """
         processed_signal, processed_signal_length = self._extract_embeddings(audio_signal=audio_signal, audio_signal_length=audio_signal_length)
         
-        embs, pools = self.multiscale_layer.forward_multiscale(
+        ms_emb_seq = self.multiscale_layer.forward_multiscale(
             processed_signal=processed_signal, 
             processed_signal_len=processed_signal_length, 
         )
         if self._cfg.freeze_speaker_model:
-            embs = embs.detach()
-        
-        # Reshape the embedding vectors into multi-scale inputs
-        ms_emb_seq = self.multiscale_layer.get_ms_emb_fixed(embs=embs) 
+            ms_emb_seq = ms_emb_seq.detach()
         return ms_emb_seq
     
     def forward(
@@ -682,13 +679,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         if self.cfg_e2e_diarizer_model.use_mock_embs:
             audio_signal, audio_signal_length, targets = batch 
         else: # In this case, audio_signal is emb_seed
-            # audio_signal, audio_signal_length, ms_seg_timestamps, ms_seg_counts, clus_label_index, scale_mapping, ch_clus_mat, targets, global_spk_labels = batch
              audio_signal, feature_length, ms_seg_timestamps, ms_seg_counts, scale_mapping, targets = batch 
         batch_size = audio_signal.shape[0]
         ms_seg_counts = self.ms_seg_counts.unsqueeze(0).repeat(batch_size, 1).to(audio_signal.device)
-        ms_seg_timestamps = self.ms_seg_timestamps.unsqueeze(0).repeat(batch_size, 1, 1, 1).to(audio_signal.device)
-        scale_mapping = self.scale_mapping.unsqueeze(0).repeat(batch_size, 1, 1) 
-        
         sequence_lengths = torch.tensor([x[-1] for x in ms_seg_counts.detach()])
         self.validation_mode = False
         preds, _preds, attn_score_stack, preds_list, encoder_states_list = self.forward(
@@ -800,21 +793,15 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         if self.cfg_e2e_diarizer_model.use_mock_embs:
             audio_signal, audio_signal_length, targets = batch 
         else: # In this case, audio_signal is emb_seed
-            # audio_signal, audio_signal_length, ms_seg_timestamps, ms_seg_counts, clus_label_index, scale_mapping, ch_clus_mat, targets, global_spk_labels = batch
              audio_signal, feature_length, ms_seg_timestamps, ms_seg_counts, scale_mapping, targets = batch
         
         batch_size = audio_signal.shape[0]
         ms_seg_counts = self.ms_seg_counts.unsqueeze(0).repeat(batch_size, 1).to(audio_signal.device)
-        ms_seg_timestamps = self.ms_seg_timestamps.unsqueeze(0).repeat(batch_size, 1, 1, 1).to(audio_signal.device)
-        scale_mapping = self.scale_mapping.unsqueeze(0).repeat(batch_size, 1, 1)
         sequence_lengths = torch.tensor([x[-1] for x in ms_seg_counts])
         self.validation_mode = True
         preds, _preds, attn_score_stack, preds_list, encoder_states_list = self.forward(
             audio_signal=audio_signal,
             audio_signal_length=audio_signal_length,
-            ms_seg_timestamps=ms_seg_timestamps,
-            ms_seg_counts=ms_seg_counts,
-            scale_mapping=scale_mapping,
         )
         if self.loss.sorted_loss:
             targets_ats = self.sort_probs_and_labels(targets, discrete=True)

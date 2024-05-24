@@ -18,6 +18,7 @@ import math
 import os
 import shutil
 from copy import deepcopy
+from pyannote.core import Segment, Timeline
 from typing import Dict, List, Tuple, Union
 
 import numpy as np
@@ -29,7 +30,6 @@ from tqdm import tqdm
 import torch.nn.functional as F
 
 from nemo.collections.asr.data.audio_to_label import repeat_signal
-from nemo.collections.asr.metrics.der import get_partial_ref_labels
 from nemo.collections.asr.parts.utils.online_clustering import (
     get_minimal_indices,
     stitch_cluster_labels
@@ -40,7 +40,6 @@ ts_vad_post_processing,
 SpeakerClustering, 
 get_argmin_mat, 
 split_input_data,
-cos_similarity,
 cos_similarity_batch,
 )
 from nemo.collections.asr.parts.utils.longform_clustering import LongFormSpeakerClustering
@@ -426,7 +425,7 @@ def write_cluster_labels(base_scale_idx, lines_cluster_labels, out_rttm_dir):
             f.write(clus_label_line)
 
 
-def generate_cluster_labels(segment_ranges: List[str], cluster_labels: List[int]):
+def generate_cluster_labels(segment_ranges: List[str], cluster_labels: List[int], offset: float= None):
     """
     Generate cluster (speaker labels) from the segment_range list and cluster label list.
 
@@ -450,6 +449,9 @@ def generate_cluster_labels(segment_ranges: List[str], cluster_labels: List[int]
     for idx, label in enumerate(cluster_labels):
         tag = 'speaker_' + str(label)
         stt, end = segment_ranges[idx]
+        if offset is not None:
+            stt = float(stt) + offset
+            end = float(end) + offset
         lines.append(f"{stt} {end} {tag}")
     cont_lines = get_contiguous_stamps(lines)
     diar_hyp = merge_stamps(cont_lines)
@@ -605,10 +607,7 @@ def get_selected_channel_embs(ms_emb_seq,
         selected_ss_mc_embs = torch.stack(merged_mono_scale_embs_list, dim=0)
     else:
         ms_cat_emb_seq = torch.stack(merged_mono_scale_embs_list, dim=0)
-        try:
-            selected_ss_mc_embs = ms_cat_emb_seq.reshape(ms_emb_seq.shape[0], ms_emb_seq.shape[1], ms_emb_seq.shape[2], ms_cat_emb_seq.shape[-1])
-        except:
-            import ipdb; ipdb.set_trace()
+        selected_ss_mc_embs = ms_cat_emb_seq.reshape(ms_emb_seq.shape[0], ms_emb_seq.shape[1], ms_emb_seq.shape[2], ms_cat_emb_seq.shape[-1])
     return selected_ss_mc_embs
 
 def perform_clustering_embs(
@@ -744,7 +743,11 @@ def perform_clustering_embs(
         
         if len(cluster_labels) != timestamps.shape[0]:
             raise ValueError("Mismatch of length between cluster_labels and timestamps.")
-        labels, lines = generate_cluster_labels(timestamps, cluster_labels)
+        if audio_rttm_map.get('offset',  None) is not None:
+            labels, lines = generate_cluster_labels(timestamps, cluster_labels, offset=audio_rttm_map.get('offset', 0))
+        else:
+            labels, lines = generate_cluster_labels(timestamps, cluster_labels, offset=None)
+
         if out_rttm_dir:
             labels_to_rttmfile(labels, uniq_id, out_rttm_dir)
             lines_cluster_labels.extend([f'{uniq_id} {seg_line}\n' for seg_line in lines])
@@ -788,6 +791,7 @@ def perform_clustering(
     """
     all_hypothesis = []
     all_reference = []
+    all_uem = []
     no_references = False
     lines_cluster_labels = []
 
@@ -849,9 +853,13 @@ def perform_clustering(
         
 
         rttm_file = audio_rttm_values.get('rttm_filepath', None)
+        if audio_rttm_values['offset'] is not None and audio_rttm_values['duration'] is not None:
+            uem_obj = uem_timeline_from_manifest(audio_rttm_values, uniq_name=uniq_id)
+            all_uem.append(uem_obj)
         if rttm_file is not None and os.path.exists(rttm_file) and not no_references:
             ref_labels = rttm_to_labels(rttm_file)
             reference = labels_to_pyannote_object(ref_labels, uniq_name=uniq_id)
+
             all_reference.append([uniq_id, reference])
         else:
             no_references = True
@@ -860,7 +868,8 @@ def perform_clustering(
     if out_rttm_dir:
         write_cluster_labels(base_scale_idx, lines_cluster_labels, out_rttm_dir)
 
-    return all_reference, all_hypothesis
+    all_uem = None if len(all_uem) == 0 else all_uem
+    return all_reference, all_hypothesis, all_uem
 
 
 def get_vad_out_from_rttm_line(rttm_line):
@@ -2118,6 +2127,19 @@ def mixdown_msdd_preds(clus_labels, msdd_preds, time_stamps, offset, threshold, 
         spk_ts = generate_speaker_assignment_intervals(speaker_assign_mat=speaker_assign_mat, timestamps=timestamps)
     return spk_ts
 
+def uem_timeline_from_manifest(manifest_dic, uniq_name):
+    """
+    Generate pyannote timeline segments for uem file
+
+     <UEM> file format
+     UNIQ_SPEAKER_ID CHANNEL START_TIME END_TIME
+    """
+    timeline = Timeline(uri=uniq_name)
+    start_time = float(manifest_dic[uniq_name]['offset']) 
+    end_time = start_time + float(manifest_dic[uniq_name]['duration'])
+    timeline.add(Segment(float(start_time), float(end_time)))
+    return timeline
+
 def make_rttm_with_overlap(
     manifest_file_path: str,
     clus_label_dict: Dict[str, List[Union[float, int]]],
@@ -2154,7 +2176,7 @@ def make_rttm_with_overlap(
     """
     params = change_output_dir_names(params, threshold, verbose)
     AUDIO_RTTM_MAP = audio_rttm_map(manifest_file_path)
-    all_hypothesis, all_reference = [], []
+    all_hypothesis, all_reference, all_uem = [], [], []
     no_references = False
     logging.info(f"Generating RTTM with infer_mode: {params['infer_mode']}")
     with open(manifest_file_path, 'r', encoding='utf-8') as manifest:
@@ -2188,11 +2210,15 @@ def make_rttm_with_overlap(
                 ref_labels = rttm_to_labels(rttm_file)
                 # ref_labels = get_partial_ref_labels(pred_labels=hyp_labels, ref_labels=ref_labels)
                 reference = labels_to_pyannote_object(ref_labels, uniq_name=uniq_id)
+                if manifest_dic['offset'] is not None and manifest_dic['duration'] is not None:
+                    uem_obj = uem_timeline_from_manifest(manifest_dic, uniq_name=uniq_id)
+                    all_uem.append(uem_obj)
                 all_reference.append([uniq_id, reference])
             else:
                 no_references = True
                 all_reference = []
-    return all_reference, all_hypothesis
+    all_uem = None if len(all_uem) == 0 else all_uem
+    return all_reference, all_hypothesis, all_uem
 
 def generate_json_output(hyp_labels, uniq_id, out_json_dir, manifest_dic, decimals=2):
     json_dict_list = []

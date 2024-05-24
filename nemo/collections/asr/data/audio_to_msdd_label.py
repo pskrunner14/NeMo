@@ -573,7 +573,6 @@ class _AudioMSDDTrainDataset(Dataset):
             scale_ts (torch.tensor):
                 Tensor containing scale timestamps.
         """
-        # scale_ts = (torch.tensor(subsegments) * self.feat_per_sec).long()
         seg_ts = (torch.tensor(subsegments) * self.feat_per_sec).float()
         scale_ts_round = torch.round(seg_ts, decimals=decimals)
         scale_ts = scale_ts_round.long()
@@ -620,37 +619,24 @@ class _AudioMSDDTrainDataset(Dataset):
         ms_seg_counts = torch.tensor(ms_seg_counts)
         return ms_seg_timestamps, ms_seg_counts
     
-    # def channel_cluster(self, mc_audio_signal, sample_rate):
-    #     clusters, mag_coherence = channel_cluster_from_coherence(
-    #                                 audio_signal=mc_audio_signal.t(),
-    #                                 sample_rate=sample_rate,
-    #                                 output_coherence=True,
-    #                                 ) 
-    #     ch_clus_mat = get_channel_averaging_matrix(clusters)
-    #     # if self.use_1ch_from_ch_clus:
-    #     #     ch_inds = torch.max(ch_clus_mat, dim=1)[1]
-    #     #     ch_clus_mat = torch.zeros_like(ch_clus_mat)
-    #     #     ch_clus_mat[torch.arange(ch_inds.shape[0]), ch_inds] = 1
-    #     return ch_clus_mat
-        
+
     def __getitem__(self, index):
         sample = self.collection[index]
         if sample.offset is None:
             sample.offset = 0
         offset = sample.offset
         duration = min(sample.duration, self.session_len_sec)
-        # duration = self.session_len_sec
 
         uniq_id = self.get_uniq_id_with_range(sample)
         ms_seg_timestamps, ms_seg_counts = self.get_ms_seg_timestamps(duration=self.session_len_sec,
                                                                       min_subsegment_duration=self.scale_dict[self.scale_n-1][0])
         
         scale_mapping = torch.stack(get_argmin_mat(ms_seg_timestamps))
-        targets, clus_label_index, global_spk_labels = self.parse_rttm_for_ms_targets(uniq_id=uniq_id, 
-                                                                                   rttm_file=sample.rttm_file,
-                                                                                   offset=offset,
-                                                                                   duration=duration,
-                                                                                   ms_seg_counts=ms_seg_counts)
+        targets, _, _ = self.parse_rttm_for_ms_targets(uniq_id=uniq_id, 
+                                                    rttm_file=sample.rttm_file,
+                                                    offset=offset,
+                                                    duration=duration,
+                                                    ms_seg_counts=ms_seg_counts)
         audio_signal = self.featurizer.process(sample.audio_file, offset=offset, duration=duration)
         if audio_signal.shape[0] < self.session_len_sec*self.featurizer.sample_rate:
             if isinstance(sample.audio_file, str): # Mono audio
@@ -659,24 +645,7 @@ class _AudioMSDDTrainDataset(Dataset):
                 audio_signal = torch.nn.functional.pad(audio_signal, (0, 0, 0, int(self.session_len_sec*self.featurizer.sample_rate) - audio_signal.shape[0]), mode='constant', value=0)
             
         feature_length = torch.tensor(audio_signal.shape[0]).long()
-        if self.random_flip:
-            flip = torch.cat([torch.randperm(self.max_spks), torch.tensor(-1).unsqueeze(0)])
-            clus_label_index, targets = flip[clus_label_index], targets[:, flip[:self.max_spks]]
-        
-        if torch.max(ms_seg_counts) != clus_label_index.shape[0]:
-            raise ValueError(f"ms_seg_counts: {ms_seg_counts}, clus_label_index.shape[0]: {clus_label_index.shape[0]}")
-        
-        # if len(audio_signal.shape) > 1:
-        #     if uniq_id in self.channel_cluster_dict:
-        #         # We need to use a hash-table for channel clustering to use the identical matrix throughout the session.
-        #         ch_clus_mat = self.channel_cluster_dict[uniq_id]
-        #     else:
-        #         ch_clus_mat = self.channel_cluster(mc_audio_signal=audio_signal, sample_rate=self.featurizer.sample_rate)
-        #         self.channel_cluster_dict[uniq_id] = ch_clus_mat
-        # else:
-        ch_clus_mat = torch.zeros((2, 2)).to(audio_signal.device)
-        return audio_signal, feature_length, ms_seg_timestamps, ms_seg_counts, clus_label_index, scale_mapping, ch_clus_mat, targets, global_spk_labels
-
+        return audio_signal, feature_length, ms_seg_timestamps, ms_seg_counts, scale_mapping, targets
 
 class _AudioMSDDInferDataset(Dataset):
     """
@@ -898,13 +867,10 @@ def _msdd_train_collate_fn(self, batch):
             Groundtruth Speaker label for the given input embedding sequence.
     """
     packed_batch = list(zip(*batch))
-    audio_signal, feature_length, ms_seg_timestamps, ms_seg_counts, clus_label_index, scale_mapping, ch_clus_arrays, targets, global_spk_labels = packed_batch
+    audio_signal, feature_length, ms_seg_timestamps, ms_seg_counts, scale_mapping, targets  = packed_batch
     audio_signal_list, feature_length_list = [], []
-    ch_clus_list = []
     
-    ms_seg_timestamps_list, ms_seg_counts_list, scale_clus_label_list, scale_mapping_list, targets_list, global_spk_labels_list = (
-        [],
-        [],
+    ms_seg_timestamps_list, ms_seg_counts_list, scale_mapping_list, targets_list = (
         [],
         [],
         [],
@@ -914,16 +880,13 @@ def _msdd_train_collate_fn(self, batch):
     max_raw_feat_len = max([x.shape[0] for x in audio_signal])
     max_target_len = max([x.shape[0] for x in targets])
     max_total_seg_len = max([x.shape[0] for x in clus_label_index])
-    # if max([len(feat.shape) for feat in audio_signal]) > 1:
-    #     max_ch = max([feat.shape[1] for feat in audio_signal])
-    # else:
     max_ch = 1
     max_clus_ch = max([clus_arr.shape[0] for clus_arr in ch_clus_arrays])
     arg_max_idx = torch.argmax(torch.tensor([ x.shape[1] for x in ms_seg_timestamps]))
     ms_seg_ts = ms_seg_timestamps[arg_max_idx]
     ms_seg_ct = ms_seg_counts[arg_max_idx]
 
-    for feat, feat_len, _, _, scale_clus, scl_map, ch_clus_m, tgt, glb_lbl in batch:
+    for feat, feat_len, ms_seg_ts, scale_clus, scl_map, tgt in batch:
         seq_len = tgt.shape[0]
         if len(feat.shape) > 1:
             pad_feat = (0, 0, 0, max_raw_feat_len - feat.shape[0])
@@ -934,16 +897,10 @@ def _msdd_train_collate_fn(self, batch):
             feat = torch.nn.functional.pad(feat, (0, feat_len_pad))
         pad_tgt = (0, 0, 0, max_target_len - seq_len)
         pad_sm = (0, max_target_len - seq_len)
-        pad_sc = (0, max_total_seg_len - scale_clus.shape[0])
-        pad_glb_lbl = (0, max_total_seg_len - glb_lbl.shape[0])
-        pad_chclus = (0, max_ch - ch_clus_m.shape[1], 0, max_clus_ch - ch_clus_m.shape[0])
         
         padded_feat = torch.nn.functional.pad(feat, pad_feat)
         padded_tgt = torch.nn.functional.pad(tgt, pad_tgt)
         padded_sm = torch.nn.functional.pad(scl_map, pad_sm)
-        padded_scale_clus = torch.nn.functional.pad(scale_clus, pad_sc, value=-1)
-        padded_global_label = torch.nn.functional.pad(glb_lbl, pad_glb_lbl, value=-1)
-        padded_chclus = torch.nn.functional.pad(ch_clus_m, pad_chclus)
         
         if max_ch > 1 and padded_feat.shape[1] < max_ch:
             feat_ch_pad = max_ch - padded_feat.shape[1]
@@ -953,22 +910,16 @@ def _msdd_train_collate_fn(self, batch):
         feature_length_list.append(feat_len.clone().detach())
         ms_seg_timestamps_list.append(ms_seg_ts)
         ms_seg_counts_list.append(ms_seg_ct.clone().detach())
-        scale_clus_label_list.append(padded_scale_clus)
-        global_spk_labels_list.append(padded_global_label)
         scale_mapping_list.append(padded_sm)
         targets_list.append(padded_tgt)
-        ch_clus_list.append(padded_chclus)
         audio_signal = torch.stack(audio_signal_list)
     feature_length = torch.stack(feature_length_list)
         
     ms_seg_timestamps = torch.stack(ms_seg_timestamps_list)
-    clus_label_index = torch.stack(scale_clus_label_list)
     ms_seg_counts = torch.stack(ms_seg_counts_list)
     scale_mapping = torch.stack(scale_mapping_list)
     targets = torch.stack(targets_list)
-    ch_clus_mat = torch.stack(ch_clus_list)
-    global_spk_labels = torch.stack(global_spk_labels_list)
-    return audio_signal, feature_length, ms_seg_timestamps, ms_seg_counts, clus_label_index, scale_mapping, ch_clus_mat, targets, global_spk_labels
+    return audio_signal, feature_length, ms_seg_timestamps, ms_seg_counts, scale_mapping, targets
 
 
 def _msdd_infer_collate_fn(self, batch):

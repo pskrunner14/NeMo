@@ -397,7 +397,7 @@ def convert_rttm_line(rttm_line, round_digits=3):
     return start, end, speaker
 
 
-def rttm_to_labels(rttm_filename):
+def rttm_to_labels(rttm_filename, offset=0):
     """
     Prepare time stamps label list from rttm file
     """
@@ -405,6 +405,9 @@ def rttm_to_labels(rttm_filename):
     with open(rttm_filename, 'r') as f:
         for line in f.readlines():
             start, end, speaker = convert_rttm_line(line, round_digits=3)
+            if offset > 0:
+                start += offset
+                end += offset
             labels.append('{} {} {}'.format(start, end, speaker))
     return labels
 

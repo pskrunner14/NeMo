@@ -13,8 +13,11 @@
 # limitations under the License.
 
 import torch
+import numpy as np
 from nemo.collections.asr.parts.utils.speaker_utils import parse_scale_configs
-
+from nemo.collections.asr.parts.utils.speaker_utils import convert_rttm_line, prepare_split_data, get_subsegments
+from nemo.collections.asr.parts.utils.offline_clustering import get_argmin_mat
+from typing import Dict, List, Tuple, Optional
 try:
     from torch.cuda.amp import autocast
 except ImportError:
@@ -27,7 +30,7 @@ except ImportError:
 torch.backends.cudnn.enabled = False 
 
 class MultiScaleLayer:
-    def __init__(self,cfg_e2e_diarizer_model, preprocessor_cfg, speaker_model):
+    def __init__(self,cfg_e2e_diarizer_model, preprocessor_cfg, speaker_model, dtype=torch.float32):
         self.cfg_e2e_diarizer_model = cfg_e2e_diarizer_model
         self._init_segmentation_info()
         self.preprocessor_cfg = preprocessor_cfg
@@ -46,9 +49,16 @@ class MultiScaleLayer:
             self.cfg_e2e_diarizer_model.scale_n = len(window_length_in_sec)
             self.emb_scale_n = self.cfg_e2e_diarizer_model.scale_n
             self.msdd_scale_n = self.cfg_e2e_diarizer_model.scale_n
-        self.frame_per_sec = int(1 / self.preprocessor_cfg.window_stride)
+        self.scale_n = len(self.multiscale_args_dict['scale_dict'])
+        self.frame_hop = self.cfg_e2e_diarizer_model.interpolated_scale/2 
+        self.scale_dict = {int(k): v for k, v in self.multiscale_args_dict['scale_dict'].items()}
+        self.longest_scale = self.msdd_multiscale_args_dict['scale_dict'][0][0]
+        self.frame_per_sec = (1 / self.preprocessor_cfg.window_stride)
+        self.feat_per_sec = self.frame_per_sec
         self.feat_dim = self.preprocessor_cfg.features
         self.max_feat_frame_count = int(self.msdd_multiscale_args_dict["scale_dict"][0][0] * self.frame_per_sec) # 0-th scale, window length
+        self.interpolated_scale =  self.cfg_e2e_diarizer_model.get('interpolated_scale', None) 
+        self.dtype = dtype
     
     def _init_segmentation_info(self):
         """Initialize segmentation settings: window, shift and multiscale weights.
@@ -59,6 +69,24 @@ class MultiScaleLayer:
             self._diarizer_params.speaker_embeddings.parameters.shift_length_in_sec,
             self._diarizer_params.speaker_embeddings.parameters.multiscale_weights,
         )
+        
+    def get_subsegments_to_scale_timestamps(self, subsegments: List[Tuple[float, float]], decimals=2):
+        """
+        Convert subsegment timestamps to scale timestamps.
+
+        Args:
+            subsegments (List[Tuple[float, float]]):
+                List of subsegment timestamps.
+
+        Returns:
+            scale_ts (torch.tensor):
+                Tensor containing scale timestamps.
+        """
+        seg_ts = (torch.tensor(subsegments) * self.feat_per_sec).float()
+        scale_ts_round = torch.round(seg_ts, decimals=decimals)
+        scale_ts = scale_ts_round.long()
+        scale_ts[:, 1] = scale_ts[:, 0] + scale_ts[:, 1]
+        return scale_ts 
 
     def get_scale_dist_mat_t(self, source_scale_idx, ms_seg_timestamps, msdd_scale_n, deci=1):
         """
@@ -81,6 +109,46 @@ class MultiScaleLayer:
         base_mat = torch.tile(base_scale_anchor, (source_scale_anchor.shape[0], 1)).t()
         abs_dist_mat = torch.abs(curr_mat - base_mat)
         return abs_dist_mat
+    
+    def get_ms_seg_timestamps(
+        self, 
+        duration: float, 
+        min_subsegment_duration: float=0.03
+        ):
+        """
+        Get start and end time of segments in each scale.
+
+        Args:
+            sample:
+                `DiarizationSpeechLabel` instance from preprocessing.collections
+        Returns:
+            ms_seg_timestamps (torch.tensor):
+                Tensor containing Multiscale segment timestamps.
+            ms_seg_counts (torch.tensor):
+                Number of segments for each scale. This information is used for reshaping embedding batch
+                during forward propagation.
+        """
+        if duration < 0:
+            raise ValueError(f"duration {duration} cannot be negative")
+        ms_seg_timestamps_list = []
+        total_steps = None
+        ms_seg_counts = [0 for _ in range(self.scale_n)]
+        for scale_idx in reversed(range(self.scale_n)):
+            subsegments = get_subsegments(offset=0, 
+                                          window=self.multiscale_args_dict['scale_dict'][scale_idx][0],
+                                          shift=self.multiscale_args_dict['scale_dict'][scale_idx][1],
+                                          duration=duration, 
+                                          min_subsegment_duration=min_subsegment_duration)
+            scale_ts_tensor = self.get_subsegments_to_scale_timestamps(subsegments)
+            if scale_idx == self.scale_n - 1:
+                total_steps = scale_ts_tensor.shape[0]
+            ms_seg_counts[scale_idx] = scale_ts_tensor.shape[0]
+            scale_ts_padded = torch.cat([scale_ts_tensor, torch.zeros(total_steps - scale_ts_tensor.shape[0], 2, dtype=scale_ts_tensor.dtype)], dim=0)
+            ms_seg_timestamps_list.append(scale_ts_padded.detach())
+        ms_seg_timestamps_list = ms_seg_timestamps_list[::-1]
+        ms_seg_timestamps = torch.stack(ms_seg_timestamps_list).type(self.dtype)
+        ms_seg_counts = torch.tensor(ms_seg_counts)
+        return ms_seg_timestamps, ms_seg_counts
 
     def get_interpolate_weights(
         self,
@@ -102,7 +170,7 @@ class MultiScaleLayer:
         Returns:
             emb_fix (torch.Tensor): interpolated embeddings
         """
-        deci = 100.0 if is_integer_ts else 1.0
+        deci = self.feat_per_sec if is_integer_ts else 1.0
         half_scale = msdd_multiscale_args_dict['scale_dict'][emb_scale_n-1][1]
         session_scale_dist_mat = self.get_scale_dist_mat_t(source_scale_idx=emb_scale_n-1, 
                                                     ms_seg_timestamps=ms_seg_timestamps[:, :base_seq_len, :], 
@@ -113,20 +181,13 @@ class MultiScaleLayer:
         interpolated_weights = ((dist_delta ** 2).t() / torch.sum(dist_delta ** 2, dim=1).t()).t()  
         return interpolated_weights 
  
-    def get_ms_emb_fixed(
-        self, 
-        embs: torch.Tensor, 
-        scale_mapping: torch.Tensor, 
-        ms_seg_counts: torch.Tensor, 
-        ms_seg_timestamps: torch.Tensor,
-    ):
-        # check_ms_data(ms_seg_timestamps, ms_seg_counts, scale_mapping)
-        batch_size = scale_mapping.shape[0]
-        split_emb_tup = torch.split(embs, ms_seg_counts[:, :self.emb_scale_n].flatten().tolist(), dim=0)
+    def get_ms_emb_fixed(self, embs: torch.Tensor):
+        batch_size = self.scale_mapping.shape[0]
+        split_emb_tup = torch.split(embs, self.ms_seg_counts[:, :self.emb_scale_n].flatten().tolist(), dim=0)
 
-        base_seq_len = ms_seg_counts[0][self.msdd_scale_n-1].item()
+        base_seq_len = self.ms_seg_counts[0][self.msdd_scale_n-1].item()
         target_embs = torch.vstack(split_emb_tup).reshape(batch_size, -1, embs.shape[-1])
-        intp_w = self.get_interpolate_weights(ms_seg_timestamps[0], 
+        intp_w = self.get_interpolate_weights(self.ms_seg_timestamps[0], 
                                          base_seq_len, 
                                          self.msdd_multiscale_args_dict, 
                                          self.emb_scale_n, 
@@ -136,8 +197,8 @@ class MultiScaleLayer:
         # To make offset values such as, [10, 20, 60, x] -> [0, 10, 30, 90]
         ms_emb_seq = self.add_interpolated_embs(target_embs=target_embs, 
                                                 intp_w=intp_w, 
-                                                scale_mapping=scale_mapping,
-                                                ms_seg_counts=ms_seg_counts, 
+                                                scale_mapping=self.scale_mapping,
+                                                ms_seg_counts=self.ms_seg_counts, 
                                                 embs=embs, 
         )
         return ms_emb_seq
@@ -168,7 +229,6 @@ class MultiScaleLayer:
         batch_size = scale_mapping.shape[0]
         repeat_mats_ext = scale_mapping[0][:self.emb_scale_n].to(embs.device)
         all_seq_len = ms_seg_counts[0][-1].to(embs.device) 
-        
         scale_count_offsets = torch.tensor([0] + torch.cumsum(ms_seg_counts[0][:self.emb_scale_n-1], dim=0).tolist())
         repeat_mats_ext = repeat_mats_ext + (scale_count_offsets.to(embs.device)).unsqueeze(1).repeat(1, all_seq_len).to(embs.device)
         extracted_embs = target_embs[:, repeat_mats_ext.flatten(), :].reshape(batch_size, self.emb_scale_n, -1, embs.shape[-1])
@@ -210,21 +270,27 @@ class MultiScaleLayer:
         ms_seg_count_frame_range = torch.repeat_interleave(torch.arange(total_seg_count).to(device), feature_count_range)       
         batch_frame_range = torch.repeat_interleave(batch_index_range, feature_count_range)
         return total_seg_count, ms_seg_count_frame_range, feature_frame_length_range, batch_frame_range, feature_frame_interval_range, feature_count_range
-
+    
     def forward_multiscale(
         self, 
         processed_signal, 
         processed_signal_len, 
-        ms_seg_timestamps, 
-        ms_seg_counts,
         ):
+        bs = processed_signal.shape[0]
+        frame_count = torch.floor(torch.tensor((processed_signal_len.max().item() / self.frame_per_sec)/self.frame_hop)).to(int).item()
+        ms_seg_timestamps, ms_seg_counts = self.get_ms_seg_timestamps(duration=(frame_count * self.frame_hop),
+                                                                      min_subsegment_duration=self.interpolated_scale)
+        scale_mapping = torch.stack(get_argmin_mat(ms_seg_timestamps))
+        self.ms_seg_timestamps = ms_seg_timestamps.unsqueeze(0).repeat(bs, 1, 1, 1).to(processed_signal.device)
+        self.ms_seg_counts = ms_seg_counts.unsqueeze(0).repeat(bs, 1).to(processed_signal.device)
+        self.scale_mapping = scale_mapping.unsqueeze(0).repeat(bs, 1, 1).to(processed_signal.device)
         tsc, mscfr, fflr, bfr, ffir, fcr = self.get_feature_index_map(emb_scale_n=self.emb_scale_n,
                                                                       processed_signal=processed_signal, 
-                                                                      ms_seg_timestamps=ms_seg_timestamps, 
-                                                                      ms_seg_counts=ms_seg_counts, 
+                                                                      ms_seg_timestamps=self.ms_seg_timestamps, 
+                                                                      ms_seg_counts=self.ms_seg_counts, 
                                                                       device=processed_signal.device)
 
-        embs, pools = self.forward_multi_decoder(processed_signal=processed_signal, 
+        _embs, pools = self.forward_multi_decoder(processed_signal=processed_signal, 
                                             processed_signal_len=processed_signal_len, 
                                             total_seg_count=tsc,
                                             ms_seg_count_frame_range=mscfr, 
@@ -234,8 +300,9 @@ class MultiScaleLayer:
                                             feature_count_range=fcr,
                                             device=processed_signal.device,
                                             )
-
-        return embs, pools
+        # Reshape the embedding vectors into multi-scale inputs
+        ms_emb_seq = self.get_ms_emb_fixed(embs=_embs)
+        return ms_emb_seq
 
     def forward_multi_decoder(
         self,

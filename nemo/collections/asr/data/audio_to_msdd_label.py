@@ -121,13 +121,13 @@ def get_frame_targets_from_rttm(
     sorted_speakers = sorted(list(set(speaker_list)))
     total_fr_len = int(duration * feat_per_sec)
     if len(sorted_speakers) > max_spks:
-        raise ValueError(f"Number of speakers in RTTM file {len(sorted_speakers)} exceeds the maximum number of speakers: {max_spks}")
+        sorted_speakers = sorted_speakers[:max_spks]
+    #     logging.info(f"Number of speakers in RTTM file {len(sorted_speakers)} exceeds the maximum number of speakers: {max_spks}")
     feat_level_target = torch.zeros(total_fr_len, max_spks) 
-    for count, (stt, end, spk_rttm_key) in enumerate(zip(stt_list, end_list, speaker_list)):
-        if end < offset or stt > offset + duration:
+    for count, (stt, end, spk) in enumerate(zip(stt_list, end_list, speaker_list)):
+        if end < offset or stt > offset + duration or spk >= max_spks:
             continue
         stt, end = max(offset, stt), min(offset + duration, end)
-        spk = spk_rttm_key
         stt_fr, end_fr = int((stt - offset) * feat_per_sec), int((end - offset)* feat_per_sec)
         feat_level_target[stt_fr:end_fr, spk] = 1
     return feat_level_target
@@ -861,10 +861,9 @@ def _msdd_train_collate_fn(self, batch):
 
     max_raw_feat_len = max([x.shape[0] for x in audio_signal])
     max_target_len = max([x.shape[0] for x in targets])
-    if max([len(feat.shape) for feat in audio_signal]) > 1:
-        max_ch = max([feat.shape[1] for feat in audio_signal])
-    else:
-        max_ch = 1
+    max_total_seg_len = max([x.shape[0] for x in clus_label_index])
+    max_ch = 1
+    max_clus_ch = max([clus_arr.shape[0] for clus_arr in ch_clus_arrays])
     arg_max_idx = torch.argmax(torch.tensor([ x.shape[1] for x in ms_seg_timestamps]))
     ms_seg_ts = ms_seg_timestamps[arg_max_idx]
     ms_seg_ct = ms_seg_counts[arg_max_idx]

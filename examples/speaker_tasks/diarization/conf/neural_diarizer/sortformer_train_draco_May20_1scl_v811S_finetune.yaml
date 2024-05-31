@@ -34,6 +34,7 @@ model:
   use_pil_f1_score: False
   perm_mock_embs: True
   multi_scale_method: 'only_interpolate' # 'mean', 'attention', 'only_interpolate'
+  streaming_mode: False
   variance_in_mock_embs: 0.05
   alpha: 0.5 # mix ratio between final pred and skip pred connections
   sort_layer_on: pre # pre, post, False
@@ -75,6 +76,7 @@ model:
     mock_emb_noise_std: ${model.mock_emb_noise_std}
     mock_emb_degree_of_freedom: 8
     validation_mode: False
+  
   validation_ds:
     manifest_filepath: ???
     emb_dir: ???

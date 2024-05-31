@@ -24,14 +24,13 @@ import torch.nn.functional as F
 from hydra.utils import instantiate
 from omegaconf import DictConfig, open_dict
 from pytorch_lightning import Trainer
-import torch.nn.functional as F
 from tqdm import tqdm
 from typing import List, Optional, Union, Dict 
 import itertools
 
 from nemo.collections.asr.parts.preprocessing.perturb import process_augmentations
 
-from nemo.collections.asr.data.audio_to_msdd_label import AudioToSpeechMSDDTrainDataset
+from nemo.collections.asr.data.audio_to_eesd_label import AudioToSpeechMSDDTrainDataset
 from nemo.collections.asr.data.audio_to_msdd_mock_label import AudioToSpeechMSDDTrainDataset as AudioToSpeechMSDDTrainMockEmbDataset
 from nemo.collections.asr.metrics.multi_binary_acc import MultiBinaryAccuracy
 from nemo.collections.asr.models.asr_model import ExportableEncDecModel
@@ -48,8 +47,9 @@ from nemo.collections.asr.parts.utils.speaker_utils import parse_scale_configs
 from nemo.core.classes import ModelPT
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.core.neural_types import AudioSignal, LengthsType, NeuralType
-from nemo.core.neural_types.elements import ProbsType, LabelsType, LossType
+from nemo.core.neural_types.elements import ProbsType
 from nemo.utils import logging
+from nemo.collections.asr.modules.transformer.transformer_modules import FixedPositionalEncoding
 
 try:
     from torch.cuda.amp import autocast
@@ -93,13 +93,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             List of available pre-trained models.
         """
         result = []
-
-        model = PretrainedModelInfo(
-            pretrained_model_name="diar_msdd_telephonic",
-            location="https://api.ngc.nvidia.com/v2/models/nvidia/nemo/diar_msdd_telephonic/versions/1.0.1/files/diar_msdd_telephonic.nemo",
-            description="For details about this model, please visit https://ngc.nvidia.com/catalog/models/nvidia:nemo:diar_msdd_telephonic",
-        )
-        result.append(model)
         return result
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
@@ -135,6 +128,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         self.sortformer_diarizer = SortformerEncLabelModel.from_config_dict(self.cfg_e2e_diarizer_model.diarizer_module)
         self.sortformer_encoder = SortformerEncLabelModel.from_config_dict(self.cfg_e2e_diarizer_model.sortformer_encoder)
         self.transformer_encoder = SortformerEncLabelModel.from_config_dict(self.cfg_e2e_diarizer_model.transformer_encoder)
+        self.position_embedding = SortformerEncLabelModel.from_config_dict(self.cfg_e2e_diarizer_model.position_embedding)
+        # FixedPositionalEncoding(hidden_size, max_sequence_length)
         self.global_loss_ratio = self.cfg_e2e_diarizer_model.get('global_loss_ratio', 300)
    
         self.original_audio_offsets = {}
@@ -164,6 +159,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         )
         self.msdd_multiscale_args_dict = self.multiscale_layer.multiscale_args_dict
         self.streaming_mode = self.cfg_e2e_diarizer_model.get("streaming_mode", False)
+        self.use_positional_embedding = self.cfg_e2e_diarizer_model.get("use_positional_embedding", False)
         self.alpha = self.cfg_e2e_diarizer_model.alpha
         self.affinity_weighting = self.cfg_e2e_diarizer_model.get('affinity_weighting', True)
         self.save_hyperparameters("cfg")
@@ -363,8 +359,11 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         else:
             AudioToSpeechDiarTrainDataset = AudioToSpeechMSDDTrainDataset
         
+        preprocessor = EncDecSpeakerLabelModel.from_config_dict(self.cfg_e2e_diarizer_model.preprocessor)
         dataset = AudioToSpeechDiarTrainDataset(
             manifest_filepath=config.manifest_filepath,
+            # preprocessor=self.sortformer_diarizer._speaker_model.preprocessor,
+            preprocessor=preprocessor,
             emb_dir=config.emb_dir,
             multiscale_args_dict=self.msdd_multiscale_args_dict,
             soft_label_thres=config.soft_label_thres,
@@ -382,9 +381,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
 
         self.data_collection = dataset.collection
         self.collate_ds = dataset
-        self.ms_seg_timestamps = dataset.ms_seg_timestamps
-        self.ms_seg_counts = dataset.ms_seg_counts
-        self.scale_mapping = dataset.scale_mapping
          
         dataloader_instance = torch.utils.data.DataLoader(
             dataset=dataset,
@@ -423,7 +419,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             "ms_seg_timestamps": NeuralType(('B', 'C', 'T', 'D'), LengthsType()),
             "ms_seg_counts": NeuralType(('B', 'C'), LengthsType()),
             "scale_mapping": NeuralType(('B', 'C', 'T'), LengthsType()),
-            "global_spk_labels": NeuralType(('B', 'T'), LengthsType()),
         }
 
     @property
@@ -459,7 +454,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         mask = row_vector < length_matrix
         return mask.float().to(context_embs.device)
 
-    def forward_infer(self, emb_seq, streaming_mode=True):
+    def forward_infer(self, emb_seq, streaming_mode=True, start_pos=0):
         """
 
         Args:
@@ -473,6 +468,13 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         """
         attn_score_list, preds_list, attn_score_stack, encoder_states_list = [], [], None, []
         encoder_mask = self.length_to_mask(emb_seq)
+        
+        if self.use_positional_embedding:
+            seq_length = emb_seq.shape[1]        
+            position_ids = torch.arange(start=start_pos, end=start_pos + seq_length, dtype=torch.long, device=emb_seq.device)
+            position_ids = position_ids.unsqueeze(0).repeat(emb_seq.size(0), 1)
+            emb_seq = emb_seq + self.position_embedding(position_ids)
+        
         if self._cfg.sortformer_encoder.num_layers > 0 and self._cfg.sortformer_encoder.sort_layer_on == 'pre':
             emb_seq, attn_score_list, preds_list, preds_mean, encoder_states_list = self.sortformer_encoder(encoder_states=emb_seq, encoder_mask=encoder_mask)
             attn_score_stack = torch.hstack(attn_score_list)
@@ -502,7 +504,24 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         ) 
         return processed_signal, processed_signal_length
         
-    def forward_multiscale_encoder(
+    def _forward_multiscale_encoder_from_processed(
+        self, 
+        processed_signal, 
+        processed_signal_len,
+    ):
+        """
+        Encoder part for end-to-end diarizaiton model.
+
+        """
+        ms_emb_seq = self.multiscale_layer.forward_multiscale(
+            processed_signal=processed_signal, 
+            processed_signal_len=processed_signal_len, 
+        )
+        if self._cfg.freeze_speaker_model:
+            ms_emb_seq = ms_emb_seq.detach()
+        return ms_emb_seq
+   
+    def _forward_multiscale_encoder_from_waveform(
         self, 
         audio_signal, 
         audio_signal_length, 
@@ -512,19 +531,20 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
 
         """
         processed_signal, processed_signal_length = self._extract_embeddings(audio_signal=audio_signal, audio_signal_length=audio_signal_length)
-        
+        import ipdb; ipdb.set_trace() 
         ms_emb_seq = self.multiscale_layer.forward_multiscale(
             processed_signal=processed_signal, 
             processed_signal_len=processed_signal_length, 
         )
         if self._cfg.freeze_speaker_model:
             ms_emb_seq = ms_emb_seq.detach()
-        return ms_emb_seq
+        return ms_emb_seq 
     
     def forward(
         self, 
         audio_signal, 
         audio_signal_length, 
+        is_raw_waveform_input=True,
     ):
         """
         Forward pass for training.
@@ -536,10 +556,16 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         if self.cfg_e2e_diarizer_model.use_mock_embs:
             emb_seq = self.train_non_linear_transform_layer(audio_signal)
         else:
-            ms_emb_seq = self.forward_multiscale_encoder(
-                audio_signal=audio_signal, 
-                audio_signal_length=audio_signal_length,
-            ) # [batch_size, max_seg_count, msdd_scale_n, emb_dim]
+            if is_raw_waveform_input:
+                ms_emb_seq = self._forward_multiscale_encoder_from_waveform(
+                    audio_signal=audio_signal, 
+                    audio_signal_length=audio_signal_length,
+                ) # [batch_size, max_seg_count, msdd_scale_n, emb_dim]
+            else:
+                ms_emb_seq = self._forward_multiscale_encoder_from_processed(
+                    processed_signal=audio_signal, 
+                    processed_signal_len=audio_signal_length,
+                ) # [batch_size, max_seg_count, msdd_scale_n, emb_dim]
             
             if self.cfg_e2e_diarizer_model.get("multi_scale_method", None) == "mean":
                 emb_seq = ms_emb_seq.mean(dim=2)
@@ -549,7 +575,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
                 emb_seq = ms_emb_seq[:, :, -1, :] 
             else:
                 raise ValueError(f"Unknown multi-scale method: {self.cfg_e2e_diarizer_model.get('multi_scale_method', None)}")
-            
         if self.streaming_mode:
             preds, _preds, attn_score_stack, total_memory_list, encoder_states_list = self.forward_streaming_infer(emb_seq, streaming_mode=self.streaming_mode) 
         else:
@@ -679,16 +704,14 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         if self.cfg_e2e_diarizer_model.use_mock_embs:
             audio_signal, audio_signal_length, targets = batch 
         else: # In this case, audio_signal is emb_seed
-             audio_signal, feature_length, ms_seg_timestamps, ms_seg_counts, scale_mapping, targets = batch 
-        batch_size = audio_signal.shape[0]
-        ms_seg_counts = self.ms_seg_counts.unsqueeze(0).repeat(batch_size, 1).to(audio_signal.device)
-        sequence_lengths = torch.tensor([x[-1] for x in ms_seg_counts.detach()])
-        self.validation_mode = False
+             audio_signal, audio_signal_length, ms_seg_timestamps, ms_seg_counts, scale_mapping, targets = batch 
+        sequence_lengths = audio_signal_length
         preds, _preds, attn_score_stack, preds_list, encoder_states_list = self.forward(
             audio_signal=audio_signal,
             audio_signal_length=audio_signal_length,
+            is_raw_waveform_input=False,
         )
-
+        
         if self.loss.sorted_loss:
             # Perform arrival-time sorting (ATS)
             targets_ats = self.sort_probs_and_labels(targets.clone(), discrete=True)
@@ -719,7 +742,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             preds_all = torch.cat(preds_list)
             targets_rep = targets_tr_loss.repeat(mid_layer_count+1,1,1)
             sequence_lengths_rep = sequence_lengths.repeat(mid_layer_count+1)
-            spk_loss = self.loss(probs=preds_all, labels=targets_rep, signal_lengths=sequence_lengths_rep)/(mid_layer_count+1)
+            spk_loss = self.loss(probs=preds_all, labels=targets_rep, signal_lengths=sequence_lengths_rep)
         else:
             spk_loss = self.loss(probs=preds, labels=targets_tr_loss, signal_lengths=sequence_lengths)
         self._reset_train_f1_accs()
@@ -793,15 +816,16 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         if self.cfg_e2e_diarizer_model.use_mock_embs:
             audio_signal, audio_signal_length, targets = batch 
         else: # In this case, audio_signal is emb_seed
-             audio_signal, feature_length, ms_seg_timestamps, ms_seg_counts, scale_mapping, targets = batch
+             audio_signal, audio_signal_length, ms_seg_timestamps, ms_seg_counts, scale_mapping, targets = batch
         
         batch_size = audio_signal.shape[0]
-        ms_seg_counts = self.ms_seg_counts.unsqueeze(0).repeat(batch_size, 1).to(audio_signal.device)
+        # ms_seg_counts = ms_seg_counts.unsqueeze(0).repeat(batch_size, 1).to(audio_signal.device)
+        ms_seg_counts = ms_seg_counts.repeat(batch_size, 1).to(audio_signal.device)
         sequence_lengths = torch.tensor([x[-1] for x in ms_seg_counts])
-        self.validation_mode = True
         preds, _preds, attn_score_stack, preds_list, encoder_states_list = self.forward(
             audio_signal=audio_signal,
             audio_signal_length=audio_signal_length,
+            is_raw_waveform_input=False,
         )
         if self.loss.sorted_loss:
             targets_ats = self.sort_probs_and_labels(targets, discrete=True)
@@ -893,52 +917,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             'test_loss': test_loss_mean,
             'test_f1_acc': f1_acc,
         }
-    def predict_step(self, batch: list, batch_idx: int, dataloader_idx: int = 0):
-        # for batch in tqdm(self._test_dl): 
-        if self.cfg_e2e_diarizer_model.use_mock_embs:
-            audio_signal, audio_signal_length, targets = batch 
-        else: # In this case, audio_signal is emb_seed
-            audio_signal, audio_signal_length, ms_seg_timestamps, ms_seg_counts, clus_label_index, scale_mapping, ch_clus_mat, targets, global_spk_labels = batch
-        
-        batch_size = audio_signal.shape[0]
-        ms_seg_counts = self.ms_seg_counts.unsqueeze(0).repeat(batch_size, 1).to(audio_signal.device)
-        ms_seg_timestamps = self.ms_seg_timestamps.unsqueeze(0).repeat(batch_size, 1, 1, 1).to(audio_signal.device)
-        scale_mapping = self.scale_mapping.unsqueeze(0).repeat(batch_size, 1, 1)
-        sequence_lengths = torch.tensor([x[-1] for x in ms_seg_counts])
-        self.validation_mode = True
-        preds, _preds, attn_score_stack, preds_list, encoder_states_list = self.forward(
-            audio_signal=audio_signal,
-            audio_signal_length=audio_signal_length,
-            ms_seg_timestamps=ms_seg_timestamps,
-            ms_seg_counts=ms_seg_counts,
-            scale_mapping=scale_mapping,
-        )
-        if self.loss.sorted_loss:
-            targets_sort_order = self.sort_probs_and_labels(targets, discrete=True)
-            targets = self.sort_targets_with_preds(targets_sort_order, 
-                                                   preds, 
-                                                   discrete=True, 
-                                                   add_pil_loss=self.cfg_e2e_diarizer_model.add_pil_loss, 
-                                                   pil_loss_thres=self.cfg_e2e_diarizer_model.pil_loss_thres)
-        mid_layer_count = len(preds_list)
-        if mid_layer_count > 0:
-            # Only mid-layer outputs 
-            preds_mid_all = torch.cat(preds_list).reshape(-1, *preds.shape)
-            torch.cat(preds_list).reshape(-1, *preds.shape)
-            preds_mean = preds_mid_all.mean(dim=0)
-            # All mid-layer outputs + final layer output
-            preds_list.append(_preds)
-            preds_all = torch.cat(preds_list)
-        else:
-            preds_mean = preds
-        # self._reset_test_f1_accs()
-        preds_vad, preds_ovl, targets_vad, targets_ovl = self.compute_aux_f1(preds, targets)
-        self._accuracy_test_vad(preds_vad, targets_vad, sequence_lengths)
-        self._accuracy_test_ovl(preds_ovl, targets_ovl, sequence_lengths)
-        self._accuracy_test(preds, targets, sequence_lengths)
-        self._accuracy_test_toplyr(_preds, targets, sequence_lengths)
-        self._accuracy_test_prdmean(preds_mean, targets, sequence_lengths)
-        return preds_all 
    
     def test_step(self, batch: list, batch_idx: int, dataloader_idx: int = 0):
         if self.cfg_e2e_diarizer_model.use_mock_embs:
@@ -948,15 +926,11 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         
         batch_size = audio_signal.shape[0]
         ms_seg_counts = self.ms_seg_counts.unsqueeze(0).repeat(batch_size, 1).to(audio_signal.device)
-        ms_seg_timestamps = self.ms_seg_timestamps.unsqueeze(0).repeat(batch_size, 1, 1, 1).to(audio_signal.device)
-        scale_mapping = self.scale_mapping.unsqueeze(0).repeat(batch_size, 1, 1)
         sequence_lengths = torch.tensor([x[-1] for x in ms_seg_counts])
         preds, _preds, attn_score_stack, preds_list, encoder_states_list = self.forward(
             audio_signal=audio_signal,
             audio_signal_length=audio_signal_length,
-            ms_seg_timestamps=ms_seg_timestamps,
-            ms_seg_counts=ms_seg_counts,
-            scale_mapping=scale_mapping,
+            # is_raw_waveform_input=False, 
         )
         mid_layer_count = len(preds_list)
         targets_f1_score = self.sort_targets_with_preds(targets.clone(), 
@@ -971,7 +945,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             preds_mid_all = torch.cat(preds_list).reshape(-1, *preds.shape)
             torch.cat(preds_list).reshape(-1, *preds.shape)
             preds_mean = preds_mid_all.mean(dim=0)
-            # All mid-layer outputs + final layer output
             preds_list.append(_preds)
             self.preds_all = torch.cat(preds_list)
         else:
@@ -1000,17 +973,14 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
                 if self.cfg_e2e_diarizer_model.use_mock_embs:
                     audio_signal, audio_signal_length, targets = batch 
                 else: # In this case, audio_signal is emb_seed
-                    # audio_signal, audio_signal_length, ms_seg_timestamps, ms_seg_counts, _, scale_mapping, _, targets, _ = batch
                     audio_signal, audio_signal_length, ms_seg_timestamps, ms_seg_counts, scale_mapping, targets = batch
                 audio_signal = audio_signal.to(self.device)
                 audio_signal_length = audio_signal_length.to(self.device)
-                batch_size = audio_signal.shape[0]
-                ms_seg_counts = self.ms_seg_counts.unsqueeze(0).repeat(batch_size, 1).to(audio_signal.device)
                 sequence_lengths = torch.tensor([x[-1] for x in ms_seg_counts]).to(audio_signal.device)
-                self.validation_mode = True
                 preds, _preds, attn_score_stack, memory_list, encoder_states_list = self.forward(
                     audio_signal=audio_signal,
                     audio_signal_length=audio_signal_length,
+                    is_raw_waveform_input=False,
                 )
                 preds = preds.detach().to('cpu')
                 self.preds_total_list.append(preds)

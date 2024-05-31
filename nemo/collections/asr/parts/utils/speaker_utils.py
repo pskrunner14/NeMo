@@ -1280,8 +1280,9 @@ def get_subsegments(
     window: float, 
     shift: float, 
     duration: float, 
-    min_subsegment_duration: float = 0.03,
+    min_subsegment_duration: float = 0.01,
     decimals: int = 2,
+    use_asr_style_frame_count: bool = False,
     ) -> List[List[float]]:
     """
     Return subsegments from a segment of audio file.
@@ -1292,22 +1293,28 @@ def get_subsegments(
         Subsegments: [[12.05, 13.55], [12.8, 14.3], [13.55, 14.45], [14.3, 14.45]]
 
     Args:
-        offset (float): start time of audio segment
-        window (float): window length for segments to subsegments length
-        shift (float): hop length for subsegments shift
-        duration (float): duration of segment
+        offset (float): Start time of audio segment
+        window (float): Window length for segments to subsegments length
+        shift (float): Hop length for subsegments shift
+        duration (float): Duration of segment
+        min_subsegment_duration (float): Exclude subsegments smaller than this duration value
+        decimals (int): Number of decimal places to round to
+        use_asr_style_frame_count (bool): If True, use asr style frame count to generate subsegments.
+                                          For example, if duration is 10 secs and frame_shift is 0.08 secs, 
+                                          it results in (10/0.08)+1 = 125 + 1 frames.
+                                          
     Returns:
         subsegments (List[tuple[float, float]]): subsegments generated for the segments as list of tuple of start and duration of each subsegment
     """
     subsegments:  List[List[float]] = []
     start = offset
     slice_end = start + duration
-    # base = math.ceil((duration - window) / shift)
-    # slices = 1 if base < 0 else base + 1
     if min_subsegment_duration <= duration < shift:
         slices = 1
+    elif use_asr_style_frame_count is True:    
+        slices = np.ceil(duration/shift).astype(int)
     else:
-        slices = int(np.ceil((duration-window)/shift) + 1)
+        slices = np.ceil(1+ (duration-window)/shift).astype(int)
     if slices == 1:
         if min(duration, window) >= min_subsegment_duration:
             subsegments.append([start, min(duration, window)])
@@ -1316,15 +1323,15 @@ def get_subsegments(
         dur_col = window * torch.ones(slices)
         dur_col[-1] = min(slice_end - start_col[-1], window)
         dur_col = torch.round(dur_col, decimals=decimals)
-        ss_tensor = torch.stack([start_col, dur_col], dim=1)
-        for k in range(ss_tensor.shape[0]):
-            if dur_col[k] >= min_subsegment_duration:
-                subsegments.append([float(ss_tensor[k,0].item()), float(ss_tensor[k,1].item())])
+        valid_mask = dur_col >= min_subsegment_duration
+        valid_subsegments = torch.stack([start_col[valid_mask], dur_col[valid_mask]], dim=1)
+        subsegments = valid_subsegments.tolist()
     return subsegments
 
 def get_subsegments_(offset: float, window: float, shift: float, duration: float) -> List[List[float]]:
     """
-    Return subsegments from a segment of audio file
+    Return subsegments from a segment of audio file.
+    
     Args:
         offset (float): start time of audio segment
         window (float): window length for segments to subsegments length

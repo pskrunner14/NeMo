@@ -107,10 +107,15 @@ class VadParams:
     shift_length_in_sec: float = 0.01
     smoothing: str = False
     overlap: float = 0.5
-    # onset: float = 0.725
-    # offset: float = 0.55
+    
+    ## Meeting
+    # onset: float = 0.5
+    # offset: float = 0.5
+    
+    ## Telephonic  
     onset: float = 0.65
     offset: float = 0.55
+    
     pad_onset: float = 0.05
     pad_offset: float = 0.05
     min_duration_on: float = 0.2
@@ -240,7 +245,6 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         diar_model = SortformerEncLabelModel.restore_from(restore_path=cfg.model_path, map_location=map_location)
     else:
         raise ValueError("cfg.model_path must end with.ckpt or.nemo!")
-      
     diar_model._cfg.diarizer.out_dir = cfg.tensor_image_dir
     diar_model._cfg.test_ds.session_len_sec = cfg.session_len_sec
     trainer = pl.Trainer(devices=device, accelerator=accelerator)
@@ -254,6 +258,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     diar_model.msdd_multiscale_args_dict['scale_dict'][scale_n-1] = (float(cfg.interpolated_scale), float(cfg.interpolated_scale/2))
     
     # Model setup for inference 
+    diar_model._cfg.test_ds.num_workers = cfg.num_workers
     diar_model.setup_test_data(test_data_config=diar_model._cfg.test_ds)    
     diar_model.streaming_mode = cfg.streaming_mode
     diar_model.sortformer_diarizer.step_len = cfg.step_len

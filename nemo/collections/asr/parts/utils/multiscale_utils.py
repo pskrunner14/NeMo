@@ -60,6 +60,7 @@ class MultiScaleLayer:
         self.interpolated_scale =  self.cfg_e2e_diarizer_model.get('interpolated_scale', None) 
         self.dtype = dtype
         self.use_asr_style_frame_count = True
+        self.sample_rate = self.cfg_e2e_diarizer_model.train_ds.get('sample_rate', 16000)
     
     def _init_segmentation_info(self):
         """Initialize segmentation settings: window, shift and multiscale weights.
@@ -114,7 +115,8 @@ class MultiScaleLayer:
     def get_ms_seg_timestamps(
         self, 
         duration: float, 
-        min_subsegment_duration: float=0.01
+        min_subsegment_duration: float=0.01,
+        sample_rate: int = 16000,
         ):
         """
         Get start and end time of segments in each scale.
@@ -140,6 +142,7 @@ class MultiScaleLayer:
                                                                 dtype=self.dtype, 
                                                                 min_subsegment_duration=min_subsegment_duration,
                                                                 use_asr_style_frame_count=self.use_asr_style_frame_count,
+                                                                sample_rate=self.sample_rate,
         )
         return ms_seg_timestamps, ms_seg_counts
 
@@ -206,7 +209,6 @@ class MultiScaleLayer:
             self.msdd_scale_n, 
             is_integer_ts=True
         ) # [batch_size, base_seq_len, emb_dim]
-
         ms_emb_seq = self.add_interpolated_embs(
             target_embs=target_embs, 
             intp_w=intp_w, 
@@ -247,11 +249,9 @@ class MultiScaleLayer:
         ms_seg_counts_embs = ms_seg_counts[:, :emb_scale_n] 
         total_seg_count = torch.sum(ms_seg_counts_embs)
         ms_seg_counts_embs_flatten =  ms_seg_counts_embs.flatten()
-
         # The following index-tensors are needed for matrix reshaping without nested for-loops.
         batch_index_range = torch.repeat_interleave(torch.arange(batch_size).to(device), ms_seg_counts_embs.sum(dim=1), dim=0)
         scale_index_range = torch.repeat_interleave(torch.arange(emb_scale_n).repeat(batch_size).to(device) , ms_seg_counts_embs_flatten)
-
         # Pre-compute sequence indices for faster assigning: 
         seq_index_range = torch.arange(ms_seg_counts_embs_flatten.max()).to(device)
         if seq_index_range.shape[0] != ms_seg_counts_embs_flatten.max():
@@ -259,7 +259,6 @@ class MultiScaleLayer:
         segment_index_range = seq_index_range.repeat(batch_size)
         target_timestamps = ms_seg_timestamps[batch_index_range, scale_index_range, segment_index_range, :].to(torch.int64)
         feature_count_range = target_timestamps[:, 1] - target_timestamps[:, 0]
-
         # Pre-compute feature indices for faster assigning:
         feature_frame_length_range, feature_frame_interval_range= self.get_feat_range_mats(max_feat_len=processed_signal.shape[2], 
                                                                                            feature_count_range=feature_count_range, 
@@ -274,9 +273,13 @@ class MultiScaleLayer:
         self, 
         processed_signal, 
         processed_signal_len, 
+        audio_signal_length=None,
         ):
-        audio_len_secs = ( processed_signal_len.max() / self.frame_per_sec) 
         batch_size = processed_signal.shape[0]
+        if audio_signal_length is not None:
+            audio_len_secs = (audio_signal_length / self.sample_rate).max()
+        else:
+            audio_len_secs = ( processed_signal_len.max() / self.frame_per_sec) 
         _ms_seg_timestamps, _ms_seg_counts = self.get_ms_seg_timestamps(duration=audio_len_secs.item())
         _scale_mapping = torch.stack(get_argmin_mat(_ms_seg_timestamps))
         ms_seg_timestamps = _ms_seg_timestamps.unsqueeze(0).repeat(batch_size, 1, 1, 1).to(processed_signal.device) # [batch_size, scale_n, num_frames, start and end timestamps]

@@ -128,8 +128,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         self.sortformer_diarizer = SortformerEncLabelModel.from_config_dict(self.cfg_e2e_diarizer_model.diarizer_module)
         self.sortformer_encoder = SortformerEncLabelModel.from_config_dict(self.cfg_e2e_diarizer_model.sortformer_encoder)
         self.transformer_encoder = SortformerEncLabelModel.from_config_dict(self.cfg_e2e_diarizer_model.transformer_encoder)
-        self.position_embedding = SortformerEncLabelModel.from_config_dict(self.cfg_e2e_diarizer_model.position_embedding)
-        # FixedPositionalEncoding(hidden_size, max_sequence_length)
+        if self.cfg_e2e_diarizer_model.get('position_embedding', None) is not None:
+            self.position_embedding = SortformerEncLabelModel.from_config_dict(self.cfg_e2e_diarizer_model.position_embedding)
         self.global_loss_ratio = self.cfg_e2e_diarizer_model.get('global_loss_ratio', 300)
    
         self.original_audio_offsets = {}
@@ -531,10 +531,11 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
 
         """
         processed_signal, processed_signal_length = self._extract_embeddings(audio_signal=audio_signal, audio_signal_length=audio_signal_length)
-        import ipdb; ipdb.set_trace() 
+        processed_signal = processed_signal[:, :, :processed_signal_length.max()]
         ms_emb_seq = self.multiscale_layer.forward_multiscale(
             processed_signal=processed_signal, 
             processed_signal_len=processed_signal_length, 
+            audio_signal_length=audio_signal_length,
         )
         if self._cfg.freeze_speaker_model:
             ms_emb_seq = ms_emb_seq.detach()
@@ -709,7 +710,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         preds, _preds, attn_score_stack, preds_list, encoder_states_list = self.forward(
             audio_signal=audio_signal,
             audio_signal_length=audio_signal_length,
-            is_raw_waveform_input=False,
+            # is_raw_waveform_input=False,
         )
         
         if self.loss.sorted_loss:
@@ -825,7 +826,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         preds, _preds, attn_score_stack, preds_list, encoder_states_list = self.forward(
             audio_signal=audio_signal,
             audio_signal_length=audio_signal_length,
-            is_raw_waveform_input=False,
+            # is_raw_waveform_input=False,
         )
         if self.loss.sorted_loss:
             targets_ats = self.sort_probs_and_labels(targets, discrete=True)
@@ -980,7 +981,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
                 preds, _preds, attn_score_stack, memory_list, encoder_states_list = self.forward(
                     audio_signal=audio_signal,
                     audio_signal_length=audio_signal_length,
-                    is_raw_waveform_input=False,
                 )
                 preds = preds.detach().to('cpu')
                 self.preds_total_list.append(preds)

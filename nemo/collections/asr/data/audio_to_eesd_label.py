@@ -21,8 +21,9 @@ from nemo.collections.asr.parts.utils.speaker_utils import convert_rttm_line, ge
 from nemo.collections.common.parts.preprocessing.collections import DiarizationSpeechLabel
 from nemo.core.classes import Dataset
 from nemo.core.neural_types import AudioSignal, LengthsType, NeuralType, ProbsType
+import numpy as np
 
-def get_subsegments_to_scale_timestamps(subsegments: List[Tuple[float, float]], feat_per_sec, decimals=2):
+def get_subsegments_to_scale_timestamps(subsegments: List[Tuple[float, float]], feat_per_sec: int = 100, max_end_ts: float=None, decimals=2):
     """
     Convert subsegment timestamps to scale timestamps.
 
@@ -39,6 +40,8 @@ def get_subsegments_to_scale_timestamps(subsegments: List[Tuple[float, float]], 
     scale_ts_round = torch.round(seg_ts, decimals=decimals)
     scale_ts = scale_ts_round.long()
     scale_ts[:, 1] = scale_ts[:, 0] + scale_ts[:, 1]
+    if max_end_ts is not None:
+        scale_ts = np.clip(scale_ts, 0, int(max_end_ts*feat_per_sec))
     return scale_ts 
 
 def get_ms_seg_timestamps(
@@ -50,6 +53,7 @@ def get_ms_seg_timestamps(
     dtype,
     min_subsegment_duration: float,
     use_asr_style_frame_count: bool = False,
+    sample_rate: int = 16000,
     ):
     """
     Get start and end time of segments in each scale.
@@ -74,8 +78,14 @@ def get_ms_seg_timestamps(
                                         duration=duration, 
                                         min_subsegment_duration=min_subsegment_duration,
                                         use_asr_style_frame_count=use_asr_style_frame_count,
+                                        sample_rate=sample_rate,
+                                        feat_per_sec=feat_per_sec,
         )
-        scale_ts_tensor = get_subsegments_to_scale_timestamps(subsegments, feat_per_sec, decimals=2)
+        if use_asr_style_frame_count:
+            effective_dur =  np.ceil((1+duration*sample_rate)/int(sample_rate/feat_per_sec)).astype(int)/feat_per_sec
+        else:
+            effective_dur = duration 
+        scale_ts_tensor = get_subsegments_to_scale_timestamps(subsegments, feat_per_sec, decimals=2, max_end_ts=(offset+effective_dur))
         if scale_idx == scale_n - 1:
             total_steps = scale_ts_tensor.shape[0]
         ms_seg_counts[scale_idx] = scale_ts_tensor.shape[0]
@@ -93,7 +103,7 @@ def extract_seg_info_from_rttm(uniq_id, offset, duration, rttm_lines, mapping_di
     included in the output lists.
     """
     rttm_stt, rttm_end = offset, offset + duration
-    stt_list, end_list, speaker_list, pairwise_infer_spks = [], [], [], []
+    stt_list, end_list, speaker_list = [], [], []
 
     speaker_set = []
     sess_to_global_spkids = dict()
@@ -447,7 +457,9 @@ class _AudioMSDDTrainDataset(Dataset):
     def get_ms_seg_timestamps(
         self, 
         duration: float, 
-        min_subsegment_duration: float=0.0
+        min_subsegment_duration: float=0.0,
+        sample_rate: int=16000,
+        feat_per_sec: int=160,
         ):
         """
         Get start and end time of segments in each scale.
@@ -470,6 +482,7 @@ class _AudioMSDDTrainDataset(Dataset):
                                                                 dtype=self.dtype, 
                                                                 min_subsegment_duration=min_subsegment_duration,
                                                                 use_asr_style_frame_count=self.use_asr_style_frame_count,
+                                                                sample_rate=sample_rate,
         )
         return ms_seg_timestamps, ms_seg_counts
     
@@ -490,27 +503,16 @@ class _AudioMSDDTrainDataset(Dataset):
         
         _audio_length = torch.tensor(audio_signal.shape[0]).long()
         audio_signal, _audio_length = audio_signal.to('cpu'), _audio_length.to('cpu')
-        # self.preprocessor = self.preprocessor.cuda()
-        # audio_signal, _audio_length = audio_signal.to('cuda'), _audio_length.to('cuda')
-        
-        # self.preprocessor = 
-        self.preprocessor.cpu()
-        feature_signal, feature_length = self.preprocessor(input_signal=audio_signal.unsqueeze(0), length=_audio_length.unsqueeze(0)) 
-        feature_signal, feature_length = feature_signal.squeeze(0), feature_length.squeeze(0)
-        duration_in_sec = (feature_length / self.feat_per_sec).item()
-        
-        # feature_signal, feature_length = audio_signal, _audio_length + 1
-        # duration_in_sec = original_duration_sec + 0.01
+        feature_signal, feature_length = audio_signal, _audio_length
+        duration_in_sec = original_duration_sec 
          
-        ms_seg_timestamps, ms_seg_counts = self.get_ms_seg_timestamps(duration=duration_in_sec)
+        ms_seg_timestamps, ms_seg_counts = self.get_ms_seg_timestamps(duration=duration_in_sec, sample_rate=self.featurizer.sample_rate)
         scale_mapping = torch.stack(get_argmin_mat(ms_seg_timestamps))
         targets, _, _ = self.parse_rttm_for_ms_targets(uniq_id=uniq_id, 
                                                     rttm_file=sample.rttm_file,
                                                     offset=offset,
                                                     duration=duration_in_sec,
                                                     ms_seg_counts=ms_seg_counts)
-        feat_len = targets.shape[0]
-        feature_signal = feature_signal[:, :feat_len]
         return feature_signal, feature_length, ms_seg_timestamps, ms_seg_counts, scale_mapping, targets
 
 def _msdd_train_collate_fn(self, batch):

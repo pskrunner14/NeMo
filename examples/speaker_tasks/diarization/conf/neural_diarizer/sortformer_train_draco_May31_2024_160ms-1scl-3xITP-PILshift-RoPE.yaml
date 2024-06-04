@@ -28,6 +28,7 @@ model:
   multi_scale_method: 'only_interpolate' # 'mean', 'attention', 'only_interpolate'
   streaming_mode: False
   use_positional_embedding: False
+  use_roformer: False
   alpha: 0.5 # mix ratio between final pred and skip pred connections
   sort_layer_on: pre # pre, post, False
   sort_bin_order: False
@@ -128,6 +129,7 @@ model:
   sortformer_encoder:
     _target_: nemo.collections.asr.modules.transformer.sortformer_encoders.SortformerEncoder
     num_layers: 6
+    use_roformer: ${model.use_roformer} # Uses roformer (transformer+RoPE) instead of Sort-layer included sortformer
     hidden_size: 192 # Needs to be multiple of num_attention_heads
     inner_size: ${model.inner}
     num_attention_heads: ${model.heads}
@@ -142,9 +144,7 @@ model:
     sort_layer_type: "parallel"
     seq_var_sort: False
     sort_bin_order: ${model.sort_bin_order}
-    layer_arrival_time_sort: ${model.layer_arrival_time_sort}
     num_classes: ${model.max_num_of_spks}
-    detach_preds: False
 
   transformer_encoder:
     _target_: nemo.collections.asr.modules.transformer.transformer_encoders.TransformerEncoder

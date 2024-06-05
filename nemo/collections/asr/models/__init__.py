@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo.collections.asr.models.aed_multitask_models import EncDecMultiTaskModel, MSEncDecMultiTaskModel
+from nemo.collections.asr.models.aed_multitask_models import EncDecMultiTaskModel, MSEncDecMultiTaskModel, MSEncDecMultiTaskModelAdapter
 from nemo.collections.asr.models.asr_model import ASRModel
 from nemo.collections.asr.models.audio_to_audio_model import AudioToAudioModel
 from nemo.collections.asr.models.classification_models import (

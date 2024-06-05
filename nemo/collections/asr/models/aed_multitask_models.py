@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
+import os, json
 from dataclasses import dataclass, field
 from math import ceil
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, Tuple
 
 import numpy as np
 import torch
@@ -41,11 +41,14 @@ from nemo.collections.asr.parts.submodules.token_classifier import TokenClassifi
 from nemo.collections.asr.parts.utils import manifest_utils
 from nemo.collections.asr.parts.utils.audio_utils import ChannelSelectorType
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
+from nemo.collections.asr.parts.utils.speaker_utils import parse_scale_configs, get_subsegments
+from nemo.collections.asr.parts.utils.offline_clustering import get_argmin_mat
 from nemo.collections.common import tokenizers
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 from nemo.collections.common.metrics import GlobalAverageLossMetric
 from nemo.collections.common.parts import transformer_weights_init
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
+from nemo.collections.common.parts import adapter_modules
 from nemo.core.classes.common import typecheck
 from nemo.core.neural_types import (
     AudioSignal,
@@ -57,9 +60,11 @@ from nemo.core.neural_types import (
     NeuralType,
     SpectrogramType,
 )
+from nemo.core import adapter_mixins
 from nemo.utils import logging, model_utils
+from nemo.collections.asr.parts.utils import adapter_utils
 
-__all__ = ['EncDecMultiTaskModel', 'MSEncDecMultiTaskModel']
+__all__ = ['EncDecMultiTaskModel', 'MSEncDecMultiTaskModel', 'MSAdapterEncDecMultiTaskModel']
 
 
 def lens_to_mask(lens, max_length):
@@ -1063,15 +1068,19 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
         """
         model_path = self.cfg.asr_model_path
 
-        if model_path is not None and model_path.endswith('.nemo'):
-            pretrained_asr_model = EncDecMultiTaskModel.restore_from(model_path, map_location="cpu")
-            logging.info("ASR Model restored locally from {}".format(model_path))
-        elif model_path.endswith('.ckpt'):
-            pretrained_asr_model = EncDecMultiTaskModel.load_from_checkpoint(model_path, map_location="cpu")
-            logging.info("ASR Model restored locally from {}".format(model_path))
-        else:
-            pretrained_asr_model = EncDecMultiTaskModel.from_pretrained(model_path, map_location="cpu")
-            logging.info("ASR Model restored from NGC {}".format(model_path))
+        try:
+            if model_path is not None and model_path.endswith('.nemo'):
+                pretrained_asr_model = EncDecMultiTaskModel.restore_from(model_path, map_location="cpu")
+                logging.info("ASR Model restored locally from {}".format(model_path))
+            elif model_path.endswith('.ckpt'):
+                pretrained_asr_model = EncDecMultiTaskModel.load_from_checkpoint(model_path, map_location="cpu")
+                logging.info("ASR Model restored locally from {}".format(model_path))
+            else:
+                pretrained_asr_model = EncDecMultiTaskModel.from_pretrained(model_path, map_location="cpu")
+                logging.info("ASR Model restored from NGC {}".format(model_path))
+        except:
+            pretrained_asr_model = None
+            logging.info("ASR Model not restored from NGC {}".format(model_path))
 
         if pretrained_asr_model is not None:
             logging.info("Restoring ASR model parameters from pretrained model.")
@@ -1107,6 +1116,7 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
             processed_signal, processed_signal_length = self.preprocessor(
                 input_signal=input_signal, length=input_signal_length
             )
+        #print('processed_signal: ', processed_signal.shape)
 
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
@@ -1147,37 +1157,37 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
             seg_feats[:, :, i, :] = feat[:, :, i * segment_shift : i * segment_shift + segment_length]
         return seg_feats
 
-    def random_zero_mask(self,
-                         feat=None,
-                         prob=0.5,
-                         mask_value=0,
-                         min_mask_len=0.2,
-                         mask_range=(0.1, 0.9),
-                         ):
-        """
-        randomly mask some frames in the feature sequence
-        Args:
-            feat: B x D x T
-            prob: float, the probability to mask a sample in the batch
-            mask_value: float, the value to fill in the masked frame
-            mask_range: tuple, only mask the frames in the range of mask_range[0] * T to mask_range[1] * T
-        Return:
-            masked_feat: B x D x T
-        """
-        if prob <= 0:
-            return None, feat
-        B, T, D = feat.shape
+    # def random_zero_mask(self,
+    #                      feat=None,
+    #                      prob=0.5,
+    #                      mask_value=0,
+    #                      min_mask_len=0.2,
+    #                      mask_range=(0.1, 0.9),
+    #                      ):
+    #     """
+    #     randomly mask some frames in the feature sequence
+    #     Args:
+    #         feat: B x D x T
+    #         prob: float, the probability to mask a sample in the batch
+    #         mask_value: float, the value to fill in the masked frame
+    #         mask_range: tuple, only mask the frames in the range of mask_range[0] * T to mask_range[1] * T
+    #     Return:
+    #         masked_feat: B x D x T
+    #     """
+    #     if prob <= 0:
+    #         return None, feat
+    #     B, T, D = feat.shape
 
-        mask = torch.ones_like(feat).to(feat.device)
-        selected_sample_idx = torch.where(torch.rand(B) < prob)[0]
-        n_masked_samples = len(selected_sample_idx)
-        start_range = (int(mask_range[0] * T), int((mask_range[1] - min_mask_len) * T))
-        mask_starts = torch.randint(start_range[0], start_range[1], (n_masked_samples,))
-        for i in range(n_masked_samples):
-            mask_len = torch.randint(int(min_mask_len * T), int(T * mask_range[1] - mask_starts[i]), (1, ))[0]
-            mask[selected_sample_idx[i], mask_starts[i]:mask_starts[i] + mask_len] = mask_value
+    #     mask = torch.ones_like(feat).to(feat.device)
+    #     selected_sample_idx = torch.where(torch.rand(B) < prob)[0]
+    #     n_masked_samples = len(selected_sample_idx)
+    #     start_range = (int(mask_range[0] * T), int((mask_range[1] - min_mask_len) * T))
+    #     mask_starts = torch.randint(start_range[0], start_range[1], (n_masked_samples,))
+    #     for i in range(n_masked_samples):
+    #         mask_len = torch.randint(int(min_mask_len * T), int(T * mask_range[1] - mask_starts[i]), (1, ))[0]
+    #         mask[selected_sample_idx[i], mask_starts[i]:mask_starts[i] + mask_len] = mask_value
 
-        return mask, feat * mask
+    #     return mask, feat * mask
 
 
     def forward_spk(
@@ -1246,10 +1256,12 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
         #logging.info('.......................', self.training, self.cfg.zero_prob)
 
         # ASR branch: downsample rate is 8
+        #print('input_signal: ', input_signal.shape)
         with torch.set_grad_enabled(not self.cfg.freeze_asr):
             asr_enc_states, asr_encoded_len, asr_enc_mask = self.forward_asr( # B x T x D
                 input_signal, input_signal_length, processed_signal, processed_signal_length
             )
+        #print('asr_enc_states: ', asr_enc_states.shape)
         # Spk branch: downsample rate is 1 for encoder, but downsample rate is 8 for decoder
         if self.spk == True:
             with torch.set_grad_enabled(not self.cfg.freeze_spk):
@@ -1284,4 +1296,131 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
             transf_log_probs = self.log_softmax(hidden_states=dec_states)
 
         return transf_log_probs, asr_encoded_len, enc_states, asr_enc_mask
+    
+class MSEncDecMultiTaskModelAdapter(EncDecMultiTaskModel, adapter_mixins.AdapterModuleMixin):
+    """
+    A Multi-Task model that uses a Masked Sequence-to-Sequence model for the encoder-decoder architecture.
+    """
 
+    def __init__(self, cfg: DictConfig, trainer: Trainer = None):
+        super().__init__(cfg)
+        self._init_asr_model()
+        
+        # adapter layers: 'all' or '0-3_5-7' 
+        if 'adapter_layers' not in cfg.adapter or cfg.adapter.adapter_layers == 'all':
+            self.adapter_layers = list(range(len(self.encoder.layers)))
+        else:
+            # '0-3_5-7' -> [0, 1, 2, 3, 5, 6, 7]
+            self.adapter_layers = []
+            for i in cfg.adapter.adapter_layers.split('_'):
+                if '-' in i:
+                    start, end = i.split('-')
+                    self.adapter_layers.extend(list(range(int(start), int(end)+1)))
+                else:
+                    self.adapter_layers.append(int(i))
+
+        self._init_encoder_adapter() # Encoder is frozen
+        self._init_decoder_adapter() # not implemented yet
+
+        print(self.is_adapter_available())
+        print(self.get_enabled_adapters())
+
+        # the encoder need to be frozen in NeMo/examples/asr/speech_multitask/speech_to_text_aed_ms_adapter.py
+        # self.encoder.freeze()
+        # self.unfreeze_enabled_adapters()
+
+    def _init_encoder_adapter(self):
+        cfg = adapter_modules.LinearAdapterConfig(
+            in_features=self.cfg.adapter.in_features, 
+            dim=self.cfg.adapter.dim
+        )
+        self._update_adapter_cfg_input_dim(cfg)
+        for i, layer in enumerate(self.encoder.layers):
+            if i in self.adapter_layers:
+                layer.add_adapter(
+                    name=f'encoder:layer{i}_adapter', 
+                    cfg=cfg
+                )
+
+    def _init_decoder_adapter(self):
+        cfg = adapter_modules.LinearAdapterConfig(
+            in_features=self.cfg.adapter.in_features, 
+            dim=self.cfg.adapter.dim
+        )
+        # TODO: add decoder adapter without changing tokenizer
+        # for i, layer in enumerate(self._decoder.layers):
+        #     layer.add_adapter(
+        #         name=f'decoder:layer{i}_adapter', 
+        #         cfg=cfg
+        #     )
+
+    def unfreeze_enabled_adapters(self):
+        for i, layer in enumerate(self.encoder.layers):
+            if i in self.adapter_layers:
+                layer.unfreeze_enabled_adapters()
+
+    def get_enabled_adapters(self) -> List[str]:
+      # call the same method on each `MLP` layer, collecting results
+        enabled_adapters = set([])
+        for i, layer in enumerate(self.encoder.layers):
+            if i in self.adapter_layers:
+                names = layer.get_enabled_adapters()
+                enabled_adapters.update(names)
+        return sorted(list(enabled_adapters))
+  
+    def set_enabled_adapters(self, name: Optional[str], enabled: bool):
+        for layer in self.encoder.layers:
+            layer.set_enabled_adapters(name, enabled)
+    
+    def is_adapter_available(self) -> bool:
+        is_available = any([layer.is_adapter_available() for layer in self.encoder.layers])
+        return is_available
+    
+    def _update_adapter_cfg_input_dim(self, cfg: DictConfig):
+        cfg = adapter_utils.update_adapter_cfg_input_dim(self, cfg, module_dim=self.cfg.model_defaults.asr_enc_hidden)
+        return cfg
+        
+    def _init_asr_model(self):
+        """
+        Initialize the ASR model. Assuming that the model is initialized with super().__init__().
+        """
+        model_path = self.cfg.asr_model_path
+
+        try:
+            if model_path is not None and model_path.endswith('.nemo'):
+                cfg = EncDecMultiTaskModel.restore_from(model_path, return_config=True)
+                cfg = self.update_model_config_to_support_adapter(cfg)
+                self.pretrained_asr_model = EncDecMultiTaskModel.restore_from(model_path, override_config_path=cfg, map_location="cpu")
+                logging.info("ASR Model restored locally from {}".format(model_path))
+            elif model_path is not None and model_path.endswith('.ckpt'):
+                cfg = EncDecMultiTaskModel.load_from_checkpoint(model_path, return_config=True)
+                cfg = self.update_model_config_to_support_adapter(cfg)
+                self.pretrained_asr_model = EncDecMultiTaskModel.load_from_checkpoint(model_path, override_config_path=cfg, map_location="cpu")
+                logging.info("ASR Model restored locally from {}".format(model_path))
+            else:
+                cfg = EncDecMultiTaskModel.from_pretrained(model_path, return_config=True)
+                cfg = self.update_model_config_to_support_adapter(cfg)
+                self.pretrained_asr_model = EncDecMultiTaskModel.from_pretrained(model_path, override_config_path=cfg, map_location="cpu")
+                logging.info("ASR Model restored from NGC {}".format(model_path))
+        except:
+            self.pretrained_asr_model = None
+            logging.info("ASR Model not restored from NGC {}".format(model_path))
+
+        if self.pretrained_asr_model is not None:
+            logging.info("Restoring ASR model parameters from pretrained model.")
+            self.encoder.load_state_dict(self.pretrained_asr_model.encoder.state_dict(), strict=True)
+            self.encoder_decoder_proj.load_state_dict(self.pretrained_asr_model.encoder_decoder_proj.state_dict(), strict=True)
+            if self.use_transf_encoder:
+                self.transf_encoder.load_state_dict(self.pretrained_asr_model.transf_encoder.state_dict(), strict=True)
+            self.transf_decoder.load_state_dict(self.pretrained_asr_model.transf_decoder.state_dict(), strict=True)
+
+            del self.pretrained_asr_model
+
+    def update_model_config_to_support_adapter(self, model_cfg):
+        with open_dict(model_cfg):
+            adapter_metadata = adapter_mixins.get_registered_adapter(model_cfg.encoder._target_)
+            if adapter_metadata is not None:
+                model_cfg.encoder._target_ = adapter_metadata.adapter_class_path
+        
+        print("Updated encoder _target_ model :", model_cfg.encoder._target_)
+        return model_cfg

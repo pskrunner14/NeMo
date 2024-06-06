@@ -13,11 +13,8 @@
 # limitations under the License.
 
 import copy
-import pickle as pkl
 from collections import OrderedDict
-from pathlib import Path
-from statistics import mode
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Union
 from operator import attrgetter
 from torch import Tensor
 
@@ -28,8 +25,6 @@ import torch.nn.functional as F
 from hydra.utils import instantiate
 from omegaconf import DictConfig, open_dict
 from pytorch_lightning import Trainer
-from pytorch_lightning.utilities import rank_zero_only
-import torch.nn.functional as F
 from tqdm import tqdm
 from typing import List, Optional, Union, Dict 
 import itertools
@@ -37,31 +32,25 @@ from dataclasses import dataclass
 
 from nemo.collections.asr.parts.preprocessing.perturb import process_augmentations
 
-from nemo.collections.asr.data.audio_to_msdd_label import AudioToSpeechMSDDTrainDataset
-from nemo.collections.asr.data.audio_to_msdd_mock_label import AudioToSpeechMSDDTrainDataset as AudioToSpeechMSDDTrainMockEmbDataset
-from nemo.collections.asr.models.multi_classification_models import EncDecMultiClassificationModel
-from nemo.collections.asr.metrics.der import score_labels
+from nemo.collections.asr.data.audio_to_eesd_label import AudioToSpeechMSDDTrainDataset
 from nemo.collections.asr.metrics.multi_binary_acc import MultiBinaryAccuracy
 from nemo.collections.asr.models.asr_model import ExportableEncDecModel
 from nemo.collections.asr.models.clustering_diarizer import (
-    _MODEL_CONFIG_YAML,
-    _SPEAKER_MODEL,
     get_available_model_names,
 )
 
 
 from nemo.collections.asr.models.label_models import EncDecSpeakerLabelModel
 from nemo.collections.asr.parts.preprocessing.features import WaveformFeaturizer
-from nemo.collections.asr.parts.utils.offline_clustering import (
-    cos_similarity_batch,
-)
+from nemo.collections.asr.parts.utils.multiscale_utils import MultiScaleLayer
 
 from nemo.collections.asr.parts.utils.speaker_utils import parse_scale_configs
 from nemo.core.classes import ModelPT
-from nemo.core.classes.common import PretrainedModelInfo, typecheck
+from nemo.core.classes.common import PretrainedModelInfo
 from nemo.core.neural_types import AudioSignal, LengthsType, NeuralType
-from nemo.core.neural_types.elements import ProbsType, LabelsType, LossType
+from nemo.core.neural_types.elements import ProbsType
 from nemo.utils import logging
+from nemo.collections.asr.modules.transformer.transformer_modules import FixedPositionalEncoding
 
 try:
     from torch.cuda.amp import autocast
@@ -77,177 +66,14 @@ torch.backends.cudnn.enabled = False
 
 __all__ = ['EncDecDiarLabelModel']
 
-from nemo.core.classes import Loss, Typing, typecheck
+from nemo.core.classes import Loss, Typing
+
 
 
 def init_weights(m):
     if isinstance(m, nn.Linear):
         torch.nn.init.xavier_uniform(m.weight)
         m.bias.data.fill_(0.01)
-
-def get_n_params(model):
-    pp=0
-    for p in list(model.parameters()):
-        nn=1
-        for s in list(p.size()):
-            nn = nn*s
-        pp += nn
-    pp_string = str(round(pp / float(10**6), 2)) + "M"
-    print(f"size: {pp_string}")
-    return pp
-
-def check_multiscale_data(method):
-    def wrapper(self, *args, **kwargs):
-        for var_str in ['ms_seg_timestamps', 'ms_seg_counts', 'scale_mapping']:
-            if torch.std(kwargs[var_str].float(), dim=0).sum() != 0:
-                raise ValueError(f"Multi-scale variables should have the same values for all samples in a batch.")
-            check_batch_unity(kwargs[var_str])
-        return method(self, *args, **kwargs)
-    return wrapper
-
-
-def check_batch_unity(batch_tensor):
-    if torch.std(batch_tensor.float(), dim=0).sum() != 0:
-        raise ValueError(f"Multi-scale variables should have the same values for all samples in a batch.")
-
-class AffinityLoss(Loss, Typing):
-    """
-    Computes Binary Cross Entropy (BCE) loss. The BCELoss class expects output from Sigmoid function.
-    """
-
-    @property
-    def input_types(self):
-        """Input types definitions for AnguarLoss.
-        """
-        return {
-            "probs": NeuralType(('B', 'T', 'C'), ProbsType()),
-            'labels': NeuralType(('B', 'T', 'C'), LabelsType()),
-            "signal_lengths": NeuralType(tuple('B'), LengthsType()),
-        }
-
-    @property
-    def output_types(self):
-        """
-        Output types definitions for binary cross entropy loss. Weights for labels can be set using weight variables.
-        """
-        return {"loss": NeuralType(elements_type=LossType())}
-
-    def __init__(self, gamma=0.0, negative_margin=0.5, positive_margin=0.05):
-        super().__init__()
-        self.gamma = gamma # weights for loss values of [different, same] speaker segments
-        self.negative_margin = negative_margin
-        self.positive_margin = positive_margin
-        
-
-    def forward(self, batch_affinity_mat, targets):
-        """
-        Calculate binary cross entropy loss based on probs, labels and signal_lengths variables.
-
-        Args:
-            probs (torch.tensor)
-                Predicted probability value which ranges from 0 to 1. Sigmoid output is expected.
-            labels (torch.tensor)
-                Groundtruth label for the predicted samples.
-            signal_lengths (torch.tensor):
-                The actual length of the sequence without zero-padding.
-
-        Returns:
-            loss (NeuralType)
-                Binary cross entropy loss value.
-        """
-        gt_affinity = cos_similarity_batch(targets, targets)
-        gt_affinity_margin = gt_affinity.clamp_(self.negative_margin, 1.0 - self.positive_margin)
-        batch_affinity_mat_margin = batch_affinity_mat.clamp_(self.negative_margin, 1.0 - self.positive_margin)
-        elem_affinity_loss = torch.abs(gt_affinity_margin - batch_affinity_mat_margin)
-        positive_samples = gt_affinity * elem_affinity_loss
-        negative_samples = (1-gt_affinity) * elem_affinity_loss
-        affinity_loss = (1-self.gamma) * positive_samples.sum() + self.gamma * negative_samples.sum()
-        return affinity_loss
-
-
-def get_scale_dist_mat_t(source_scale_idx, ms_seg_timestamps, msdd_scale_n, deci=1):
-    """
-    Get distance matrix between anchors of the source scale and base scale.
-
-    Args:
-        source_scale_idx (int): Source scale index
-        ms_seg_timestamps (Tensor): Multi-scale segment timestamps
-
-    Returns:
-        abs_dist_mat (Tensor): Distance matrix between anchors of the source scale and base scale
-    """
-    source_scale_anchor_zeros = torch.mean(ms_seg_timestamps[source_scale_idx, :, :], dim=1) / deci
-    base_scale_anchor_zeros = torch.mean(ms_seg_timestamps[msdd_scale_n-1, :, :], dim=1) / deci
-    # Get only non-zero timestamps (= Remove zero-padding)
-    source_scale_anchor = source_scale_anchor_zeros[source_scale_anchor_zeros.nonzero()].t()
-    base_scale_anchor = base_scale_anchor_zeros[base_scale_anchor_zeros.nonzero()].t()
-    # Calculate absolute distance matrix
-    curr_mat = torch.tile(source_scale_anchor, (base_scale_anchor.shape[0], 1))
-    base_mat = torch.tile(base_scale_anchor, (source_scale_anchor.shape[0], 1)).t()
-    abs_dist_mat = torch.abs(curr_mat - base_mat)
-    return abs_dist_mat
-
-def get_padded_timestamps_t(ms_ts_dict, base_scale):
-    """
-    Get zero-padded timestamps of all scales.
-
-    """
-    ms_seg_timestamps_list = []
-    max_length = len(ms_ts_dict[base_scale]['time_stamps'])
-    for data_dict in ms_ts_dict.values():
-        ms_seg_timestamps = data_dict['time_stamps']
-        ms_seg_timestamps = torch.tensor(ms_seg_timestamps)
-        padded_ms_seg_ts = F.pad(input=ms_seg_timestamps, pad=(0, 0, 0, max_length - len(ms_seg_timestamps)), mode='constant', value=0)
-        ms_seg_timestamps_list.append(padded_ms_seg_ts)
-    ms_seg_timestamps = torch.stack(ms_seg_timestamps_list)
-    return ms_seg_timestamps
-
-def get_interpolate_weights(
-    ms_seg_timestamps: torch.Tensor, 
-    base_seq_len: int, 
-    msdd_multiscale_args_dict: dict, 
-    emb_scale_n: int, 
-    msdd_scale_n: int, 
-    is_integer_ts=False
-    ):
-    """
-    Interpolate embeddings to a finer scale.
-
-    Args:
-        emb_fix (torch.Tensor): embeddings of the base scale
-        ms_seg_timestamps (torch.Tensor): timestamps of the base scale
-        base_seq_len (int): length of the base scale
-    
-    Returns:
-        emb_fix (torch.Tensor): interpolated embeddings
-    """
-    deci = 100.0 if is_integer_ts else 1.0
-    half_scale = msdd_multiscale_args_dict['scale_dict'][emb_scale_n-1][1]
-    session_scale_dist_mat = get_scale_dist_mat_t(source_scale_idx=emb_scale_n-1, 
-                                                  ms_seg_timestamps=ms_seg_timestamps[:, :base_seq_len, :], 
-                                                  msdd_scale_n=msdd_scale_n, deci=deci)
-    target_bool = (session_scale_dist_mat < half_scale)
-    session_scale_dist_mat.flatten()[target_bool.flatten() == False] = half_scale
-    dist_delta = (half_scale - session_scale_dist_mat.flatten()).reshape(base_seq_len, target_bool.shape[1])
-    interpolated_weights = ((dist_delta ** 2).t() / torch.sum(dist_delta ** 2, dim=1).t()).t()  
-    return interpolated_weights 
-
-def get_batch_cosine_sim(ms_emb_seq: torch.Tensor) -> torch.Tensor:
-    """
-    Calculate cosine similarity in batch mode.
-
-    Args:
-        ms_emb_seq (Tensor):
-            Multi-scale embedding sequence.
-
-    Returns:
-        batch_cos_sim (Tensor):
-            Cosine similarity values
-    """
-    batch_embs = ms_emb_seq.reshape(-1, ms_emb_seq.shape[-3], ms_emb_seq.shape[-1])
-    batch_cos_sim = cos_similarity_batch(batch_embs, batch_embs).reshape(ms_emb_seq.shape[0], ms_emb_seq.shape[2], ms_emb_seq.shape[1], ms_emb_seq.shape[1])
-    batch_cos_sim = torch.mean(batch_cos_sim, dim=1) # Average over scales: (batch_size, base scale timesteps, base scale timesteps)
-    return batch_cos_sim 
 
 class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
     """
@@ -269,18 +95,12 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             List of available pre-trained models.
         """
         result = []
-
-        model = PretrainedModelInfo(
-            pretrained_model_name="diar_msdd_telephonic",
-            location="https://api.ngc.nvidia.com/v2/models/nvidia/nemo/diar_msdd_telephonic/versions/1.0.1/files/diar_msdd_telephonic.nemo",
-            description="For details about this model, please visit https://ngc.nvidia.com/catalog/models/nvidia:nemo:diar_msdd_telephonic",
-        )
-        result.append(model)
         return result
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
         """
-        Initialize an MSDD model and the specified speaker embedding model. In this init function, training and validation datasets are prepared.
+        Initialize an MSDD model and the specified speaker embedding model. 
+        In this init function, training and validation datasets are prepared.
         """
         self._trainer = trainer if trainer else None
         self.cfg_e2e_diarizer_model = cfg
@@ -294,7 +114,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             self.world_size = 1
             self.pairwise_infer = True
 
-        self._init_msdd_scales() 
+        self._init_msdd_scales()  
         if self._trainer is not None and self.cfg_e2e_diarizer_model.get('augmentor', None) is not None:
             self.augmentor = process_augmentations(self.cfg_e2e_diarizer_model.augmentor)
         else:
@@ -307,12 +127,11 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             self.cfg_e2e_diarizer_model.diarizer_module.scale_n = self.cfg_e2e_diarizer_model.scale_n
 
         self.preprocessor = EncDecSpeakerLabelModel.from_config_dict(self.cfg_e2e_diarizer_model.preprocessor)
-        self.frame_per_sec = int(1 / self.preprocessor._cfg.window_stride)
-        self.feat_dim = self.preprocessor._cfg.features
-        self.max_feat_frame_count = int(self.msdd_multiscale_args_dict["scale_dict"][0][0] * self.frame_per_sec) # 0-th scale, window length
         self.sortformer_diarizer = SortformerEncLabelModel.from_config_dict(self.cfg_e2e_diarizer_model.diarizer_module)
         self.sortformer_encoder = SortformerEncLabelModel.from_config_dict(self.cfg_e2e_diarizer_model.sortformer_encoder)
         self.transformer_encoder = SortformerEncLabelModel.from_config_dict(self.cfg_e2e_diarizer_model.transformer_encoder)
+        if self.cfg_e2e_diarizer_model.get('position_embedding', None) is not None:
+            self.position_embedding = SortformerEncLabelModel.from_config_dict(self.cfg_e2e_diarizer_model.position_embedding)
         self.global_loss_ratio = self.cfg_e2e_diarizer_model.get('global_loss_ratio', 300)
    
         self.original_audio_offsets = {}
@@ -322,10 +141,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
 
         self.eps = 1e-3
         self.emb_dim = self.cfg_e2e_diarizer_model.diarizer_module.emb_dim
-        self.train_non_linear_transform_layer = self.non_linear_transform_layer(layer_n=1, input_size=self.emb_dim, hidden_size=2*self.emb_dim, output_size=self.emb_dim, seed=100)
-        self.valid_non_linear_transform_layer = self.non_linear_transform_layer(layer_n=4, input_size=self.emb_dim, hidden_size=2*self.emb_dim, output_size=self.emb_dim, seed=200)
-        
-        # MSDD v2 parameters
         self.encoder_infer_mode = False
 
         if trainer is not None:
@@ -337,6 +152,17 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             self._init_speaker_model()
             self.loss = instantiate(self.cfg_e2e_diarizer_model.loss)
             self.multichannel_mixing = self.cfg_e2e_diarizer_model.get('multichannel_mixing', True)
+        
+        self.multiscale_layer = MultiScaleLayer(cfg_e2e_diarizer_model=cfg, 
+                                                preprocessor_cfg=self.preprocessor._cfg,
+                                                speaker_model=self.sortformer_diarizer._speaker_model,
+        )
+        self.msdd_multiscale_args_dict = self.multiscale_layer.multiscale_args_dict
+        self.streaming_mode = self.cfg_e2e_diarizer_model.get("streaming_mode", False)
+        self.use_positional_embedding = self.cfg_e2e_diarizer_model.get("use_positional_embedding", False)
+        self.use_roformer = self.cfg_e2e_diarizer_model.get("use_roformer", False)
+        if  self.use_roformer and self.use_positional_embedding and self.cfg_e2e_diarizer_model.sortformer_encoder.num_layers > 0:
+            raise ValueError("`use_roformer` with sortformer layers and `use_positional_embedding` are mutually exclusive. Choose only one of them.")
         self.alpha = self.cfg_e2e_diarizer_model.alpha
         self.affinity_weighting = self.cfg_e2e_diarizer_model.get('affinity_weighting', True)
         self.save_hyperparameters("cfg")
@@ -361,17 +187,24 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         self.time_flag_end = 0.0
 
         speaker_inds = list(range(self.cfg_e2e_diarizer_model.max_num_of_spks))
-        # Get all permutations
-        self.spk_perm = torch.tensor(list(itertools.permutations(speaker_inds)))
-        
+        self.spk_perm = torch.tensor(list(itertools.permutations(speaker_inds))) # Get all permutations
+
+    def _init_segmentation_info(self):
+        """Initialize segmentation settings: window, shift and multiscale weights.
+        """
+        self._diarizer_params = self.cfg_e2e_diarizer_model.diarizer
+        self.multiscale_args_dict = parse_scale_configs(
+            self._diarizer_params.speaker_embeddings.parameters.window_length_in_sec,
+            self._diarizer_params.speaker_embeddings.parameters.shift_length_in_sec,
+            self._diarizer_params.speaker_embeddings.parameters.multiscale_weights,
+        )
+
+ 
     def _init_msdd_scales(self,):
         window_length_in_sec = self.cfg_e2e_diarizer_model.diarizer.speaker_embeddings.parameters.window_length_in_sec
         self.msdd_multiscale_args_dict = self.multiscale_args_dict
         self.model_spk_num = self.cfg_e2e_diarizer_model.max_num_of_spks
         if self.cfg_e2e_diarizer_model.get('interpolated_scale', None) is not None:
-            # if self.cfg_e2e_diarizer_model.interpolated_scale > 0.1:
-            #     raise ValueError("Interpolated scale must be smaller than 0.1")
-            # Use an interpolated scale so add another scale 
             self.cfg_e2e_diarizer_model.scale_n = len(window_length_in_sec) + 1 # Adding one interpolated scale
             self.emb_scale_n = len(window_length_in_sec) # Scales that are extracted from the audio
             self.msdd_multiscale_args_dict['scale_dict'][self.emb_scale_n] = (self.cfg_e2e_diarizer_model.interpolated_scale, self.cfg_e2e_diarizer_model.interpolated_scale/2)
@@ -383,28 +216,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             self.emb_scale_n = self.cfg_e2e_diarizer_model.scale_n
             self.msdd_scale_n = self.cfg_e2e_diarizer_model.scale_n
 
-    def non_linear_transform_layer(self, layer_n, input_size, hidden_size, output_size, seed):
-        torch.manual_seed(seed)
-        layers = []
-
-        # First layer
-        layers.append(nn.Linear(input_size, hidden_size))
-        layers.append(nn.Sigmoid())
-
-        # Additional hidden layers
-        for _ in range(1, layer_n):
-            layers.append(nn.Linear(hidden_size, hidden_size))
-            layers.append(nn.Sigmoid())
-
-        # Output layer
-        layers.append(nn.Linear(hidden_size, output_size))
-
-        # Create the sequential model
-        model = nn.Sequential(*layers)
-        model.apply(init_weights)
-        model.eval()
-        return model
-    
     def setup_optimizer_param_groups(self):
         """
         Override function in ModelPT to allow for different parameter groups for the speaker model and the MSDD model.
@@ -460,16 +271,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             del cfg.speaker_model_cfg.train_ds
             del cfg.speaker_model_cfg.validation_ds
     
-    def _init_segmentation_info(self):
-        """Initialize segmentation settings: window, shift and multiscale weights.
-        """
-        self._diarizer_params = self.cfg_e2e_diarizer_model.diarizer
-        self.multiscale_args_dict = parse_scale_configs(
-            self._diarizer_params.speaker_embeddings.parameters.window_length_in_sec,
-            self._diarizer_params.speaker_embeddings.parameters.shift_length_in_sec,
-            self._diarizer_params.speaker_embeddings.parameters.multiscale_weights,
-        )
-
     def _init_speaker_model(self):
         """
         Initialize speaker embedding model with model name or path passed through config. Note that speaker embedding model is loaded to
@@ -532,15 +333,14 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         else:
             global_rank = 0
         time_flag = time.time()
-        print(f"AAB: Starting Dataloader Instance loading... Step A")
+        logging.info(f"AAB: Starting Dataloader Instance loading... Step A")
         
-        if self.cfg_e2e_diarizer_model.use_mock_embs:
-            AudioToSpeechDiarTrainDataset = AudioToSpeechMSDDTrainMockEmbDataset
-        else:
-            AudioToSpeechDiarTrainDataset = AudioToSpeechMSDDTrainDataset
+        AudioToSpeechDiarTrainDataset = AudioToSpeechMSDDTrainDataset
         
+        preprocessor = EncDecSpeakerLabelModel.from_config_dict(self.cfg_e2e_diarizer_model.preprocessor)
         dataset = AudioToSpeechDiarTrainDataset(
             manifest_filepath=config.manifest_filepath,
+            preprocessor=preprocessor,
             emb_dir=config.emb_dir,
             multiscale_args_dict=self.msdd_multiscale_args_dict,
             soft_label_thres=config.soft_label_thres,
@@ -558,9 +358,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
 
         self.data_collection = dataset.collection
         self.collate_ds = dataset
-        self.ms_seg_timestamps = dataset.ms_seg_timestamps
-        self.ms_seg_counts = dataset.ms_seg_counts
-        self.scale_mapping = dataset.scale_mapping
          
         dataloader_instance = torch.utils.data.DataLoader(
             dataset=dataset,
@@ -599,7 +396,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             "ms_seg_timestamps": NeuralType(('B', 'C', 'T', 'D'), LengthsType()),
             "ms_seg_counts": NeuralType(('B', 'C'), LengthsType()),
             "scale_mapping": NeuralType(('B', 'C', 'T'), LengthsType()),
-            "global_spk_labels": NeuralType(('B', 'T'), LengthsType()),
         }
 
     @property
@@ -612,159 +408,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             }
         )
 
-    def get_ms_emb_fixed(
-        self, 
-        embs: torch.Tensor, 
-        scale_mapping: torch.Tensor, 
-        ms_seg_counts: torch.Tensor, 
-        ms_seg_timestamps: torch.Tensor,
-    ):
-        # check_ms_data(ms_seg_timestamps, ms_seg_counts, scale_mapping)
-        batch_size = scale_mapping.shape[0]
-        split_emb_tup = torch.split(embs, ms_seg_counts[:, :self.emb_scale_n].flatten().tolist(), dim=0)
-
-        base_seq_len = ms_seg_counts[0][self.msdd_scale_n-1].item()
-        target_embs = torch.vstack(split_emb_tup).reshape(batch_size, -1, embs.shape[-1])
-        intp_w = get_interpolate_weights(ms_seg_timestamps[0], 
-                                         base_seq_len, 
-                                         self.msdd_multiscale_args_dict, 
-                                         self.emb_scale_n, 
-                                         self.msdd_scale_n, 
-                                         is_integer_ts=True)
-        
-        # To make offset values such as, [10, 20, 60, x] -> [0, 10, 30, 90]
-        ms_emb_seq = self.add_interpolated_embs(target_embs=target_embs, 
-                                                intp_w=intp_w, 
-                                                scale_mapping=scale_mapping,
-                                                ms_seg_counts=ms_seg_counts, 
-                                                embs=embs, 
-        )
-        return ms_emb_seq
-    
-    def repeat_and_align(
-        self, 
-        ms_seg_timestamps, 
-        scale_mapping, 
-        all_seq_len, 
-        batch_size
-        ):
-        device = ms_seg_timestamps.device
-        repeat_mats_all = scale_mapping[0].to(device)
-        ms_ts = ms_seg_timestamps.reshape(batch_size, -1, 2)
-        offsets_for_batch = (all_seq_len * torch.arange(self.msdd_scale_n).to(device)).unsqueeze(1).repeat(1, all_seq_len).to(device)
-        repeat_mats_all = repeat_mats_all + offsets_for_batch
-        ms_ts_rep = ms_ts[:, repeat_mats_all.flatten(), :].reshape(batch_size, self.msdd_scale_n, -1, 2)
-        return ms_ts_rep
-
-    def add_interpolated_embs(
-        self, 
-        target_embs, 
-        intp_w,
-        scale_mapping,
-        ms_seg_counts, 
-        embs, 
-        ):
-        batch_size = scale_mapping.shape[0]
-        repeat_mats_ext = scale_mapping[0][:self.emb_scale_n].to(embs.device)
-        all_seq_len = ms_seg_counts[0][-1].to(embs.device) 
-        
-        scale_count_offsets = torch.tensor([0] + torch.cumsum(ms_seg_counts[0][:self.emb_scale_n-1], dim=0).tolist())
-        repeat_mats_ext = repeat_mats_ext + (scale_count_offsets.to(embs.device)).unsqueeze(1).repeat(1, all_seq_len).to(embs.device)
-        extracted_embs = target_embs[:, repeat_mats_ext.flatten(), :].reshape(batch_size, self.emb_scale_n, -1, embs.shape[-1])
-        finest_extracted_start = ms_seg_counts[0][:self.emb_scale_n-1].sum()
-        interpolated_embs = torch.bmm(intp_w.repeat(batch_size, 1, 1), target_embs[:, finest_extracted_start:, :]).unsqueeze(1)
-        ms_emb_seq = torch.cat((extracted_embs, interpolated_embs), dim=1).transpose(2, 1) 
-        return ms_emb_seq
-    
-    def get_feature_index_map(
-        self, 
-        emb_scale_n,
-        processed_signal, 
-        ms_seg_timestamps, 
-        ms_seg_counts,
-        device: torch.device,
-        ):
-        batch_size = processed_signal.shape[0]
-        ms_seg_counts_embs = ms_seg_counts[:, :emb_scale_n] 
-
-        total_seg_count = torch.sum(ms_seg_counts_embs)
-        ms_seg_counts_embs_flatten =  ms_seg_counts_embs.flatten()
-
-        # The following index-tensors are needed for matrix reshaping without nested for-loops.
-        batch_index_range = torch.repeat_interleave(torch.arange(batch_size).to(device), ms_seg_counts_embs.sum(dim=1), dim=0)
-        scale_index_range = torch.repeat_interleave(torch.arange(emb_scale_n).repeat(batch_size).to(device) , ms_seg_counts_embs_flatten)
-
-        # Pre-compute sequence indices for faster assigning: 
-        seq_index_range = torch.arange(ms_seg_counts_embs_flatten.max())
-        segment_index_range = torch.concat([seq_index_range[:seq_len] for seq_len in ms_seg_counts_embs_flatten]).to(device)
-        target_timestamps = ms_seg_timestamps[batch_index_range, scale_index_range, segment_index_range, :].to(torch.int64)
-        feature_count_range = target_timestamps[:, 1] - target_timestamps[:, 0]
-        
-        # Pre-compute feature indices for faster assigning:
-        feature_frame_length_range, feature_frame_interval_range= self.get_feat_range_matirx(max_feat_len=processed_signal.shape[2], 
-                                                                                             feature_count_range=feature_count_range, 
-                                                                                             target_timestamps=target_timestamps, 
-                                                                                             device=processed_signal.device)
-        # Assign frame-by-frame indices for one-pass assignment without nested for-loops
-        ms_seg_count_frame_range = torch.repeat_interleave(torch.arange(total_seg_count).to(device), feature_count_range)       
-        batch_frame_range = torch.repeat_interleave(batch_index_range, feature_count_range)
-        return total_seg_count, ms_seg_count_frame_range, feature_frame_length_range, batch_frame_range, feature_frame_interval_range, feature_count_range
-
-    def forward_multiscale(
-        self, 
-        processed_signal, 
-        processed_signal_len, 
-        ms_seg_timestamps, 
-        ms_seg_counts,
-        ):
-        tsc, mscfr, fflr, bfr, ffir, fcr = self.get_feature_index_map(emb_scale_n=self.emb_scale_n,
-                                                                      processed_signal=processed_signal, 
-                                                                      ms_seg_timestamps=ms_seg_timestamps, 
-                                                                      ms_seg_counts=ms_seg_counts, 
-                                                                      device=processed_signal.device)
-
-        embs, pools = self.forward_multi_decoder(processed_signal=processed_signal, 
-                                            processed_signal_len=processed_signal_len, 
-                                            total_seg_count=tsc,
-                                            ms_seg_count_frame_range=mscfr, 
-                                            feature_frame_length_range=fflr, 
-                                            batch_frame_range=bfr, 
-                                            feature_frame_interval_range=ffir,
-                                            feature_count_range=fcr,
-                                            device=processed_signal.device,
-                                            )
-
-        return embs, pools
-
-
-    def forward_multi_decoder(
-        self,
-        processed_signal, 
-        processed_signal_len, 
-        total_seg_count,
-        ms_seg_count_frame_range, 
-        feature_frame_length_range, 
-        batch_frame_range, 
-        feature_frame_interval_range,
-        feature_count_range,
-        device,
-        ):
-        # Assign the acoustic feature values in processed_signal at once
-        encoded, _ = self.sortformer_diarizer._speaker_model.encoder(audio_signal=processed_signal, length=processed_signal_len)
-        encoded_segments = torch.zeros(total_seg_count, encoded.shape[1], self.max_feat_frame_count).to(torch.float32).to(device)
-        encoded_segments[ms_seg_count_frame_range, :, feature_frame_length_range] = encoded[batch_frame_range, :, feature_frame_interval_range]
-        pools, embs = self.sortformer_diarizer._speaker_model.decoder(encoder_output=encoded_segments, length=feature_count_range) 
-        return embs, pools
-    
-    def get_feat_range_matirx(self, max_feat_len, feature_count_range, target_timestamps, device):
-        """ 
-        """
-        feat_index_range = torch.arange(0, max_feat_len).to(device) 
-        feature_frame_offsets = torch.repeat_interleave(target_timestamps[:, 0], feature_count_range)
-        feature_frame_interval_range = torch.concat([feat_index_range[stt:end] for (stt, end) in target_timestamps]).to(device)
-        feature_frame_length_range = feature_frame_interval_range - feature_frame_offsets
-        return feature_frame_length_range, feature_frame_interval_range
-    
     def length_to_mask(self, context_embs):
         """
         Convert length values to encoder mask input tensor.
@@ -788,7 +431,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         mask = row_vector < length_matrix
         return mask.float().to(context_embs.device)
 
-    def forward_infer(self, emb_seq, streaming_mode=True):
+    def forward_infer(self, emb_seq, streaming_mode=True, start_pos=0):
         """
 
         Args:
@@ -802,141 +445,147 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         """
         attn_score_list, preds_list, attn_score_stack, encoder_states_list = [], [], None, []
         encoder_mask = self.length_to_mask(emb_seq)
-        if self._cfg.sortformer_encoder.num_layers > 0 and self._cfg.sortformer_encoder.sort_layer_on == 'pre':
-            emb_seq, attn_score_list, preds_list, preds_mean, encoder_states_list = self.sortformer_encoder(encoder_states=emb_seq, encoder_mask=encoder_mask)
-            attn_score_stack = torch.hstack(attn_score_list)
-            
-        emb_seq = self.transformer_encoder(encoder_states=emb_seq, encoder_mask=encoder_mask)
         
-        if self._cfg.sortformer_encoder.num_layers > 0 and self._cfg.sortformer_encoder.sort_layer_on == 'post':
-            emb_seq, attn_score_list, preds_list, preds_mean, encoder_states_list = self.sortformer_encoder(encoder_states=emb_seq, encoder_mask=encoder_mask)
-            attn_score_stack = torch.hstack(attn_score_list)
+        if self.use_positional_embedding:
+            seq_length = emb_seq.shape[1]        
+            position_ids = torch.arange(start=start_pos, end=start_pos + seq_length, dtype=torch.long, device=emb_seq.device)
+            position_ids = position_ids.unsqueeze(0).repeat(emb_seq.size(0), 1)
+            emb_seq = emb_seq + self.position_embedding(position_ids)
+        
+        if self.use_roformer:
+            emb_seq = self.sortformer_encoder(encoder_states=emb_seq, encoder_mask=encoder_mask)
+        else:
+            if self._cfg.sortformer_encoder.num_layers > 0 and self._cfg.sortformer_encoder.sort_layer_on == 'pre':
+                emb_seq, attn_score_list, preds_list, preds_mean, encoder_states_list = self.sortformer_encoder(encoder_states=emb_seq, encoder_mask=encoder_mask)
+                attn_score_stack = torch.hstack(attn_score_list)
+                
+            emb_seq = self.transformer_encoder(encoder_states=emb_seq, encoder_mask=encoder_mask)
+            
+            if self._cfg.sortformer_encoder.num_layers > 0 and self._cfg.sortformer_encoder.sort_layer_on == 'post':
+                emb_seq, attn_score_list, preds_list, preds_mean, encoder_states_list = self.sortformer_encoder(encoder_states=emb_seq, encoder_mask=encoder_mask)
+                attn_score_stack = torch.hstack(attn_score_list)
         _preds = self.sortformer_diarizer.forward_speaker_sigmoids(emb_seq)
         _preds = self.sort_probs_and_labels(_preds, discrete=False)
         
-        if self.sortformer_encoder.sort_bin_order and self._cfg.sortformer_encoder.num_layers > 0:
+        if self.sortformer_encoder.sort_bin_order and (self._cfg.sortformer_encoder.num_layers > 0 and not self.use_roformer):
             preds = self.alpha * _preds + (1 - self.alpha) * preds_mean
             preds = self.sort_probs_and_labels(preds, discrete=False)
         else:
             preds = _preds
         return preds, _preds, attn_score_stack, preds_list, encoder_states_list
     
-    def forward_encoder(
+    def _extract_embeddings(self, audio_signal, audio_signal_length):
+        audio_signal = audio_signal.to(self.device)
+        self.sortformer_diarizer._speaker_model = self.sortformer_diarizer._speaker_model.to(self.device)
+        self.sortformer_encoder = self.sortformer_encoder.to(self.device)
+        audio_signal = (1/(audio_signal.max()+self.eps)) * audio_signal 
+        processed_signal, processed_signal_length = self.sortformer_diarizer._speaker_model.preprocessor(
+            input_signal=audio_signal, length=audio_signal_length
+        ) 
+        return processed_signal, processed_signal_length
+        
+    def _forward_multiscale_encoder_from_processed(
         self, 
-        audio_signal, 
-        audio_signal_length, 
-        ms_seg_timestamps, 
-        ms_seg_counts, 
-        scale_mapping, 
+        processed_signal, 
+        processed_signal_len,
     ):
         """
         Encoder part for end-to-end diarizaiton model.
 
         """
-        audio_signal = audio_signal.to(self.device)
-        self.sortformer_diarizer._speaker_model = self.sortformer_diarizer._speaker_model.to(self.device)
-        self.sortformer_encoder = self.sortformer_encoder.to(self.device)
-        audio_signal = (1/(audio_signal.max()+self.eps)) * audio_signal 
-            
-        processed_signal, processed_signal_length = self.sortformer_diarizer._speaker_model.preprocessor(
-            input_signal=audio_signal, length=audio_signal_length
+        ms_emb_seq = self.multiscale_layer.forward_multiscale(
+            processed_signal=processed_signal, 
+            processed_signal_len=processed_signal_len, 
         )
+        if self._cfg.freeze_speaker_model:
+            ms_emb_seq = ms_emb_seq.detach()
+        return ms_emb_seq
+   
+    def _forward_multiscale_encoder_from_waveform(
+        self, 
+        audio_signal, 
+        audio_signal_length, 
+    ):
+        """
+        Encoder part for end-to-end diarizaiton model.
 
-        embs, pools = self.forward_multiscale(
+        """
+        processed_signal, processed_signal_length = self._extract_embeddings(audio_signal=audio_signal, audio_signal_length=audio_signal_length)
+        processed_signal = processed_signal[:, :, :processed_signal_length.max()]
+        ms_emb_seq = self.multiscale_layer.forward_multiscale(
             processed_signal=processed_signal, 
             processed_signal_len=processed_signal_length, 
-            ms_seg_timestamps=ms_seg_timestamps, 
-            ms_seg_counts=ms_seg_counts,
+            audio_signal_length=audio_signal_length,
         )
-        
         if self._cfg.freeze_speaker_model:
-            embs = embs.detach()
-        
-        # Reshape the embedding vectors into multi-scale inputs
-        ms_emb_seq = self.get_ms_emb_fixed(embs=embs,    
-                                           scale_mapping=scale_mapping, 
-                                           ms_seg_counts=ms_seg_counts, 
-                                           ms_seg_timestamps=ms_seg_timestamps)
-        return ms_emb_seq
+            ms_emb_seq = ms_emb_seq.detach()
+        return ms_emb_seq 
     
     def forward(
         self, 
         audio_signal, 
         audio_signal_length, 
-        ms_seg_timestamps, 
-        ms_seg_counts, 
-        scale_mapping, 
+        is_raw_waveform_input=True,
     ):
         """
         Forward pass for training.
-        
-        if self.cfg_e2e_diarizer_model.use_mock_embs is True, then audio_signal is used as emb_seed.
-            audio_signal dimension is [batch, emb_seed_dim*max_num_of_spks]
-        if self.cfg_e2e_diarizer_model.use_mock_embs is False, then audio_signal is actual time series audio signal.
         """        
-        if self.cfg_e2e_diarizer_model.use_mock_embs:
-            emb_seq = self.train_non_linear_transform_layer(audio_signal)
-        else:
-            ms_emb_seq = self.forward_encoder(
+        if is_raw_waveform_input:
+            ms_emb_seq = self._forward_multiscale_encoder_from_waveform(
                 audio_signal=audio_signal, 
                 audio_signal_length=audio_signal_length,
-                ms_seg_timestamps=ms_seg_timestamps,
-                ms_seg_counts=ms_seg_counts,
-                scale_mapping=scale_mapping,
             ) # [batch_size, max_seg_count, msdd_scale_n, emb_dim]
-            # Step 2: Clustering for initialization
-            # Compute the cosine similarity between the input and the cluster average embeddings
-            if self.cfg_e2e_diarizer_model.get("multi_scale_method", None) == "mean":
-                emb_seq = ms_emb_seq.mean(dim=2)
-            elif self.cfg_e2e_diarizer_model.get("multi_scale_method", None) == "attention":
-                emb_seq, attn_score_stack = self.sortformer_diarizer.apply_attention_weight(ms_emb_seq=ms_emb_seq)
-                # raise NotImplementedError
-            elif self.cfg_e2e_diarizer_model.get("multi_scale_method", None) == "only_interpolate":
-                emb_seq = ms_emb_seq[:, :, -1, :] # Original shape: (batch_size, max_seg_count, scale_index, emb_dim)
-            else:
-                raise ValueError(f"Unknown multi-scale method: {self.cfg_e2e_diarizer_model.get('multi_scale_method', None)}")
-            
-        # Step 3: SortFormer Diarization Inference
-        self.mem_len, self.step_len = (2400, 2400)
-        streaming_mode = True
-        self.eval()
-        if streaming_mode:
-            preds, _preds, attn_score_stack, total_memory_list, encoder_states_list = self.forward_streaming_infer(emb_seq, streaming_mode=streaming_mode) 
         else:
-            preds, _preds, attn_score_stack, preds_list, encoder_states_list = self.forward_infer(emb_seq, streaming_mode=streaming_mode)
+            ms_emb_seq = self._forward_multiscale_encoder_from_processed(
+                processed_signal=audio_signal, 
+                processed_signal_len=audio_signal_length,
+            ) # [batch_size, max_seg_count, msdd_scale_n, emb_dim]
+        
+        if self.cfg_e2e_diarizer_model.get("multi_scale_method", None) == "mean":
+            emb_seq = ms_emb_seq.mean(dim=2)
+        elif self.cfg_e2e_diarizer_model.get("multi_scale_method", None) == "attention":
+            emb_seq, _ = self.sortformer_diarizer.apply_attention_weight(ms_emb_seq=ms_emb_seq)
+        elif self.cfg_e2e_diarizer_model.get("multi_scale_method", None) == "only_interpolate":
+            emb_seq = ms_emb_seq[:, :, -1, :] 
+        else:
+            raise ValueError(f"Unknown multi-scale method: {self.cfg_e2e_diarizer_model.get('multi_scale_method', None)}")
+        if self.streaming_mode:
+            preds, _preds, attn_score_stack, total_memory_list, encoder_states_list = self.forward_streaming_infer(emb_seq, streaming_mode=self.streaming_mode) 
+        else:
+            preds, _preds, attn_score_stack, preds_list, encoder_states_list = self.forward_infer(emb_seq, streaming_mode=self.streaming_mode)
             total_memory_list = []
         return preds, _preds, attn_score_stack, total_memory_list, encoder_states_list
     
-    def forward_streaming_infer(self, emb_seq, streaming_mode=True):
+    def forward_streaming_infer(self, emb_seq, streaming_mode=True, AMP_QUANT=5.0):
         total_pred_list, total_memory_list = [], []
         memory_buff, memory_label = None, None
-        chunk_n = torch.ceil(torch.tensor((emb_seq.shape[1]-self.mem_len)/self.step_len)).int().item() + 1
+        chunk_n = torch.ceil(torch.tensor((emb_seq.shape[1]- self.sortformer_diarizer.mem_len)/ self.sortformer_diarizer.step_len)).int().item() + 1
         for step_idx in tqdm(range(0, chunk_n), desc="memory and steps diar", leave=False):
             if step_idx == 0:
-                new_context_embs = emb_seq[:, :self.mem_len, :]
+                new_context_embs = emb_seq[:, : self.sortformer_diarizer.mem_len, :]
                 memory_buff = new_context_embs
                 chunk_emb_seq = None
             elif step_idx > 0:
-                stt_fr, end_fr = self.mem_len + (step_idx-1) *self.step_len, self.mem_len + (step_idx)*self.step_len
+                stt_fr = self.sortformer_diarizer.mem_len + (step_idx-1) * self.sortformer_diarizer.step_len
+                end_fr = self.sortformer_diarizer.mem_len + (step_idx)* self.sortformer_diarizer.step_len
                 chunk_emb_seq = emb_seq[:,stt_fr:end_fr , :]
                 new_context_embs = torch.cat([memory_buff, chunk_emb_seq], dim=1)
                 
             preds_mem_new, _preds, attn_score_stack, preds_list, encoder_states_list = self.forward_infer(new_context_embs, streaming_mode=streaming_mode)
             del new_context_embs, _preds, attn_score_stack, preds_list, encoder_states_list
             torch.cuda.empty_cache()
-            preds_mem_new = preds_mem_new.detach()
             _preds, attn_score_stack, encoder_states_list = None, None, None
             if step_idx == 0:
                 total_pred_list.append(preds_mem_new)
             else:
-                total_pred_list.append(preds_mem_new[:, self.mem_len:]) 
+                total_pred_list.append(preds_mem_new[:,  self.sortformer_diarizer.mem_len:]) 
 
             preds_mem_new_binary = preds_mem_new.round() 
             if step_idx < chunk_n - 1:
                 memory_buff, memory_label = self.sortformer_diarizer.memory_compressor(step_idx, chunk_emb_seq, prev_preds=preds_mem_new_binary, memory_buff=memory_buff, memory_label=memory_label)
 
             total_memory_list.append(memory_label.detach().cpu())
-            quant_memory = ((5.0)*memory_buff.detach().cpu()).round()
+            quant_memory = (AMP_QUANT*memory_buff.detach().cpu()).round().to(torch.int8)
             self.sortformer_diarizer.embedding_list.append(quant_memory)
             del chunk_emb_seq, preds_mem_new_binary
             torch.cuda.empty_cache()
@@ -1026,27 +675,14 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             return False
         
     def training_step(self, batch: list, batch_idx: int):
-        start = time.time()
-        if self.cfg_e2e_diarizer_model.use_mock_embs:
-            audio_signal, audio_signal_length, targets = batch 
-        else: # In this case, audio_signal is emb_seed
-            audio_signal, audio_signal_length, ms_seg_timestamps, ms_seg_counts, clus_label_index, scale_mapping, ch_clus_mat, targets, global_spk_labels = batch
-        
-        batch_size = audio_signal.shape[0]
-        ms_seg_counts = self.ms_seg_counts.unsqueeze(0).repeat(batch_size, 1).to(audio_signal.device)
-        ms_seg_timestamps = self.ms_seg_timestamps.unsqueeze(0).repeat(batch_size, 1, 1, 1).to(audio_signal.device)
-        scale_mapping = self.scale_mapping.unsqueeze(0).repeat(batch_size, 1, 1) 
-        
-        sequence_lengths = torch.tensor([x[-1] for x in ms_seg_counts.detach()])
-        self.validation_mode = False
+        audio_signal, audio_signal_length, ms_seg_timestamps, ms_seg_counts, scale_mapping, targets = batch 
+        sequence_lengths = audio_signal_length
         preds, _preds, attn_score_stack, preds_list, encoder_states_list = self.forward(
             audio_signal=audio_signal,
             audio_signal_length=audio_signal_length,
-            ms_seg_timestamps=ms_seg_timestamps,
-            ms_seg_counts=ms_seg_counts,
-            scale_mapping=scale_mapping,
+            # is_raw_waveform_input=False,
         )
-
+        
         if self.loss.sorted_loss:
             # Perform arrival-time sorting (ATS)
             targets_ats = self.sort_probs_and_labels(targets.clone(), discrete=True)
@@ -1077,7 +713,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             preds_all = torch.cat(preds_list)
             targets_rep = targets_tr_loss.repeat(mid_layer_count+1,1,1)
             sequence_lengths_rep = sequence_lengths.repeat(mid_layer_count+1)
-            spk_loss = self.loss(probs=preds_all, labels=targets_rep, signal_lengths=sequence_lengths_rep)/(mid_layer_count+1)
+            spk_loss = self.loss(probs=preds_all, labels=targets_rep, signal_lengths=sequence_lengths_rep)
         else:
             spk_loss = self.loss(probs=preds, labels=targets_tr_loss, signal_lengths=sequence_lengths)
         self._reset_train_f1_accs()
@@ -1148,27 +784,19 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         
 
     def validation_step(self, batch: list, batch_idx: int, dataloader_idx: int = 0):
-        if self.cfg_e2e_diarizer_model.use_mock_embs:
-            audio_signal, audio_signal_length, targets = batch 
-        else: # In this case, audio_signal is emb_seed
-            audio_signal, audio_signal_length, ms_seg_timestamps, ms_seg_counts, clus_label_index, scale_mapping, ch_clus_mat, targets, global_spk_labels = batch
-        
+        audio_signal, audio_signal_length, ms_seg_timestamps, ms_seg_counts, scale_mapping, targets = batch
         batch_size = audio_signal.shape[0]
-        ms_seg_counts = self.ms_seg_counts.unsqueeze(0).repeat(batch_size, 1).to(audio_signal.device)
-        ms_seg_timestamps = self.ms_seg_timestamps.unsqueeze(0).repeat(batch_size, 1, 1, 1).to(audio_signal.device)
-        scale_mapping = self.scale_mapping.unsqueeze(0).repeat(batch_size, 1, 1)
+        # ms_seg_counts = ms_seg_counts.unsqueeze(0).repeat(batch_size, 1).to(audio_signal.device)
+        ms_seg_counts = ms_seg_counts.repeat(batch_size, 1).to(audio_signal.device)
         sequence_lengths = torch.tensor([x[-1] for x in ms_seg_counts])
-        self.validation_mode = True
         preds, _preds, attn_score_stack, preds_list, encoder_states_list = self.forward(
             audio_signal=audio_signal,
             audio_signal_length=audio_signal_length,
-            ms_seg_timestamps=ms_seg_timestamps,
-            ms_seg_counts=ms_seg_counts,
-            scale_mapping=scale_mapping,
+            # is_raw_waveform_input=False,
         )
         if self.loss.sorted_loss:
             targets_ats = self.sort_probs_and_labels(targets, discrete=True)
-            targets_pil = self.sort_targets_with_preds(targets.clone(), 
+            targets_f1_score = self.sort_targets_with_preds(targets.clone(), 
                                                    preds, 
                                                    discrete=True, 
                                                    add_pil_loss=self.cfg_e2e_diarizer_model.add_pil_loss, 
@@ -1256,102 +884,30 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             'test_loss': test_loss_mean,
             'test_f1_acc': f1_acc,
         }
-    def predict_step(self, batch: list, batch_idx: int, dataloader_idx: int = 0):
-        # for batch in tqdm(self._test_dl): 
-        if self.cfg_e2e_diarizer_model.use_mock_embs:
-            audio_signal, audio_signal_length, targets = batch 
-        else: # In this case, audio_signal is emb_seed
-            audio_signal, audio_signal_length, ms_seg_timestamps, ms_seg_counts, clus_label_index, scale_mapping, ch_clus_mat, targets, global_spk_labels = batch
-        
-        batch_size = audio_signal.shape[0]
-        ms_seg_counts = self.ms_seg_counts.unsqueeze(0).repeat(batch_size, 1).to(audio_signal.device)
-        ms_seg_timestamps = self.ms_seg_timestamps.unsqueeze(0).repeat(batch_size, 1, 1, 1).to(audio_signal.device)
-        scale_mapping = self.scale_mapping.unsqueeze(0).repeat(batch_size, 1, 1)
-        sequence_lengths = torch.tensor([x[-1] for x in ms_seg_counts])
-        self.validation_mode = True
-        preds, _preds, attn_score_stack, preds_list, encoder_states_list = self.forward(
-            audio_signal=audio_signal,
-            audio_signal_length=audio_signal_length,
-            ms_seg_timestamps=ms_seg_timestamps,
-            ms_seg_counts=ms_seg_counts,
-            scale_mapping=scale_mapping,
-        )
-        if self.loss.sorted_loss:
-            targets_sort_order = self.sort_probs_and_labels(targets, discrete=True)
-            targets = self.sort_targets_with_preds(targets_sort_order, 
-                                                   preds, 
-                                                   discrete=True, 
-                                                   add_pil_loss=self.cfg_e2e_diarizer_model.add_pil_loss, 
-                                                   pil_loss_thres=self.cfg_e2e_diarizer_model.pil_loss_thres)
-        mid_layer_count = len(preds_list)
-        if mid_layer_count > 0:
-            # Only mid-layer outputs 
-            preds_mid_all = torch.cat(preds_list).reshape(-1, *preds.shape)
-            torch.cat(preds_list).reshape(-1, *preds.shape)
-            preds_mean = preds_mid_all.mean(dim=0)
-            # All mid-layer outputs + final layer output
-            preds_list.append(_preds)
-            preds_all = torch.cat(preds_list)
-            targets_rep = targets.repeat(mid_layer_count+1,1,1)
-            sequence_lengths_rep = sequence_lengths.repeat(mid_layer_count+1)
-            loss = self.loss(probs=preds_all, labels=targets_rep, signal_lengths=sequence_lengths_rep)/(mid_layer_count+1)
-        else:
-            loss = self.loss(probs=preds, labels=targets, signal_lengths=sequence_lengths)  
-            preds_mean = preds
-        # self._reset_test_f1_accs()
-        preds_vad, preds_ovl, targets_vad, targets_ovl = self.compute_aux_f1(preds, targets)
-        self._accuracy_test_vad(preds_vad, targets_vad, sequence_lengths)
-        self._accuracy_test_ovl(preds_ovl, targets_ovl, sequence_lengths)
-        self._accuracy_test(preds, targets, sequence_lengths)
-        self._accuracy_test_toplyr(_preds, targets, sequence_lengths)
-        self._accuracy_test_prdmean(preds_mean, targets, sequence_lengths)
-        return preds_all 
    
     def test_step(self, batch: list, batch_idx: int, dataloader_idx: int = 0):
-        if self.cfg_e2e_diarizer_model.use_mock_embs:
-            audio_signal, audio_signal_length, targets = batch 
-        else: # In this case, audio_signal is emb_seed
-            audio_signal, audio_signal_length, ms_seg_timestamps, ms_seg_counts, clus_label_index, scale_mapping, ch_clus_mat, targets, global_spk_labels = batch
-        
+        audio_signal, audio_signal_length, ms_seg_timestamps, ms_seg_counts, scale_mapping, targets = batch 
         batch_size = audio_signal.shape[0]
         ms_seg_counts = self.ms_seg_counts.unsqueeze(0).repeat(batch_size, 1).to(audio_signal.device)
-        ms_seg_timestamps = self.ms_seg_timestamps.unsqueeze(0).repeat(batch_size, 1, 1, 1).to(audio_signal.device)
-        scale_mapping = self.scale_mapping.unsqueeze(0).repeat(batch_size, 1, 1)
         sequence_lengths = torch.tensor([x[-1] for x in ms_seg_counts])
         preds, _preds, attn_score_stack, preds_list, encoder_states_list = self.forward(
             audio_signal=audio_signal,
             audio_signal_length=audio_signal_length,
-            ms_seg_timestamps=ms_seg_timestamps,
-            ms_seg_counts=ms_seg_counts,
-            scale_mapping=scale_mapping,
+            # is_raw_waveform_input=False, 
         )
         mid_layer_count = len(preds_list)
-        if self.loss.sorted_loss:
-                # Perform arrival-time sorting (ATS)
-                targets_ats = self.sort_probs_and_labels(targets.clone(), discrete=True)
-                # `targets_pil` should not be used for training purpose.
-                targets_pil = self.sort_targets_with_preds(targets.clone(), 
-                                                            preds, 
-                                                            discrete=True, 
-                                                            add_pil_loss=self.cfg_e2e_diarizer_model.get('add_pil_loss', True),
-                                                            pil_loss_thres=self.cfg_e2e_diarizer_model.get('pil_loss_thres', 0.0)
-                )
-                if self.cfg_e2e_diarizer_model.get('use_pil_f1_score', True):
-                    targets_f1_score = targets_pil 
-                else:
-                    targets_f1_score = targets_ats
-                    
-                if self.cfg_e2e_diarizer_model.get('use_pil_train', False):
-                    targets_tr_loss = targets_pil 
-                else:
-                    targets_tr_loss = targets_ats
-                    
+        targets_f1_score = self.sort_targets_with_preds(targets.clone(), 
+                                                    preds, 
+                                                    discrete=True, 
+                                                    add_pil_loss=self.cfg_e2e_diarizer_model.get('add_pil_loss', True),
+                                                    pil_loss_thres=self.cfg_e2e_diarizer_model.get('pil_loss_thres', 0.0)
+        )
+
         if mid_layer_count > 0:
             # Only mid-layer outputs 
             preds_mid_all = torch.cat(preds_list).reshape(-1, *preds.shape)
             torch.cat(preds_list).reshape(-1, *preds.shape)
             preds_mean = preds_mid_all.mean(dim=0)
-            # All mid-layer outputs + final layer output
             preds_list.append(_preds)
             self.preds_all = torch.cat(preds_list)
         else:
@@ -1374,81 +930,60 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         return self.preds_all
     
     def test_batch(self,):
-        self.preds_total_list = []
-        self.batch_f1_accs_list = []
-        for batch_idx, batch in enumerate(tqdm(self._test_dl)):
-            if self.cfg_e2e_diarizer_model.use_mock_embs:
-                audio_signal, audio_signal_length, targets = batch 
-            else: # In this case, audio_signal is emb_seed
-                audio_signal, audio_signal_length, ms_seg_timestamps, ms_seg_counts, clus_label_index, scale_mapping, ch_clus_mat, targets, global_spk_labels = batch
-            audio_signal = audio_signal.to(self.device)
-            audio_signal_length = audio_signal_length.to(self.device)
-            batch_size = audio_signal.shape[0]
-            ms_seg_counts = self.ms_seg_counts.unsqueeze(0).repeat(batch_size, 1).to(audio_signal.device)
-            ms_seg_timestamps = self.ms_seg_timestamps.unsqueeze(0).repeat(batch_size, 1, 1, 1).to(audio_signal.device)
-            scale_mapping = self.scale_mapping.unsqueeze(0).repeat(batch_size, 1, 1).to(audio_signal.device)
-            sequence_lengths = torch.tensor([x[-1] for x in ms_seg_counts]).to(audio_signal.device)
-            # targets = targets.to(self.device)
-            self.validation_mode = True
-            preds, _preds, attn_score_stack, memory_list, encoder_states_list = self.forward(
-                audio_signal=audio_signal,
-                audio_signal_length=audio_signal_length,
-                ms_seg_timestamps=ms_seg_timestamps,
-                ms_seg_counts=ms_seg_counts,
-                scale_mapping=scale_mapping,
-            )
+        self.preds_total_list, self.batch_f1_accs_list = [], []
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(tqdm(self._test_dl)):
+                audio_signal, audio_signal_length, ms_seg_timestamps, ms_seg_counts, scale_mapping, targets = batch
+                audio_signal = audio_signal.to(self.device)
+                audio_signal_length = audio_signal_length.to(self.device)
+                sequence_lengths = torch.tensor([x[-1] for x in ms_seg_counts]).to(audio_signal.device)
+                preds, _preds, attn_score_stack, memory_list, encoder_states_list = self.forward(
+                    audio_signal=audio_signal,
+                    audio_signal_length=audio_signal_length,
+                )
+                preds = preds.detach().to('cpu')
+                self.preds_total_list.append(preds)
+                torch.cuda.empty_cache()
             
-            preds = preds.detach().to('cpu')
-            if self.loss.sorted_loss:
-                # Perform arrival-time sorting (ATS)
-                targets_ats = self.sort_probs_and_labels(targets.clone(), discrete=True)
-                # `targets_pil` should not be used for training purpose.
-                targets_pil = self.sort_targets_with_preds(targets.clone(), 
+                # Batch-wise evaluation
+                targets_f1_score = self.sort_targets_with_preds(targets.clone(), 
                                                             preds, 
                                                             discrete=True, 
                                                             add_pil_loss=self.cfg_e2e_diarizer_model.add_pil_loss, 
                                                             pil_loss_thres=self.cfg_e2e_diarizer_model.pil_loss_thres)
-                if self.cfg_e2e_diarizer_model.get('use_pil_f1_score', True):
-                    targets_f1_score = targets_pil 
-                else:
-                    targets_f1_score = targets_ats
-                    
-                if self.cfg_e2e_diarizer_model.get('use_pil_train', False):
-                    targets_tr_loss = targets_pil 
-                else:
-                    targets_tr_loss = targets_ats
 
+                preds_vad, preds_ovl, targets_vad, targets_ovl = self.compute_aux_f1(preds, targets_f1_score)
+                self._accuracy_valid(preds, targets_f1_score, sequence_lengths)
+                f1_acc = self._accuracy_valid.compute()
+                self.batch_f1_accs_list.append(f1_acc)
 
-            self.preds_total_list.append(preds)
-            # self._reset_test_f1_accs()
-            preds_vad, preds_ovl, targets_vad, targets_ovl = self.compute_aux_f1(preds, targets_f1_score)
+                if len(memory_list) > 0:
+                    self.save_tensor_data(batch_idx, preds, targets_f1_score, f1_acc, sequence_lengths, memory_list)
 
-            self._accuracy_valid(preds, targets_f1_score, sequence_lengths)
-            f1_acc = self._accuracy_valid.compute()
-            self.batch_f1_accs_list.append(f1_acc)
-
-            if len(memory_list) > 0:
-                memory_mats = torch.cat(memory_list, dim=1)
-                embedding_mats = torch.cat(self.sortformer_diarizer.embedding_list, dim=1)
-                for pred_idx in range(preds.shape[0]):
-                    global_index = batch_idx * self._test_dl.batch_size + pred_idx
-                    uniq_id = self._test_dl.dataset.collection[global_index][1]
-                    tags = f"{uniq_id}-bid{batch_idx}-sid{pred_idx}"
-                    print(f"Batch F1Acc. {f1_acc:.4f}_Saving tensor images with tags: {tags}")
-                    directory = self._cfg.diarizer.get('out_dir', None)
-                    if directory is None:
-                        raise ValueError(f"No output directory specified for tensor image saving. Please set the `out_dir` in the config file.")
-                    else:
-                        print(f"Saving tensor images to directory: {directory}")
-                    torch.save(preds[pred_idx], f'{directory}/preds@{tags}.pt')
-                    torch.save(targets_f1_score[pred_idx], f'{directory}/targets@{tags}.pt')
-                    torch.save(memory_mats[pred_idx], f'{directory}/mems_mst{self.mem_len}@{tags}.pt')
-                    torch.save(embedding_mats[pred_idx], f'{directory}/embs_mst{self.mem_len}@{tags}.pt')
-                    # torch.save(targets_f1_score[pred_idx], f'{directory}/targets_{tags}.pt')
         print(f"Batch F1Acc. MEAN: {torch.mean(torch.tensor(self.batch_f1_accs_list))}") 
         self.preds_total = torch.vstack(self.preds_total_list) 
+        
+    def save_tensor_data(self, batch_idx, preds, targets_f1_score, f1_acc, sequence_lengths, memory_list):
+        memory_mats = torch.cat(memory_list, dim=1)
+        embedding_mats = torch.cat(self.sortformer_diarizer.embedding_list, dim=1)
+        for pred_idx in range(preds.shape[0]):
+            global_index = batch_idx * self._test_dl.batch_size + pred_idx
+            uniq_id = self._test_dl.dataset.collection[global_index][1]
+            directory = self._cfg.diarizer.get('out_dir', None)
+            tags = f"{uniq_id}-bid{batch_idx}-sid{pred_idx}"
+            print(f"Batch F1Acc. {f1_acc:.4f}_Saving tensor images with tags: {tags}")
+            if self.save_tensor_images:
+                if directory is None:
+                    raise ValueError(f"No output directory specified for tensor image saving. Please set the `out_dir` in the config file.")
+                else:
+                    print(f"Saving tensor images to directory: {directory}")
+                torch.save(preds[pred_idx], f'{directory}/preds@{tags}.pt')
+                torch.save(targets_f1_score[pred_idx], f'{directory}/targets@{tags}.pt')
+                torch.save(memory_mats[pred_idx], f'{directory}/mems_mst{self.sortformer_diarizer.mem_len}@{tags}.pt')
+                torch.save(embedding_mats[pred_idx], f'{directory}/embs_mst{self.sortformer_diarizer.mem_len}@{tags}.pt')
+        
     def diarize(self,):
-        pass
+        raise NotImplementedError
 
     def compute_accuracies(self):
         """
@@ -1465,4 +1000,3 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         total_count = torch.prod(torch.tensor(self._accuracy_test.targets.shape))
         simple_acc = num_correct / total_count
         return f1_score, simple_acc
-

@@ -85,6 +85,11 @@ class DiarizationConfig:
     batch_size: int = 4
     num_workers: int = 0
     random_seed: Optional[int] = None  # seed number going to be used in seed_everything()
+    
+    # Streaming diarization configs
+    streaming_mode: bool = True # If True, streaming diarization will be used. For long-form audio, set mem_len=step_len
+    mem_len: int = 2000
+    step_len: int = 2000
 
     # If `cuda` is a negative number, inference will be on CPU only.
     cuda: Optional[int] = None
@@ -100,14 +105,21 @@ class DiarizationConfig:
 class VadParams:
     window_length_in_sec: float = 0.15
     shift_length_in_sec: float = 0.01
-    smoothing: str = "median"
+    smoothing: str = False
     overlap: float = 0.5
-    onset: float = 0.5
-    offset: float = 0.5
+    
+    ## Meeting
+    # onset: float = 0.5
+    # offset: float = 0.5
+    
+    ## Telephonic  
+    onset: float = 0.65
+    offset: float = 0.55
+    
     pad_onset: float = 0.05
     pad_offset: float = 0.05
-    min_duration_on: float = 0.05
-    min_duration_off: float = 0.0
+    min_duration_on: float = 0.2
+    min_duration_off: float = 0.2
     filter_speech_first: bool = True
 
 def get_overlapping_list(source_range_list, target_range):
@@ -121,16 +133,19 @@ def get_overlapping_list(source_range_list, target_range):
     return out_range
 
 def timestamps_to_pyannote_object(timestamps, cluster_labels, uniq_id, audio_rttm_values, all_hypothesis, all_reference, all_uems):
-    labels, lines = generate_cluster_labels(timestamps, cluster_labels)
+    offset, dur = float(audio_rttm_values.get('offset', None)), float(audio_rttm_values.get('duration', None))
+    if offset is not None:
+        labels, lines = generate_cluster_labels(timestamps, cluster_labels, offset=offset)
+    else:
+        labels, lines = generate_cluster_labels(timestamps, cluster_labels)
     hypothesis = labels_to_pyannote_object(labels, uniq_name=uniq_id)
     all_hypothesis.append([uniq_id, hypothesis])
     rttm_file = audio_rttm_values.get('rttm_filepath', None)
-    
     if rttm_file is not None and os.path.exists(rttm_file):
-        offset, dur = float(audio_rttm_values.get('offset', None)), float(audio_rttm_values.get('duration', None))
         uem_lines = [[offset, dur+offset]] 
         org_ref_labels = rttm_to_labels(rttm_file)
         ref_labels = org_ref_labels
+        
         reference = labels_to_pyannote_object(ref_labels, uniq_name=uniq_id)
         uem_obj = get_uem_object(uem_lines, uniq_id=uniq_id)
         all_uems.append(uem_obj)
@@ -224,12 +239,16 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         accelerator = 'gpu'
         map_location = torch.device(f'cuda:{cfg.cuda}')
 
-    diar_model = SortformerEncLabelModel.load_from_checkpoint(checkpoint_path=cfg.model_path, map_location=map_location)
+    if cfg.model_path.endswith(".ckpt"):
+        diar_model = SortformerEncLabelModel.load_from_checkpoint(checkpoint_path=cfg.model_path, map_location=map_location)
+    elif cfg.model_path.endswith(".nemo"):
+        diar_model = SortformerEncLabelModel.restore_from(restore_path=cfg.model_path, map_location=map_location)
+    else:
+        raise ValueError("cfg.model_path must end with.ckpt or.nemo!")
     diar_model._cfg.diarizer.out_dir = cfg.tensor_image_dir
     diar_model._cfg.test_ds.session_len_sec = cfg.session_len_sec
     trainer = pl.Trainer(devices=device, accelerator=accelerator)
     diar_model.set_trainer(trainer)
-    diar_model = diar_model.eval()
     diar_model._cfg.test_ds.manifest_filepath = cfg.dataset_manifest
     infer_audio_rttm_dict = get_audio_rttm_map(cfg.dataset_manifest)
     diar_model._cfg.test_ds.batch_size = cfg.batch_size
@@ -239,7 +258,12 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     diar_model.msdd_multiscale_args_dict['scale_dict'][scale_n-1] = (float(cfg.interpolated_scale), float(cfg.interpolated_scale/2))
     
     # Model setup for inference 
+    diar_model._cfg.test_ds.num_workers = cfg.num_workers
     diar_model.setup_test_data(test_data_config=diar_model._cfg.test_ds)    
+    diar_model.streaming_mode = cfg.streaming_mode
+    diar_model.sortformer_diarizer.step_len = cfg.step_len
+    diar_model.sortformer_diarizer.mem_len = cfg.mem_len
+    diar_model.save_tensor_images = cfg.save_tensor_images
     diar_model.test_batch()
     
     # Evaluation
@@ -253,6 +277,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
                                                          all_uem=all_uems, 
                                                          collar=0.25, 
                                                          ignore_overlap=False)
+    print("VadParams:", VadParams())
 
 if __name__ == '__main__':
     main()

@@ -18,6 +18,7 @@ import math
 import os
 import shutil
 from copy import deepcopy
+from pyannote.core import Segment, Timeline
 from typing import Dict, List, Tuple, Union
 
 import numpy as np
@@ -29,7 +30,6 @@ from tqdm import tqdm
 import torch.nn.functional as F
 
 from nemo.collections.asr.data.audio_to_label import repeat_signal
-from nemo.collections.asr.metrics.der import get_partial_ref_labels
 from nemo.collections.asr.parts.utils.online_clustering import (
     get_minimal_indices,
     stitch_cluster_labels
@@ -40,7 +40,6 @@ ts_vad_post_processing,
 SpeakerClustering, 
 get_argmin_mat, 
 split_input_data,
-cos_similarity,
 cos_similarity_batch,
 )
 from nemo.collections.asr.parts.utils.longform_clustering import LongFormSpeakerClustering
@@ -420,7 +419,7 @@ def convert_rttm_line(rttm_line, round_digits=3):
     return start, end, speaker
 
 
-def rttm_to_labels(rttm_filename):
+def rttm_to_labels(rttm_filename, offset=0):
     """
     Prepare time stamps label list from rttm file
     """
@@ -428,6 +427,9 @@ def rttm_to_labels(rttm_filename):
     with open(rttm_filename, 'r') as f:
         for line in f.readlines():
             start, end, speaker = convert_rttm_line(line, round_digits=3)
+            if offset > 0:
+                start += offset
+                end += offset
             labels.append('{} {} {}'.format(start, end, speaker))
     return labels
 
@@ -448,7 +450,7 @@ def write_cluster_labels(base_scale_idx, lines_cluster_labels, out_rttm_dir):
             f.write(clus_label_line)
 
 
-def generate_cluster_labels(segment_ranges: List[str], cluster_labels: List[int]):
+def generate_cluster_labels(segment_ranges: List[str], cluster_labels: List[int], offset: float= None):
     """
     Generate cluster (speaker labels) from the segment_range list and cluster label list.
 
@@ -472,6 +474,9 @@ def generate_cluster_labels(segment_ranges: List[str], cluster_labels: List[int]
     for idx, label in enumerate(cluster_labels):
         tag = 'speaker_' + str(label)
         stt, end = segment_ranges[idx]
+        if offset is not None:
+            stt = float(stt) + offset
+            end = float(end) + offset
         lines.append(f"{stt} {end} {tag}")
     cont_lines = get_contiguous_stamps(lines)
     diar_hyp = merge_stamps(cont_lines)
@@ -763,7 +768,11 @@ def perform_clustering_embs(
         
         if len(cluster_labels) != timestamps.shape[0]:
             raise ValueError("Mismatch of length between cluster_labels and timestamps.")
-        labels, lines = generate_cluster_labels(timestamps, cluster_labels)
+        if audio_rttm_map.get('offset',  None) is not None:
+            labels, lines = generate_cluster_labels(timestamps, cluster_labels, offset=audio_rttm_map.get('offset', 0))
+        else:
+            labels, lines = generate_cluster_labels(timestamps, cluster_labels, offset=None)
+
         if out_rttm_dir:
             labels_to_rttmfile(labels, uniq_id, out_rttm_dir)
             lines_cluster_labels.extend([f'{uniq_id} {seg_line}\n' for seg_line in lines])
@@ -807,6 +816,7 @@ def perform_clustering(
     """
     all_hypothesis = []
     all_reference = []
+    all_uem = []
     no_references = False
     lines_cluster_labels = []
 
@@ -868,9 +878,13 @@ def perform_clustering(
         
 
         rttm_file = audio_rttm_values.get('rttm_filepath', None)
+        if audio_rttm_values['offset'] is not None and audio_rttm_values['duration'] is not None:
+            uem_obj = uem_timeline_from_manifest(audio_rttm_values, uniq_name=uniq_id)
+            all_uem.append(uem_obj)
         if rttm_file is not None and os.path.exists(rttm_file) and not no_references:
             ref_labels = rttm_to_labels(rttm_file)
             reference = labels_to_pyannote_object(ref_labels, uniq_name=uniq_id)
+
             all_reference.append([uniq_id, reference])
         else:
             no_references = True
@@ -879,7 +893,8 @@ def perform_clustering(
     if out_rttm_dir:
         write_cluster_labels(base_scale_idx, lines_cluster_labels, out_rttm_dir)
 
-    return all_reference, all_hypothesis
+    all_uem = None if len(all_uem) == 0 else all_uem
+    return all_reference, all_hypothesis, all_uem
 
 
 def get_vad_out_from_rttm_line(rttm_line):
@@ -1293,8 +1308,11 @@ def get_subsegments(
     window: float, 
     shift: float, 
     duration: float, 
-    min_subsegment_duration: float = 0.03,
+    min_subsegment_duration: float = 0.01,
     decimals: int = 2,
+    use_asr_style_frame_count: bool = False,
+    sample_rate: int = 16000,
+    feat_per_sec: int = 100,
     ) -> List[List[float]]:
     """
     Return subsegments from a segment of audio file.
@@ -1305,42 +1323,47 @@ def get_subsegments(
         Subsegments: [[12.05, 13.55], [12.8, 14.3], [13.55, 14.45], [14.3, 14.45]]
 
     Args:
-        offset (float): start time of audio segment
-        window (float): window length for segments to subsegments length
-        shift (float): hop length for subsegments shift
-        duration (float): duration of segment
+        offset (float): Start time of audio segment
+        window (float): Window length for segments to subsegments length
+        shift (float): Hop length for subsegments shift
+        duration (float): Duration of segment
+        min_subsegment_duration (float): Exclude subsegments smaller than this duration value
+        decimals (int): Number of decimal places to round to
+        use_asr_style_frame_count (bool): If True, use asr style frame count to generate subsegments.
+                                          For example, if duration is 10 secs and frame_shift is 0.08 secs, 
+                                          it results in (10/0.08)+1 = 125 + 1 frames.
+                                          
     Returns:
         subsegments (List[tuple[float, float]]): subsegments generated for the segments as list of tuple of start and duration of each subsegment
     """
     subsegments:  List[List[float]] = []
     start = offset
     slice_end = start + duration
-    # base = math.ceil((duration - window) / shift)
-    # slices = 1 if base < 0 else base + 1
     if min_subsegment_duration <= duration < shift:
         slices = 1
+    elif use_asr_style_frame_count is True:    
+        num_feat_frames = np.ceil((1+duration*sample_rate)/int(sample_rate/feat_per_sec)).astype(int)
+        slices = np.ceil(num_feat_frames/int(feat_per_sec*shift)).astype(int)
+        slice_end = start + shift * slices
     else:
-        slices = int(np.ceil((duration-window)/shift) + 1)
+        slices = np.ceil(1+ (duration-window)/shift).astype(int)
     if slices == 1:
         if min(duration, window) >= min_subsegment_duration:
             subsegments.append([start, min(duration, window)])
     elif slices > 0: # What if slcies = 0 ?
         start_col = torch.arange(offset, slice_end, shift)[:slices]
         dur_col = window * torch.ones(slices)
-        try:
-            dur_col[-1] = min(slice_end - start_col[-1], window)
-        except:
-            import ipdb; ipdb.set_trace()
+        dur_col = torch.min(slice_end*torch.ones_like(start_col)- start_col, window * torch.ones_like(start_col))
         dur_col = torch.round(dur_col, decimals=decimals)
-        ss_tensor = torch.stack([start_col, dur_col], dim=1)
-        for k in range(ss_tensor.shape[0]):
-            if dur_col[k] >= min_subsegment_duration:
-                subsegments.append([float(ss_tensor[k,0].item()), float(ss_tensor[k,1].item())])
+        valid_mask = dur_col >= min_subsegment_duration
+        valid_subsegments = torch.stack([start_col[valid_mask], dur_col[valid_mask]], dim=1)
+        subsegments = valid_subsegments.tolist()
     return subsegments
 
 def get_subsegments_(offset: float, window: float, shift: float, duration: float) -> List[List[float]]:
     """
-    Return subsegments from a segment of audio file
+    Return subsegments from a segment of audio file.
+    
     Args:
         offset (float): start time of audio segment
         window (float): window length for segments to subsegments length
@@ -2132,6 +2155,19 @@ def mixdown_msdd_preds(clus_labels, msdd_preds, time_stamps, offset, threshold, 
         spk_ts = generate_speaker_assignment_intervals(speaker_assign_mat=speaker_assign_mat, timestamps=timestamps)
     return spk_ts
 
+def uem_timeline_from_manifest(manifest_dic, uniq_name):
+    """
+    Generate pyannote timeline segments for uem file
+
+     <UEM> file format
+     UNIQ_SPEAKER_ID CHANNEL START_TIME END_TIME
+    """
+    timeline = Timeline(uri=uniq_name)
+    start_time = float(manifest_dic[uniq_name]['offset']) 
+    end_time = start_time + float(manifest_dic[uniq_name]['duration'])
+    timeline.add(Segment(float(start_time), float(end_time)))
+    return timeline
+
 def make_rttm_with_overlap(
     manifest_file_path: str,
     clus_label_dict: Dict[str, List[Union[float, int]]],
@@ -2241,7 +2277,7 @@ def _make_rttm_with_overlap(
     """
     params = change_output_dir_names(params, threshold, verbose)
     AUDIO_RTTM_MAP = audio_rttm_map(manifest_file_path)
-    all_hypothesis, all_reference = [], []
+    all_hypothesis, all_reference, all_uem = [], [], []
     no_references = False
     logging.info(f"Generating RTTM with infer_mode: {params['infer_mode']}")
     with open(manifest_file_path, 'r', encoding='utf-8') as manifest:
@@ -2275,11 +2311,15 @@ def _make_rttm_with_overlap(
                 ref_labels = rttm_to_labels(rttm_file)
                 # ref_labels = get_partial_ref_labels(pred_labels=hyp_labels, ref_labels=ref_labels)
                 reference = labels_to_pyannote_object(ref_labels, uniq_name=uniq_id)
+                if manifest_dic['offset'] is not None and manifest_dic['duration'] is not None:
+                    uem_obj = uem_timeline_from_manifest(manifest_dic, uniq_name=uniq_id)
+                    all_uem.append(uem_obj)
                 all_reference.append([uniq_id, reference])
             else:
                 no_references = True
                 all_reference = []
-    return all_reference, all_hypothesis
+    all_uem = None if len(all_uem) == 0 else all_uem
+    return all_reference, all_hypothesis, all_uem
 
 def generate_json_output(hyp_labels, uniq_id, out_json_dir, manifest_dic, decimals=2):
     json_dict_list = []

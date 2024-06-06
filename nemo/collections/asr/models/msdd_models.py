@@ -1371,6 +1371,7 @@ class NeuralDiarizer(LightningModule):
         preds_list, targets_list, signal_lengths_list = [], [], []
         uniq_id_list = get_uniq_id_list_from_manifest(self.msdd_model.cfg.test_ds.manifest_filepath)
         test_data_collection = [d for d in self.msdd_model.data_collection]
+        import ipdb; ipdb.set_trace()
         for sidx, test_batch in enumerate(tqdm(self.msdd_model.test_dataloader())):
             signals, signal_lengths, _targets, emb_vectors = test_batch
             cumul_sample_count.append(cumul_sample_count[-1] + signal_lengths.shape[0])
@@ -1412,7 +1413,7 @@ class NeuralDiarizer(LightningModule):
         manifest_filepath = self.msdd_model.cfg.test_ds.manifest_filepath
         rttm_map = audio_rttm_map(manifest_filepath)
         for k, (collar, ignore_overlap) in enumerate(self.diar_eval_settings):
-            all_reference, all_hypothesis, all_uems = make_rttm_with_overlap(
+            all_reference, all_hypothesis, all_uem = make_rttm_with_overlap(
                 manifest_filepath,
                 self.msdd_model.clus_test_label_dict,
                 preds_list,
@@ -1428,6 +1429,7 @@ class NeuralDiarizer(LightningModule):
                 rttm_map,
                 all_reference,
                 all_hypothesis,
+                all_uem=all_uem,
                 collar=collar,
                 all_uem=all_uems,
                 ignore_overlap=ignore_overlap,

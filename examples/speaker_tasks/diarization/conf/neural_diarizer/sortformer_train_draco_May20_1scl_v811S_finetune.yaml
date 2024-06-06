@@ -10,6 +10,12 @@ sample_rate: 16000
 num_workers: 18
 batch_size: 8
 
+init_from_ptl_ckpt:
+  speaker_tasks:
+    name: 'sortformer_diarizer_small'
+    include: ["preprocessor","diarizer_module","sortformer_encoder", "transformer_encoder", "speaker_decoder"]
+    exclude: ["decoder.final"] # Add specific layer names here to exlude or just ["decoder"] if to exclude all of decoder pretrained weights
+
 model: 
   diarizer:
     out_dir: null
@@ -29,7 +35,6 @@ model:
   perm_mock_embs: True
   multi_scale_method: 'only_interpolate' # 'mean', 'attention', 'only_interpolate'
   streaming_mode: False
-  use_positional_embedding: False
   variance_in_mock_embs: 0.05
   alpha: 0.5 # mix ratio between final pred and skip pred connections
   sort_layer_on: pre # pre, post, False
@@ -54,6 +59,7 @@ model:
   train_f1_acc_window_length: 25
   train_f1_acc_thres_pil_shift: 0.0
 
+
   train_ds:
     manifest_filepath: ???
     emb_dir: ???
@@ -70,11 +76,7 @@ model:
     mock_emb_noise_std: ${model.mock_emb_noise_std}
     mock_emb_degree_of_freedom: 8
     validation_mode: False
-<<<<<<< HEAD
   
-=======
-
->>>>>>> origin/multispeaker_canary_sortformer
   validation_ds:
     manifest_filepath: ???
     emb_dir: ???
@@ -136,12 +138,7 @@ model:
     context_vector_type: 'cos_sim' # Type of context vector: options. Options: ('cos_sim', 'elem_prod')
     use_amsl_layer: True
     sort_final_layer_on: False
-
-  position_embedding:
-    _target_: nemo.collections.asr.modules.transformer.transformer_modules.FixedPositionalEncoding
-    hidden_size: 192
-    max_sequence_length: 10000
-
+  
   sortformer_encoder:
     _target_: nemo.collections.asr.modules.transformer.sortformer_encoders.SortformerEncoder
     num_layers: 6

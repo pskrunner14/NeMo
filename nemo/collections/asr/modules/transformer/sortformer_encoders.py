@@ -18,13 +18,79 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.functional import gelu
-from nemo.collections.asr.modules.transformer.transformer_modules import PositionWiseFF
+from nemo.collections.asr.modules.transformer.transformer_modules import PositionWiseFF, RotaryEmbedding
 from nemo.collections.common.parts import form_attention_mask
 import math
 
 __all__ = ["SortformerEncoder"]
 
 
+
+class MultiHeadAttention(nn.Module):
+    """
+    Multi-head scaled dot-product attention layer.
+
+    Args:
+        hidden_size: size of the embeddings in the model, also known as d_model
+        num_attention_heads: number of heads in multi-head attention
+        attn_score_dropout: probability of dropout applied to attention scores
+        attn_layer_dropout: probability of dropout applied to the output of the
+            whole layer, but before layer normalization
+    """
+
+    def __init__(self, hidden_size, num_attention_heads, attn_score_dropout=0.0, attn_layer_dropout=0.0):
+        super().__init__()
+        if hidden_size % num_attention_heads != 0:
+            raise ValueError(
+                "The hidden size (%d) is not a multiple of the number "
+                "of attention heads (%d)" % (hidden_size, num_attention_heads)
+            )
+        self.hidden_size = hidden_size
+        self.num_attention_heads = num_attention_heads
+        self.attn_head_size = int(hidden_size / num_attention_heads)
+        self.attn_scale = math.sqrt(math.sqrt(self.attn_head_size))
+
+        self.query_net = nn.Linear(hidden_size, hidden_size)
+        self.key_net = nn.Linear(hidden_size, hidden_size)
+        self.value_net = nn.Linear(hidden_size, hidden_size)
+        self.out_projection = nn.Linear(hidden_size, hidden_size)
+
+        self.attn_dropout = nn.Dropout(attn_score_dropout)
+        self.layer_dropout = nn.Dropout(attn_layer_dropout)
+
+    def transpose_for_scores(self, x):
+        new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attn_head_size)
+        x = x.view(*new_x_shape)
+        return x.permute(0, 2, 1, 3)
+
+    def forward(self, queries, keys, values, attention_mask):
+
+        # attention_mask is needed to hide the tokens which correspond to [PAD]
+        # in the case of BERT, or to hide the future tokens in the case of
+        # vanilla language modeling and translation
+        query = self.query_net(queries)
+        key = self.key_net(keys)
+        value = self.value_net(values)
+        query = self.transpose_for_scores(query) / self.attn_scale
+        key = self.transpose_for_scores(key) / self.attn_scale
+        value = self.transpose_for_scores(value)
+
+        # for numerical stability we pre-divide query and key by sqrt(sqrt(d))
+        attention_scores = torch.matmul(query, key.transpose(-1, -2))
+        if attention_mask is not None:
+            attention_scores = attention_scores + attention_mask.to(attention_scores.dtype)
+        attention_probs = torch.softmax(attention_scores, dim=-1)
+        attention_probs = self.attn_dropout(attention_probs)
+
+        context = torch.matmul(attention_probs, value)
+        context = context.permute(0, 2, 1, 3).contiguous()
+        new_context_shape = context.size()[:-2] + (self.hidden_size,)
+        context = context.view(*new_context_shape)
+
+        # output projection
+        output_states = self.out_projection(context)
+        output_states = self.layer_dropout(output_states)
+        return output_states
 
 
 class MultiHeadAttentionWithScores(nn.Module):
@@ -372,6 +438,68 @@ class SortformerEncoderBlock(nn.Module):
             return self.forward_and_sort_replace(encoder_query, encoder_mask, encoder_keys)
 
 
+class RoFormerEncoderBlock(nn.Module):
+    """
+    Building block of Transformer encoder.
+
+    Args:
+        hidden_size: size of the embeddings in the model, also known as d_model
+        inner_size: number of neurons in the intermediate part of feed-forward
+            net, usually is (4-8 x hidden_size) in the papers
+        num_attention_heads: number of heads in multi-head attention
+        attn_score_dropout: probability of dropout applied to attention scores
+        attn_layer_dropout: probability of dropout applied to the output of the
+            attention layers, but before layer normalization
+        ffn_dropout: probability of dropout applied to FFN output
+        hidden_act: activation function used between two linear layers in FFN
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        inner_size: int,
+        num_attention_heads: int = 1,
+        attn_score_dropout: float = 0.0,
+        attn_layer_dropout: float = 0.0,
+        ffn_dropout: float = 0.0,
+        hidden_act: str = "relu",
+        pre_ln: bool = False,
+        rotary_emb_dim: int = 32,
+        use_xpos: bool = True,
+    ):
+        super().__init__()
+        self.pre_ln = pre_ln
+        self.layer_norm_1 = nn.LayerNorm(hidden_size, eps=1e-5)
+        self.first_sub_layer = MultiHeadAttention(
+            hidden_size, num_attention_heads, attn_score_dropout, attn_layer_dropout
+        )
+        self.layer_norm_2 = nn.LayerNorm(hidden_size, eps=1e-5)
+        self.second_sub_layer = PositionWiseFF(hidden_size, inner_size, ffn_dropout, hidden_act)
+        self.rotary_emb = RotaryEmbedding(dim = rotary_emb_dim, use_xpos=use_xpos)
+
+    def forward_postln(self, encoder_query, encoder_mask, encoder_keys):
+        """
+        Post-LayerNorm block
+        Order of operations: Self-Attn -> Residual -> LN -> Cross-Attn -> Residual -> LN -> FFN -> Residual -> LN
+        """
+        encoder_query, encoder_keys = self.rotary_emb.rotate_queries_and_keys(encoder_query, encoder_keys)
+        self_attn_output = self.first_sub_layer(encoder_query, encoder_keys, encoder_keys, encoder_mask)
+        self_attn_output += encoder_query
+        self_attn_output = self.layer_norm_1(self_attn_output)
+
+        output_states = self.second_sub_layer(self_attn_output)
+        output_states += self_attn_output
+        output_states = self.layer_norm_2(output_states)
+
+        return output_states
+
+    def forward(self, encoder_query, encoder_mask, encoder_keys):
+        # if self.pre_ln:
+        #     return self.forward_preln(encoder_query, encoder_mask, encoder_keys)
+        # else:
+        return self.forward_postln(encoder_query, encoder_mask, encoder_keys)
+
+
 class SortformerEncoder(nn.Module):
     def __init__(
         self,
@@ -380,6 +508,7 @@ class SortformerEncoder(nn.Module):
         inner_size: int,
         mask_future: bool = False,
         num_attention_heads: int = 1,
+        use_roformer: bool = False,
         attn_score_dropout: float = 0.0,
         attn_layer_dropout: float = 0.0,
         ffn_dropout: float = 0.0,
@@ -401,28 +530,40 @@ class SortformerEncoder(nn.Module):
             self.final_layer_norm = nn.LayerNorm(hidden_size, eps=1e-5)
         else:
             self.final_layer_norm = None
-
-        layer = SortformerEncoderBlock(
-            hidden_size,
-            inner_size,
-            num_attention_heads,
-            attn_score_dropout,
-            attn_layer_dropout,
-            ffn_dropout,
-            hidden_act,
-            pre_ln,
-            unit_dim,
-            sort_layer_on,
-            seq_var_sort,
-            sort_bin_order,
-            layer_arrival_time_sort,
-            num_classes,
-            detach_preds,
-            sort_layer_type,
-        )
+        self.use_roformer = use_roformer
+        self.sort_bin_order = sort_bin_order
+        if self.use_roformer: 
+            layer = RoFormerEncoderBlock(
+                hidden_size,
+                inner_size,
+                num_attention_heads,
+                attn_score_dropout,
+                attn_layer_dropout,
+                ffn_dropout,
+                hidden_act,
+                pre_ln,
+            )
+        else:
+            layer = SortformerEncoderBlock(
+                hidden_size,
+                inner_size,
+                num_attention_heads,
+                attn_score_dropout,
+                attn_layer_dropout,
+                ffn_dropout,
+                hidden_act,
+                pre_ln,
+                unit_dim,
+                sort_layer_on,
+                seq_var_sort,
+                sort_bin_order,
+                layer_arrival_time_sort,
+                num_classes,
+                detach_preds,
+                sort_layer_type,
+            )
         self.layers = nn.ModuleList([copy.deepcopy(layer) for _ in range(num_layers)])
         self.diag = 0 if mask_future else None
-        self.sort_bin_order = sort_bin_order
 
     def _get_memory_states(self, encoder_states, encoder_mems_list=None, i=0):
         if encoder_mems_list is not None:
@@ -431,7 +572,26 @@ class SortformerEncoder(nn.Module):
             memory_states = encoder_states
         return memory_states
 
-    def forward_memory(self, encoder_states, encoder_mask, encoder_mems_list=None, return_mems=False, memory_sort=False):
+    
+    def forward(self, encoder_states, encoder_mask, encoder_mems_list=None, return_mems=False, memory_sort=False):
+        if self.use_roformer:
+            cached_mems_list = self.rope_forward(encoder_states, encoder_mask, encoder_mems_list, return_mems)
+            return cached_mems_list
+        else:
+            cached_mems_list, attn_score_mat_list, preds_list, preds_mean, encoder_states_list = self.sort_forward(encoder_states, encoder_mask, encoder_mems_list, return_mems)
+            return cached_mems_list, attn_score_mat_list, preds_list, preds_mean, encoder_states_list
+    
+    def sort_forward(self, encoder_states, encoder_mask, encoder_mems_list=None, return_mems=False, memory_sort=False):
+        """
+        Args:
+            encoder_states: output of the embedding_layer (B x L_enc x H)
+            encoder_mask: encoder inputs mask (B x L_enc)
+            encoder_mems_list: list of the cached encoder hidden states
+                for fast autoregressive generation which will be used instead
+                of encoder_states as keys and values if not None
+            return_mems: bool, whether to return outputs of all encoder layers
+                or the last layer only
+        """
         encoder_attn_mask = form_attention_mask(encoder_mask, self.diag)
         memory_states = self._get_memory_states(encoder_states, encoder_mems_list, 0)
         cached_mems_list = [memory_states]
@@ -447,9 +607,16 @@ class SortformerEncoder(nn.Module):
         preds_layers = torch.stack(preds_list, dim=0)
         preds_mean = torch.mean(preds_layers, dim=0)
         
-        return cached_mems_list[-1], attn_score_mat_list, preds_list, preds_mean, encoder_states_list
-    
-    def forward(self, encoder_states, encoder_mask, encoder_mems_list=None, return_mems=False, memory_sort=False):
+        if self.final_layer_norm is not None:
+            encoder_states = self.final_layer_norm(encoder_states)
+            memory_states = self._get_memory_states(encoder_states, encoder_mems_list, i + 1)
+            cached_mems_list.append(memory_states)
+        if return_mems:
+            return cached_mems_list, attn_score_mat_list, preds_list, preds_mean, encoder_states_list
+        else:
+            return cached_mems_list[-1], attn_score_mat_list, preds_list, preds_mean, encoder_states_list
+        
+    def rope_forward(self, encoder_states, encoder_mask, encoder_mems_list=None, return_mems=False):
         """
         Args:
             encoder_states: output of the embedding_layer (B x L_enc x H)
@@ -460,29 +627,24 @@ class SortformerEncoder(nn.Module):
             return_mems: bool, whether to return outputs of all encoder layers
                 or the last layer only
         """
-        if memory_sort:
-            self.forward_memory(encoder_states, encoder_mask, encoder_mems_list, return_mems=False)
+
+        encoder_attn_mask = form_attention_mask(encoder_mask, self.diag)
+
+        memory_states = self._get_memory_states(encoder_states, encoder_mems_list, 0)
+        cached_mems_list = [memory_states]
+
+        for i, layer in enumerate(self.layers):
+            encoder_states = layer(encoder_states, encoder_attn_mask, memory_states)
+            memory_states = self._get_memory_states(encoder_states, encoder_mems_list, i + 1)
+            cached_mems_list.append(memory_states)
+
+        if self.final_layer_norm is not None:
+            encoder_states = self.final_layer_norm(encoder_states)
+            memory_states = self._get_memory_states(encoder_states, encoder_mems_list, i + 1)
+            cached_mems_list.append(memory_states)
+
+        if return_mems:
+            return cached_mems_list
         else:
-            encoder_attn_mask = form_attention_mask(encoder_mask, self.diag)
-            memory_states = self._get_memory_states(encoder_states, encoder_mems_list, 0)
-            cached_mems_list = [memory_states]
-            attn_score_mat_list, encoder_states_list, preds_list = [], [], []
-            for i, layer in enumerate(self.layers):
-                encoder_states, attn_score_mat, preds = layer(encoder_states, encoder_attn_mask, memory_states)
-                attn_score_mat_list.append(attn_score_mat)
-                preds_list.append(preds)
-                memory_states = self._get_memory_states(encoder_states, encoder_mems_list, i + 1)
-                cached_mems_list.append(memory_states)
-                encoder_states_list.append(encoder_states)
-                
-            preds_layers = torch.stack(preds_list, dim=0)
-            preds_mean = torch.mean(preds_layers, dim=0)
-            
-            if self.final_layer_norm is not None:
-                encoder_states = self.final_layer_norm(encoder_states)
-                memory_states = self._get_memory_states(encoder_states, encoder_mems_list, i + 1)
-                cached_mems_list.append(memory_states)
-            if return_mems:
-                return cached_mems_list, attn_score_mat_list, preds_list, preds_mean, encoder_states_list
-            else:
-                return cached_mems_list[-1], attn_score_mat_list, preds_list, preds_mean, encoder_states_list
+            return cached_mems_list[-1]
+

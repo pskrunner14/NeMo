@@ -383,6 +383,7 @@ def create_manifest(
     rttm_path: str = None,
     uem_path: str = None,
     ctm_path: str = None,
+    seglst_path: str = None,
     add_duration: bool = False,
 ):
     """
@@ -408,15 +409,17 @@ def create_manifest(
     rttm_pathdict = get_path_dict(rttm_path, uniqids, len_wavs)
     uem_pathdict = get_path_dict(uem_path, uniqids, len_wavs)
     ctm_pathdict = get_path_dict(ctm_path, uniqids, len_wavs)
+    seglst_pathdict = get_path_dict(seglst_path, uniqids, len_wavs)
 
     lines = []
     for uid in uniqids:
-        wav, text, rttm, uem, ctm = (
+        wav, text, rttm, uem, ctm, seglst = (
             wav_pathdict[uid],
             text_pathdict[uid],
             rttm_pathdict[uid],
             uem_pathdict[uid],
             ctm_pathdict[uid],
+            seglst_pathdict[uid],
         )
 
         audio_line = wav.strip()
@@ -438,6 +441,9 @@ def create_manifest(
 
         if ctm is not None:
             ctm = ctm.strip()
+        
+        if seglst is not None:
+            seglst = seglst.strip()
 
         duration = None
         if add_duration:
@@ -454,6 +460,7 @@ def create_manifest(
                 "rttm_filepath": rttm,
                 "uem_filepath": uem,
                 "ctm_filepath": ctm,
+                "seglst_filepath": seglst,
             }
         ]
         lines.extend(meta)

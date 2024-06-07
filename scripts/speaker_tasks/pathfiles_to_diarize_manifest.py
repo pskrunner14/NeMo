@@ -50,6 +50,7 @@ if __name__ == "__main__":
     parser.add_argument("--paths2rttm_files", help="path to text file containing list of rttm files", type=str)
     parser.add_argument("--paths2uem_files", help="path to uem files", type=str)
     parser.add_argument("--paths2ctm_files", help="path to ctm files", type=str)
+    parser.add_argument("--paths2seglst_files", help="path to seglst files", type=str)
     parser.add_argument("--manifest_filepath", help="path to output manifest file", type=str, required=True)
     parser.add_argument(
         "--add_duration", help="add duration of audio files to output manifest files.", action='store_true',
@@ -62,6 +63,7 @@ if __name__ == "__main__":
         args.paths2rttm_files,
         args.paths2uem_files,
         args.paths2ctm_files,
+        args.paths2seglst_files,
         args.manifest_filepath,
         args.add_duration,
     )

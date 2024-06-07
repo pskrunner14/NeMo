@@ -10,12 +10,6 @@ sample_rate: 16000
 num_workers: 18
 batch_size: 8
 
-init_from_ptl_ckpt:
-  speaker_tasks:
-    name: 'sortformer_diarizer_small'
-    include: ["preprocessor","diarizer_module","sortformer_encoder", "transformer_encoder", "speaker_decoder"]
-    exclude: ["decoder.final"] # Add specific layer names here to exlude or just ["decoder"] if to exclude all of decoder pretrained weights
-
 model: 
   diarizer:
     out_dir: null
@@ -29,17 +23,15 @@ model:
         multiscale_weights: [1] # Weight for each scale. should be null (for single scale) or a list matched with window/shift scale count. ex) [0.33,0.33,0.33]
         save_embeddings: True # Save embeddings as pickle file for each audio input.
   
-  use_mock_embs: False
   use_pil_train: False
   use_pil_f1_score: False
-  perm_mock_embs: True
   multi_scale_method: 'only_interpolate' # 'mean', 'attention', 'only_interpolate'
   streaming_mode: False
-  variance_in_mock_embs: 0.05
+  use_positional_embedding: False
+  use_roformer: False
   alpha: 0.5 # mix ratio between final pred and skip pred connections
   sort_layer_on: pre # pre, post, False
   sort_bin_order: False
-  mock_emb_noise_std: 0.05
   num_workers: ${num_workers}
   heads: 12
   inner: 768
@@ -59,7 +51,6 @@ model:
   train_f1_acc_window_length: 25
   train_f1_acc_thres_pil_shift: 0.0
 
-
   train_ds:
     manifest_filepath: ???
     emb_dir: ???
@@ -72,11 +63,8 @@ model:
     batch_size: ${batch_size}
     shuffle: True
     num_workers: ${num_workers}
-    perm_mock_embs: ${model.perm_mock_embs}
-    mock_emb_noise_std: ${model.mock_emb_noise_std}
-    mock_emb_degree_of_freedom: 8
     validation_mode: False
-  
+
   validation_ds:
     manifest_filepath: ???
     emb_dir: ???
@@ -89,9 +77,6 @@ model:
     batch_size: ${batch_size}
     shuffle: True
     num_workers: ${num_workers}
-    perm_mock_embs: ${model.perm_mock_embs}
-    mock_emb_noise_std: ${model.mock_emb_noise_std}
-    mock_emb_degree_of_freedom: 48
     validation_mode: True
   
   test_ds:
@@ -107,9 +92,6 @@ model:
     shuffle: False
     seq_eval_mode: True
     num_workers: ${num_workers}
-    perm_mock_embs: ${model.perm_mock_embs}
-    mock_emb_noise_std: ${model.mock_emb_noise_std}
-    mock_emb_degree_of_freedom: 48
     validation_mode: True
 
   preprocessor:
@@ -138,10 +120,16 @@ model:
     context_vector_type: 'cos_sim' # Type of context vector: options. Options: ('cos_sim', 'elem_prod')
     use_amsl_layer: True
     sort_final_layer_on: False
-  
+
+  position_embedding:
+    _target_: nemo.collections.asr.modules.transformer.transformer_modules.FixedPositionalEncoding
+    hidden_size: 192
+    max_sequence_length: 10000
+
   sortformer_encoder:
     _target_: nemo.collections.asr.modules.transformer.sortformer_encoders.SortformerEncoder
     num_layers: 6
+    use_roformer: ${model.use_roformer} # Uses roformer (transformer+RoPE) instead of Sort-layer included sortformer
     hidden_size: 192 # Needs to be multiple of num_attention_heads
     inner_size: ${model.inner}
     num_attention_heads: ${model.heads}
@@ -156,22 +144,7 @@ model:
     sort_layer_type: "parallel"
     seq_var_sort: False
     sort_bin_order: ${model.sort_bin_order}
-    layer_arrival_time_sort: ${model.layer_arrival_time_sort}
     num_classes: ${model.max_num_of_spks}
-    detach_preds: False
-
-  transformer_encoder_row:
-    _target_: nemo.collections.asr.modules.transformer.transformer_encoders.TransformerEncoder
-    num_layers: 3
-    hidden_size: 299 # Needs to be multiple of num_attention_heads
-    inner_size: 598
-    num_attention_heads: ${model.heads}
-    attn_score_dropout: 0.5
-    attn_layer_dropout: 0.5
-    ffn_dropout: 0.5
-    hidden_act: relu
-    pre_ln: False
-    pre_ln_final_layer_norm: True
 
   transformer_encoder:
     _target_: nemo.collections.asr.modules.transformer.transformer_encoders.TransformerEncoder

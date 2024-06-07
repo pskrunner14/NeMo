@@ -28,6 +28,8 @@ model:
   use_pil_f1_score: False
   perm_mock_embs: True
   multi_scale_method: 'only_interpolate' # 'mean', 'attention', 'only_interpolate'
+  streaming_mode: False
+  use_positional_embedding: False
   variance_in_mock_embs: 0.05
   alpha: 0.5 # mix ratio between final pred and skip pred connections
   sort_layer_on: pre # pre, post, False
@@ -69,6 +71,7 @@ model:
     mock_emb_noise_std: ${model.mock_emb_noise_std}
     mock_emb_degree_of_freedom: 8
     validation_mode: False
+
   validation_ds:
     manifest_filepath: ???
     emb_dir: ???
@@ -130,7 +133,12 @@ model:
     context_vector_type: 'cos_sim' # Type of context vector: options. Options: ('cos_sim', 'elem_prod')
     use_amsl_layer: True
     sort_final_layer_on: False
-  
+
+  position_embedding:
+    _target_: nemo.collections.asr.modules.transformer.transformer_modules.FixedPositionalEncoding
+    hidden_size: 192
+    max_sequence_length: 10000
+
   sortformer_encoder:
     _target_: nemo.collections.asr.modules.transformer.sortformer_encoders.SortformerEncoder
     num_layers: 6

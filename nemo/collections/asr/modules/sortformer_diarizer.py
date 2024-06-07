@@ -26,20 +26,6 @@ from nemo.core.neural_types.elements import ProbsType
 __all__ = ['SortformerDiarizer']
 
 
-class ConvLayer(nn.Module):
-    def __init__(self, in_channels=1, out_channels=1, kernel_size=(3, 1), stride=(1, 1)):
-        super(ConvLayer, self).__init__()
-        self.cnn = nn.Sequential(
-            nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, stride=stride),
-            nn.ReLU(),
-            nn.BatchNorm2d(out_channels, eps=0.001, momentum=0.99),
-        )
-
-    def forward(self, feature):
-        feature = self.cnn(feature)
-        return feature
-
-
 class SortformerDiarizer(NeuralModule, Exportable):
     """
     Multi-scale Diarization Decoder (MSDD) for overlap-aware diarization and improved diarization accuracy from clustering diarizer.

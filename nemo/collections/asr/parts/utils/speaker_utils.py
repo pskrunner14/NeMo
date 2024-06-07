@@ -1289,6 +1289,8 @@ def get_subsegments(
     min_subsegment_duration: float = 0.01,
     decimals: int = 2,
     use_asr_style_frame_count: bool = False,
+    sample_rate: int = 16000,
+    feat_per_sec: int = 100,
     ) -> List[List[float]]:
     """
     Return subsegments from a segment of audio file.
@@ -1318,7 +1320,9 @@ def get_subsegments(
     if min_subsegment_duration <= duration < shift:
         slices = 1
     elif use_asr_style_frame_count is True:    
-        slices = np.ceil(duration/shift).astype(int)
+        num_feat_frames = np.ceil((1+duration*sample_rate)/int(sample_rate/feat_per_sec)).astype(int)
+        slices = np.ceil(num_feat_frames/int(feat_per_sec*shift)).astype(int)
+        slice_end = start + shift * slices
     else:
         slices = np.ceil(1+ (duration-window)/shift).astype(int)
     if slices == 1:
@@ -1327,7 +1331,7 @@ def get_subsegments(
     else:
         start_col = torch.arange(offset, slice_end, shift)[:slices]
         dur_col = window * torch.ones(slices)
-        dur_col[-1] = min(slice_end - start_col[-1], window)
+        dur_col = torch.min(slice_end*torch.ones_like(start_col)- start_col, window * torch.ones_like(start_col))
         dur_col = torch.round(dur_col, decimals=decimals)
         valid_mask = dur_col >= min_subsegment_duration
         valid_subsegments = torch.stack([start_col[valid_mask], dur_col[valid_mask]], dim=1)

@@ -77,7 +77,9 @@ class DiarizationConfig:
     audio_key: str = 'audio_filepath'  # Used to override the default audio key in dataset_manifest
     eval_config_yaml: Optional[str] = None  # Path to a yaml file of config of evaluation
     presort_manifest: bool = True  # Significant inference speedup on short-form data due to padding reduction
-    interpolated_scale:float=0.16
+    interpolated_scale: float=0.16
+    eval_mode: bool=False
+    no_der: bool=False
     
     # General configs
     output_filename: Optional[str] = None
@@ -249,6 +251,8 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     diar_model._cfg.test_ds.session_len_sec = cfg.session_len_sec
     trainer = pl.Trainer(devices=device, accelerator=accelerator)
     diar_model.set_trainer(trainer)
+    if cfg.eval_mode:
+        diar_model = diar_model.eval()
     diar_model._cfg.test_ds.manifest_filepath = cfg.dataset_manifest
     infer_audio_rttm_dict = get_audio_rttm_map(cfg.dataset_manifest)
     diar_model._cfg.test_ds.batch_size = cfg.batch_size
@@ -265,6 +269,8 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     diar_model.sortformer_diarizer.mem_len = cfg.mem_len
     diar_model.save_tensor_images = cfg.save_tensor_images
     diar_model.test_batch()
+    if cfg.no_der:
+        return
     
     # Evaluation
     output_list, all_hyps, all_refs, all_uems = convert_pred_mat_to_segments(infer_audio_rttm_dict, 

@@ -126,6 +126,16 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             self.cfg_e2e_diarizer_model.diarizer_module.scale_n = self.cfg_e2e_diarizer_model.scale_n
 
         self.preprocessor = EncDecSpeakerLabelModel.from_config_dict(self.cfg_e2e_diarizer_model.preprocessor)
+
+        self.use_raw_encoder = self.cfg_e2e_diarizer_model.get("use_raw_encoder", True)
+        self.use_raw_encoder_only = self.cfg_e2e_diarizer_model.get("use_raw_encoder_only", True)
+        if self.use_raw_encoder:
+            self.encoder = SortformerEncLabelModel.from_config_dict(self.cfg_e2e_diarizer_model.encoder)
+            if self.cfg_e2e_diarizer_model.encoder.d_model != self.cfg_e2e_diarizer_model.diarizer_module.emb_dim:
+                self.encoder_proj = nn.Linear(self.cfg_e2e_diarizer_model.encoder.d_model, self.cfg_e2e_diarizer_model.diarizer_module.emb_dim)
+            if not self.use_raw_encoder_only:
+                self.emb_combine = nn.Linear(2*self.cfg_e2e_diarizer_model.diarizer_module.emb_dim, self.cfg_e2e_diarizer_model.diarizer_module.emb_dim)
+
         self.sortformer_diarizer = SortformerEncLabelModel.from_config_dict(self.cfg_e2e_diarizer_model.diarizer_module)
         self.sortformer_encoder = SortformerEncLabelModel.from_config_dict(self.cfg_e2e_diarizer_model.sortformer_encoder)
         self.transformer_encoder = SortformerEncLabelModel.from_config_dict(self.cfg_e2e_diarizer_model.transformer_encoder)
@@ -526,26 +536,51 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
     ):
         """
         Forward pass for training.
-        """        
+        """
         if is_raw_waveform_input:
-            ms_emb_seq = self._forward_multiscale_encoder_from_waveform(
-                audio_signal=audio_signal, 
-                audio_signal_length=audio_signal_length,
-            ) # [batch_size, max_seg_count, msdd_scale_n, emb_dim]
+            if self.use_raw_encoder:
+                processed_signal, processed_signal_length = self._extract_embeddings(audio_signal=audio_signal, audio_signal_length=audio_signal_length)
+                processed_signal = processed_signal[:, :, :processed_signal_length.max()]
+                self.encoder = self.encoder.to(self.device)
+                raw_emb, raw_emb_length = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
+                raw_emb = raw_emb.transpose(1, 2)
+                if self.cfg_e2e_diarizer_model.encoder.d_model != self.cfg_e2e_diarizer_model.diarizer_module.emb_dim:
+                    self.encoder_proj = self.encoder_proj.to(self.device)
+                    raw_emb = self.encoder_proj(raw_emb)
+            if not self.use_raw_encoder_only:
+                ms_emb_seq = self._forward_multiscale_encoder_from_waveform(
+                    audio_signal=audio_signal, 
+                    audio_signal_length=audio_signal_length,
+                ) # [batch_size, max_seg_count, msdd_scale_n, emb_dim]
         else:
-            ms_emb_seq = self._forward_multiscale_encoder_from_processed(
-                processed_signal=audio_signal, 
-                processed_signal_len=audio_signal_length,
-            ) # [batch_size, max_seg_count, msdd_scale_n, emb_dim]
-        
-        if self.cfg_e2e_diarizer_model.get("multi_scale_method", None) == "mean":
-            emb_seq = ms_emb_seq.mean(dim=2)
-        elif self.cfg_e2e_diarizer_model.get("multi_scale_method", None) == "attention":
-            emb_seq, _ = self.sortformer_diarizer.apply_attention_weight(ms_emb_seq=ms_emb_seq)
-        elif self.cfg_e2e_diarizer_model.get("multi_scale_method", None) == "only_interpolate":
-            emb_seq = ms_emb_seq[:, :, -1, :] 
+            if self.use_raw_encoder:
+                self.encoder = self.encoder.to(self.device)
+                raw_emb, raw_emb_length = self.encoder(audio_signal=audio_signal, length=audio_signal_length)
+                raw_emb = raw_emb.transpose(1, 2)
+                if self.cfg_e2e_diarizer_model.encoder.d_model != self.cfg_e2e_diarizer_model.diarizer_module.emb_dim:
+                    self.encoder_proj = self.encoder_proj.to(self.device)
+                    raw_emb = self.encoder_proj(raw_emb)
+            if not self.use_raw_encoder_only:
+                ms_emb_seq = self._forward_multiscale_encoder_from_processed(
+                    processed_signal=audio_signal, 
+                    processed_signal_len=audio_signal_length,
+                ) # [batch_size, max_seg_count, msdd_scale_n, emb_dim]
+
+        if self.use_raw_encoder and self.use_raw_encoder_only:
+            emb_seq = raw_emb
         else:
-            raise ValueError(f"Unknown multi-scale method: {self.cfg_e2e_diarizer_model.get('multi_scale_method', None)}")
+            if self.cfg_e2e_diarizer_model.get("multi_scale_method", None) == "mean":
+                emb_seq = ms_emb_seq.mean(dim=2)
+            elif self.cfg_e2e_diarizer_model.get("multi_scale_method", None) == "attention":
+                emb_seq, _ = self.sortformer_diarizer.apply_attention_weight(ms_emb_seq=ms_emb_seq)
+            elif self.cfg_e2e_diarizer_model.get("multi_scale_method", None) == "only_interpolate":
+                emb_seq = ms_emb_seq[:, :, -1, :] 
+            else:
+                raise ValueError(f"Unknown multi-scale method: {self.cfg_e2e_diarizer_model.get('multi_scale_method', None)}")
+            if self.use_raw_encoder:
+                self.emb_combine = self.emb_combine.to(self.device)
+                emb_seq = self.emb_combine(torch.cat((emb_seq, raw_emb), dim=2))
+
         if self.streaming_mode:
             preds, _preds, attn_score_stack, total_memory_list, encoder_states_list = self.forward_streaming_infer(emb_seq, streaming_mode=self.streaming_mode) 
         else:

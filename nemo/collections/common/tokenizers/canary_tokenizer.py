@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
+import os, re
 from functools import cached_property
 from pathlib import Path
 from typing import Dict, List
@@ -90,3 +90,49 @@ class CanaryTokenizer(AggregateTokenizer):
         )
         spl_tokenizer = SentencePieceTokenizer(str(model_path))
         return spl_tokenizer
+
+class MSCanaryTokenizer(CanaryTokenizer):
+    """
+    Wrapper around CanaryTokenizer for Multi-Speaker ASR
+    The transcript is segmented by special speaker tokens:
+    <|speaker0|> transcript0 <|speaker1|> transcript1 ...
+    """
+
+    def __init__(self, tokenizers: Dict):
+        super().__init__(tokenizers)
+
+    # def text_to_tokens(self, text, lang_id):
+    #     tokenizer = self.tokenizers_dict[lang_id]
+    #     spl_tokenizer = self.tokenizers_dict['spl_tokens']
+    #     split_text = re.split(r"(<\|.*?\|>)", text)
+    #     spl_tokens = [split_text[i] for i in range(1, len(split_text), 2)]
+    #     transcript_tokens = [split_text[i] for i in range(2, len(split_text), 2)]
+    #     assert len(spl_tokens) == len(transcript_tokens)
+    #     tokens = []
+    #     for i in range(len(spl_tokens)):
+    #         tokens += spl_tokenizer.text_to_tokens(spl_tokens[i])
+    #         tokens += tokenizer.text_to_tokens(transcript_tokens[i])
+    #     return tokens
+
+    def text_to_ids(self, text, lang_id):
+        tokenizer = self.tokenizers_dict[lang_id]
+        split_text = re.split(r"(<\|.*?\|>)", text)
+        spl_tokens = [split_text[i] for i in range(1, len(split_text), 2)]
+        transcripts = [split_text[i] for i in range(2, len(split_text), 2)]
+        #logging.warning(spl_tokens, transcripts)
+        assert len(spl_tokens) == len(transcripts)
+        ids = []
+        
+        for i in range(len(spl_tokens)):
+            #logging.warning(ids)
+            assert spl_tokens[i] in self.special_tokens
+            # special tokens 
+            tokenizer = self.tokenizers_dict['spl_tokens']
+            offset = self.token_id_offset['spl_tokens']
+            ids += [n + offset for n in tokenizer.text_to_ids(spl_tokens[i])]
+            # segmented transcripts
+            tokenizer = self.tokenizers_dict[lang_id]
+            offset = self.token_id_offset[lang_id]
+            ids += [n + offset for n in tokenizer.text_to_ids(transcripts[i])]
+
+        return ids

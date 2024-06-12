@@ -101,30 +101,15 @@ class MSCanaryTokenizer(CanaryTokenizer):
     def __init__(self, tokenizers: Dict):
         super().__init__(tokenizers)
 
-    # def text_to_tokens(self, text, lang_id):
-    #     tokenizer = self.tokenizers_dict[lang_id]
-    #     spl_tokenizer = self.tokenizers_dict['spl_tokens']
-    #     split_text = re.split(r"(<\|.*?\|>)", text)
-    #     spl_tokens = [split_text[i] for i in range(1, len(split_text), 2)]
-    #     transcript_tokens = [split_text[i] for i in range(2, len(split_text), 2)]
-    #     assert len(spl_tokens) == len(transcript_tokens)
-    #     tokens = []
-    #     for i in range(len(spl_tokens)):
-    #         tokens += spl_tokenizer.text_to_tokens(spl_tokens[i])
-    #         tokens += tokenizer.text_to_tokens(transcript_tokens[i])
-    #     return tokens
-
     def text_to_ids(self, text, lang_id):
         tokenizer = self.tokenizers_dict[lang_id]
         split_text = re.split(r"(<\|.*?\|>)", text)
         spl_tokens = [split_text[i] for i in range(1, len(split_text), 2)]
         transcripts = [split_text[i] for i in range(2, len(split_text), 2)]
-        #logging.warning(spl_tokens, transcripts)
         assert len(spl_tokens) == len(transcripts)
         ids = []
         
         for i in range(len(spl_tokens)):
-            #logging.warning(ids)
             assert spl_tokens[i] in self.special_tokens
             # special tokens 
             tokenizer = self.tokenizers_dict['spl_tokens']

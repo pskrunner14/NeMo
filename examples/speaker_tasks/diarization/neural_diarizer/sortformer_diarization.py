@@ -78,8 +78,9 @@ class DiarizationConfig:
     eval_config_yaml: Optional[str] = None  # Path to a yaml file of config of evaluation
     presort_manifest: bool = True  # Significant inference speedup on short-form data due to padding reduction
     interpolated_scale: float=0.16
-    eval_mode: bool=False
-    no_der: bool=False
+    eval_mode: bool = False
+    no_der: bool = False
+    use_new_pil: bool = False
     
     # General configs
     output_filename: Optional[str] = None
@@ -242,7 +243,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         map_location = torch.device(f'cuda:{cfg.cuda}')
 
     if cfg.model_path.endswith(".ckpt"):
-        diar_model = SortformerEncLabelModel.load_from_checkpoint(checkpoint_path=cfg.model_path, map_location=map_location)
+        diar_model = SortformerEncLabelModel.load_from_checkpoint(checkpoint_path=cfg.model_path, map_location=map_location, strict=False)
     elif cfg.model_path.endswith(".nemo"):
         diar_model = SortformerEncLabelModel.restore_from(restore_path=cfg.model_path, map_location=map_location)
     else:
@@ -256,6 +257,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     diar_model._cfg.test_ds.manifest_filepath = cfg.dataset_manifest
     infer_audio_rttm_dict = get_audio_rttm_map(cfg.dataset_manifest)
     diar_model._cfg.test_ds.batch_size = cfg.batch_size
+    diar_model.use_new_pil = cfg.use_new_pil
     
     # Force the model to use the designated hop length
     scale_n = len(diar_model.msdd_multiscale_args_dict['scale_dict'])

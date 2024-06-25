@@ -885,6 +885,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         return metrics
 
     def multi_validation_epoch_end(self, outputs: list, dataloader_idx: int = 0):
+        if not outputs:
+            logging.warning(f"MAYBE A BUG: empty outputs for dataloader={dataloader_idx}")
+            return
         val_loss_mean = torch.stack([x['val_loss'] for x in outputs]).mean()
         val_ats_loss_mean = torch.stack([x['val_ats_loss'] for x in outputs]).mean()
         val_pil_loss_mean = torch.stack([x['val_pil_loss'] for x in outputs]).mean()

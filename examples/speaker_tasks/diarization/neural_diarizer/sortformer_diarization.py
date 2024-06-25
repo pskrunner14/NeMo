@@ -54,9 +54,7 @@ import torch
 import logging
 from omegaconf import OmegaConf
 from nemo.core.config import hydra_runner
-"""
-Example of end-to-end diarization inference 
-"""
+
 
 seed_everything(42)
 
@@ -237,8 +235,8 @@ def get_uem_object(uem_lines: List[List[float]], uniq_id: str):
     return timeline
 
 def convert_pred_mat_to_segments(
-    audio_rttm_map_dict, 
-    batch_preds_list: torch.Tensor, 
+    audio_rttm_map_dict: Dict[str, Dict[str, str]], 
+    batch_preds_list: List[torch.Tensor], 
     unit_10ms_frame_count:int = 8,
     bypass_postprocessing: bool = False,
     ):
@@ -247,7 +245,7 @@ def convert_pred_mat_to_segments(
 
     Args:
         audio_rttm_map_dict (dict): dictionary of audio file path, offset, duration and RTTM filepath.
-        batch_preds_list (torch.Tensor): list of prediction matrices containing sigmoid values for each speaker.
+        batch_preds_list (List[torch.Tensor]): list of prediction matrices containing sigmoid values for each speaker.
             Dimension: [(1, frames, num_speakers), ..., (1, frames, num_speakers)]
         unit_10ms_frame_count (int, optional): number of 10ms segments in a frame. Defaults to 8.
         bypass_postprocessing (bool, optional): if True, postprocessing will be bypassed. Defaults to False.

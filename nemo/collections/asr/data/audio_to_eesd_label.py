@@ -478,23 +478,15 @@ class _AudioMSDDTrainDataset(Dataset):
         session_len_sec = sample.duration
         uniq_id = self.get_uniq_id_with_range(sample)
         audio_signal = self.featurizer.process(sample.audio_file, offset=offset, duration=session_len_sec)
-        if audio_signal.shape[0] < session_len_sec*self.featurizer.sample_rate:
-            if isinstance(sample.audio_file, str): # Mono audio
-                audio_signal = torch.nn.functional.pad(audio_signal, (0, int(session_len_sec*self.featurizer.sample_rate) - audio_signal.shape[0]), mode='constant', value=0)
-            else:
-                audio_signal = torch.nn.functional.pad(audio_signal, (0, 0, 0, int(session_len_sec*self.featurizer.sample_rate) - audio_signal.shape[0]), mode='constant', value=0)
-        
         _audio_length = torch.tensor(audio_signal.shape[0]).long()
         audio_signal, _audio_length = audio_signal.to('cpu'), _audio_length.to('cpu')
         feature_signal, feature_length = audio_signal, _audio_length
         ms_seg_timestamps, ms_seg_counts = self.get_ms_seg_timestamps(duration=session_len_sec, sample_rate=self.featurizer.sample_rate)
-        scale_mapping = torch.stack(get_argmin_mat(ms_seg_timestamps))
         targets = self.parse_rttm_for_ms_targets(uniq_id=uniq_id,
                                                  rttm_file=sample.rttm_file,
                                                  offset=offset,
                                                  duration=session_len_sec,
                                                  ms_seg_counts=ms_seg_counts)
-        # return feature_signal, feature_length, ms_seg_timestamps, ms_seg_counts, scale_mapping, targets
         return feature_signal, feature_length, ms_seg_counts, targets
 
 def _msdd_train_collate_fn(self, batch):
@@ -529,13 +521,7 @@ def _msdd_train_collate_fn(self, batch):
     # audio_signal, feature_length, ms_seg_timestamps, ms_seg_counts, scale_mapping, targets  = packed_batch
     audio_signal, feature_length, ms_seg_counts, targets  = packed_batch
     audio_signal_list, feature_length_list = [], []
-    
-    ms_seg_timestamps_list, ms_seg_counts_list, scale_mapping_list, targets_list = (
-        [],
-        [],
-        [],
-        [],
-    )
+    ms_seg_counts_list, targets_list = [], []
 
     max_raw_feat_len = max([x.shape[0] for x in audio_signal])
     max_target_len = max([x.shape[0] for x in targets])
@@ -543,11 +529,6 @@ def _msdd_train_collate_fn(self, batch):
         max_ch = max([feat.shape[1] for feat in audio_signal])
     else:
         max_ch = 1
-    # arg_max_idx = torch.argmax(torch.tensor([ x.shape[1] for x in ms_seg_timestamps]))
-    # arg_max_idx = torch.argmax(torch.tensor([ x.item() for x in ms_seg_counts]))
-    # ms_seg_ts = ms_seg_timestamps[arg_max_idx]
-    # ms_seg_ct = ms_seg_counts[arg_max_idx]
-    # for feat, feat_len, ms_seg_ts, scale_clus, scl_map, tgt in batch:
     for feat, feat_len, ms_seg_ct, tgt in batch:
         seq_len = tgt.shape[0]
         if len(feat.shape) > 1:
@@ -558,11 +539,8 @@ def _msdd_train_collate_fn(self, batch):
             feat_len_pad = feat_len - feat.shape[0]
             feat = torch.nn.functional.pad(feat, (0, feat_len_pad))
         pad_tgt = (0, 0, 0, max_target_len - seq_len)
-        # pad_sm = (0, max_target_len - seq_len)
-        
         padded_feat = torch.nn.functional.pad(feat, pad_feat)
         padded_tgt = torch.nn.functional.pad(tgt, pad_tgt)
-        # padded_sm = torch.nn.functional.pad(scl_map, pad_sm)
         
         if max_ch > 1 and padded_feat.shape[1] < max_ch:
             feat_ch_pad = max_ch - padded_feat.shape[1]
@@ -570,17 +548,12 @@ def _msdd_train_collate_fn(self, batch):
 
         audio_signal_list.append(padded_feat)
         feature_length_list.append(feat_len.clone().detach())
-        # ms_seg_timestamps_list.append(ms_seg_ts)
         ms_seg_counts_list.append(ms_seg_ct.clone().detach())
-        # scale_mapping_list.append(padded_sm)
         targets_list.append(padded_tgt)
         audio_signal = torch.stack(audio_signal_list)
     feature_length = torch.stack(feature_length_list)
-    # ms_seg_timestamps = torch.stack(ms_seg_timestamps_list)
     ms_seg_counts = torch.stack(ms_seg_counts_list)
-    # scale_mapping = torch.stack(scale_mapping_list)
     targets = torch.stack(targets_list)
-    # return audio_signal, feature_length, ms_seg_timestamps, ms_seg_counts, scale_mapping, targets
     return audio_signal, feature_length, ms_seg_counts, targets
 
 class AudioToSpeechMSDDTrainDataset(_AudioMSDDTrainDataset):

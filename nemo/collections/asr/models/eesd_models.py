@@ -124,6 +124,11 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
 
         self.preprocessor = EncDecSpeakerLabelModel.from_config_dict(self.cfg_e2e_diarizer_model.preprocessor)
 
+        if hasattr(self.cfg_e2e_diarizer_model, 'spec_augment') and self._cfg.spec_augment is not None:
+            self.spec_augmentation = SortformerEncLabelModel.from_config_dict(self.cfg_e2e_diarizer_model.spec_augment)
+        else:
+            self.spec_augmentation = None
+
         self.use_raw_encoder = self.cfg_e2e_diarizer_model.get("use_raw_encoder", False)
         self.use_raw_encoder_only = self.cfg_e2e_diarizer_model.get("use_raw_encoder_only", False)
         if self.use_raw_encoder:
@@ -159,7 +164,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         self.encoder_infer_mode = False
 
         if trainer is not None:
-            self.add_speaker_model_config(cfg)
+#            self.add_speaker_model_config(cfg)
             self.loss = instantiate(self.cfg_e2e_diarizer_model.loss)
             self.affinity_loss = instantiate(self.cfg_e2e_diarizer_model.affinity_loss)
         else:
@@ -493,6 +498,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             if self.use_raw_encoder:
                 processed_signal, processed_signal_length = self._extract_embeddings(audio_signal=audio_signal, audio_signal_length=audio_signal_length)
                 processed_signal = processed_signal[:, :, :processed_signal_length.max()]
+                # Spec augment is not applied during evaluation/testing
+                if self.spec_augmentation is not None and self.training:
+                    processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
                 self.encoder = self.encoder.to(self.device)
                 raw_emb, raw_emb_length = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
                 raw_emb = raw_emb.transpose(1, 2)
@@ -506,6 +514,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
                 ) # [batch_size, max_seg_count, msdd_scale_n, emb_dim]
         else:
             if self.use_raw_encoder:
+                # Spec augment is not applied during evaluation/testing
+                if self.spec_augmentation is not None and self.training:
+                    audio_signal = self.spec_augmentation(input_spec=audio_signal, length=audio_signal_length)
                 self.encoder = self.encoder.to(self.device)
                 raw_emb, raw_emb_length = self.encoder(audio_signal=audio_signal, length=audio_signal_length)
                 raw_emb = raw_emb.transpose(1, 2)

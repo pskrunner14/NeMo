@@ -12,50 +12,49 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
+
 import copy
-from collections import OrderedDict
-from typing import Dict, List, Optional, Union
-from operator import attrgetter
-from math import ceil
-from torch import Tensor
-from einops import rearrange
+import inspect
+import itertools
 import time
+from collections import OrderedDict
+from dataclasses import dataclass
+from math import ceil
+from operator import attrgetter
+from pathlib import Path
+from typing import Dict, List, Optional, Union
+
 import torch
-from torch import nn
 import torch.nn.functional as F
+from einops import rearrange
 from hydra.utils import instantiate
 from omegaconf import DictConfig, open_dict
-from pytorch_lightning import Trainer
-from tqdm import tqdm
-from typing import List, Optional, Union, Dict 
-import itertools
-from dataclasses import dataclass
-from pathlib import Path
-
-from pyannote.database.util import load_rttm
 from pyannote.core import Annotation, Segment
+from pyannote.database.util import load_rttm
 from pyannote.metrics.diarization import DiarizationErrorRate
-from nemo.collections.asr.parts.preprocessing.perturb import process_augmentations
-from nemo.collections.asr.data.audio_to_eesd_label_heh import get_audio_to_eesd_label_dataset_from_config, EESDAudioRTTMBatch
+from pytorch_lightning import Trainer
+from pytorch_lightning.utilities import rank_zero_only
+from torch import Tensor, nn
+from tqdm import tqdm
+
+from nemo.collections.asr.data.audio_to_eesd_label_heh import (
+    EESDAudioRTTMBatch,
+    get_audio_to_eesd_label_dataset_from_config,
+)
+from nemo.collections.asr.losses.bce_loss import MaskedBCELoss
 from nemo.collections.asr.metrics.multi_binary_acc import MultiBinaryAccuracy
 from nemo.collections.asr.models.asr_model import ExportableEncDecModel
-from nemo.collections.asr.models.clustering_diarizer import (
-    get_available_model_names,
-)
+from nemo.collections.asr.models.clustering_diarizer import get_available_model_names
+from nemo.collections.asr.modules.transformer.transformer_modules import FixedPositionalEncoding
 from nemo.collections.asr.parts.mixins import ASRAdapterModelMixin
-from pytorch_lightning.utilities import rank_zero_only
-
-from nemo.collections.asr.losses.bce_loss import MaskedBCELoss
 from nemo.collections.asr.parts.preprocessing.features import WaveformFeaturizer
-from nemo.core.classes import ModelPT
-from nemo.core.classes import Loss, Typing, typecheck
+from nemo.collections.asr.parts.preprocessing.perturb import process_augmentations
+from nemo.core.classes import Loss, ModelPT, Typing, typecheck
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.core.neural_types import AudioSignal, LengthsType, NeuralType
 from nemo.core.neural_types.elements import ProbsType
 from nemo.utils import logging
 from nemo.utils.nemo_logging import LogMode
-from nemo.collections.asr.modules.transformer.transformer_modules import FixedPositionalEncoding
 
 try:
     from torch.cuda.amp import autocast
@@ -67,7 +66,7 @@ except ImportError:
         yield
 
 
-torch.backends.cudnn.enabled = False 
+torch.backends.cudnn.enabled = False
 
 __all__ = ['EncDecEESDModel']
 
@@ -96,31 +95,29 @@ class EncDecEESDModel(ModelPT, ExportableEncDecModel, ASRAdapterModelMixin):
         self._accuracy_val = MultiBinaryAccuracy()
         self._accuracy_test = MultiBinaryAccuracy()
 
-        self._accuracy_train_vad= MultiBinaryAccuracy()
-        self._accuracy_val_vad= MultiBinaryAccuracy()
-        self._accuracy_test_vad= MultiBinaryAccuracy()
+        self._accuracy_train_vad = MultiBinaryAccuracy()
+        self._accuracy_val_vad = MultiBinaryAccuracy()
+        self._accuracy_test_vad = MultiBinaryAccuracy()
 
-        self._accuracy_train_ovl= MultiBinaryAccuracy()
-        self._accuracy_val_ovl= MultiBinaryAccuracy()
-        self._accuracy_test_ovl= MultiBinaryAccuracy()
+        self._accuracy_train_ovl = MultiBinaryAccuracy()
+        self._accuracy_val_ovl = MultiBinaryAccuracy()
+        self._accuracy_test_ovl = MultiBinaryAccuracy()
 
         speaker_inds = list(range(self._cfg.max_num_of_spks))
-        self.spk_perm = nn.Parameter(torch.tensor(list(itertools.permutations(speaker_inds))), requires_grad=False) # Get all permutations
+        self.spk_perm = nn.Parameter(
+            torch.tensor(list(itertools.permutations(speaker_inds))), requires_grad=False
+        )  # Get all permutations
         self.max_num_speakers = self._cfg.max_num_of_spks
         self.frame_len_secs = self._cfg.frame_len_secs
         self.sample_rate = self._cfg.sample_rate
         self.use_pil = self._cfg.get('use_pil', True)
 
-        
     def list_available_models(self):
         return []
 
     def _setup_dataloader_from_config(self, config: DictConfig):
         dataset = get_audio_to_eesd_label_dataset_from_config(
-            config=config,
-            local_rank=self.local_rank,
-            global_rank=self.global_rank,
-            world_size=self.world_size,
+            config=config, local_rank=self.local_rank, global_rank=self.global_rank, world_size=self.world_size,
         )
 
         if dataset is None:
@@ -203,7 +200,7 @@ class EncDecEESDModel(ModelPT, ExportableEncDecModel, ASRAdapterModelMixin):
 
     def setup_test_data(self, test_data_config: Optional[Union[DictConfig, Dict]]):
         if test_data_config.get("manifest_filepath", None) is None:
-            return 
+            return
 
         if 'shuffle' not in test_data_config:
             test_data_config['shuffle'] = False
@@ -235,28 +232,38 @@ class EncDecEESDModel(ModelPT, ExportableEncDecModel, ASRAdapterModelMixin):
         batch_size = labels.size(0)
         num_frames = labels.size(1)
         num_speakers = labels.size(2)
-        perm_size = self.spk_perm.shape[0] 
+        perm_size = self.spk_perm.shape[0]
         permed_labels = labels[:, :, self.spk_perm]  # (batch_size, frame_len, perm_size, max_num_of_spks)
-        permed_preds = torch.unsqueeze(preds, 2).repeat(1,1, self.spk_perm.shape[0],1)  # (batch_size, frame_len, perm_size, max_num_of_spks)
+        permed_preds = torch.unsqueeze(preds, 2).repeat(
+            1, 1, self.spk_perm.shape[0], 1
+        )  # (batch_size, frame_len, perm_size, max_num_of_spks)
 
         flattened_permed_labels = rearrange(permed_labels, 'b t p s -> (b p) t s')
         flattened_permed_preds = rearrange(permed_preds, 'b t p s -> (b p) t s')
         flattened_lengths = lengths.unsqueeze(-1).repeat(1, perm_size).view(-1)  # (batch_size*perm_size)
 
-        flattened_loss, _ = self.bce_loss(probs=flattened_permed_preds, labels=flattened_permed_labels, lengths=flattened_lengths)  # [batch_size * perm_size, frame_len, spk_num]
-        
-        permed_loss = flattened_loss.sum(dim=1) / flattened_lengths.unsqueeze(-1)  # average across time, (batch_size * perm_size, spk_num)
+        flattened_loss, _ = self.bce_loss(
+            probs=flattened_permed_preds, labels=flattened_permed_labels, lengths=flattened_lengths
+        )  # [batch_size * perm_size, frame_len, spk_num]
+
+        permed_loss = flattened_loss.sum(dim=1) / flattened_lengths.unsqueeze(
+            -1
+        )  # average across time, (batch_size * perm_size, spk_num)
         permed_loss = permed_loss.mean(dim=1)  # average across speakers, (batch_size * perm_size)
         permed_loss = rearrange(permed_loss, '(b p)-> b p', b=batch_size, p=perm_size)
 
         best_perm_idx = torch.argmin(permed_loss, dim=1)  # (batch_size)
         best_loss = permed_loss[torch.arange(batch_size), best_perm_idx]  # (batch_size)
         best_perm = self.spk_perm[best_perm_idx]  # (batch_size, num_speakers)
-        best_permed_labels = permed_labels[torch.arange(batch_size), :, best_perm_idx]  # (batch_size, frame_len, max_num_of_spks)
+        best_permed_labels = permed_labels[
+            torch.arange(batch_size), :, best_perm_idx
+        ]  # (batch_size, frame_len, max_num_of_spks)
 
         return best_permed_labels, best_perm, best_loss
 
-    def forward(self, input_signal=None, input_signal_length=None, processed_signal=None, processed_signal_length=None):
+    def forward(
+        self, input_signal=None, input_signal_length=None, processed_signal=None, processed_signal_length=None
+    ):
         has_input_signal = input_signal is not None and input_signal_length is not None
         has_processed_signal = processed_signal is not None and processed_signal_length is not None
         if (has_input_signal ^ has_processed_signal) == False:
@@ -280,11 +287,13 @@ class EncDecEESDModel(ModelPT, ExportableEncDecModel, ASRAdapterModelMixin):
             encoder_output = self.encoder(processed_signal, length=processed_signal_length)
             encoded = encoder_output[0]
             encoded_len = encoder_output[1]
-            encoded = encoded.transpose(1,2)
+            encoded = encoded.transpose(1, 2)
         elif "encoder_mask" in encoder_params:
             # Transformer encoder
-            processed_signal = processed_signal.transpose(1,2)  # (B, C, T) -> (B, T, C)
-            encoder_mask = torch.arange(processed_signal.size(1)).unsqueeze(0).to(processed_signal.device) < processed_signal_length.unsqueeze(-1)
+            processed_signal = processed_signal.transpose(1, 2)  # (B, C, T) -> (B, T, C)
+            encoder_mask = torch.arange(processed_signal.size(1)).unsqueeze(0).to(
+                processed_signal.device
+            ) < processed_signal_length.unsqueeze(-1)
             encoded = self.encoder(processed_signal, encoder_mask)
             encoded_len = processed_signal_length
         else:
@@ -295,7 +304,7 @@ class EncDecEESDModel(ModelPT, ExportableEncDecModel, ASRAdapterModelMixin):
         logits = self.decoder(encoded)  # (B, T, C)
         probs = torch.sigmoid(logits)
         return probs, encoded_len
-    
+
     def trim_preds_and_labels(self, preds, labels, encoded_len):
         # clip encoded length to the maximum length of the labels
         encoded_len = torch.clamp(encoded_len, max=labels.size(1))
@@ -328,7 +337,9 @@ class EncDecEESDModel(ModelPT, ExportableEncDecModel, ASRAdapterModelMixin):
             # permed_labels: (batch_size, frame_len, max_num_of_spks)
             # best_perm: (batch_size, max_num_of_spks)
             # best_loss: (batch_size)
-            permed_labels, best_perm, best_loss = self.get_best_label_perm_and_loss(preds=probs, labels=labels, lengths=encoded_len)
+            permed_labels, best_perm, best_loss = self.get_best_label_perm_and_loss(
+                preds=probs, labels=labels, lengths=encoded_len
+            )
             # loss_value = best_loss.mean()
         else:
             permed_labels = labels
@@ -365,7 +376,7 @@ class EncDecEESDModel(ModelPT, ExportableEncDecModel, ASRAdapterModelMixin):
             )
 
         return {'loss': loss_value, 'log': tensorboard_logs}
-    
+
     def evaluation_step(self, batch: EESDAudioRTTMBatch, batch_idx: int, dataloader_idx: int = 0, mode: str = 'val'):
         metrics = {}
         probs, encoded_len = self.forward(
@@ -380,13 +391,24 @@ class EncDecEESDModel(ModelPT, ExportableEncDecModel, ASRAdapterModelMixin):
         if self.use_der_metric:
             uem_list = batch.uem
             rttm_files = batch.rttm_file if self.use_rttm_for_der else None
-            results, pred_anno, label_anno = get_diarization_error_rate(probs, labels, encoded_len, frame_len_secs=self.frame_len_secs, uem_list=uem_list, threshold=self.threshold, collar=self.collar, skip_overlap=self.skip_overlap, detailed=True, rttm_files=rttm_files)
+            results, pred_anno, label_anno = get_diarization_error_rate(
+                probs,
+                labels,
+                encoded_len,
+                frame_len_secs=self.frame_len_secs,
+                uem_list=uem_list,
+                threshold=self.threshold,
+                collar=self.collar,
+                skip_overlap=self.skip_overlap,
+                detailed=True,
+                rttm_files=rttm_files,
+            )
             der_list = []
             cer_list = []
             miss_list = []
             fa_list = []
             self.write_predictions(batch.sample_id, pred_anno, label_anno)
-            for i,metric in enumerate(results):
+            for i, metric in enumerate(results):
                 if metric['total'] == 0:
                     logging.warning(f"Total evaluation time is 0 for sample {batch.sample_id[i]}. Skipping.")
                     continue
@@ -403,12 +425,9 @@ class EncDecEESDModel(ModelPT, ExportableEncDecModel, ASRAdapterModelMixin):
             cer_list = torch.tensor(cer_list)
             miss_list = torch.tensor(miss_list)
             fa_list = torch.tensor(fa_list)
-            metrics.update({
-                f'{mode}_der': der_list,
-                f'{mode}_cer': cer_list,
-                f'{mode}_miss': miss_list,
-                f'{mode}_fa': fa_list,
-            })
+            metrics.update(
+                {f'{mode}_der': der_list, f'{mode}_cer': cer_list, f'{mode}_miss': miss_list, f'{mode}_fa': fa_list,}
+            )
 
         probs, labels, encoded_len = self.trim_preds_and_labels(probs, labels, encoded_len)
 
@@ -416,14 +435,16 @@ class EncDecEESDModel(ModelPT, ExportableEncDecModel, ASRAdapterModelMixin):
             # permed_labels: (batch_size, frame_len, max_num_of_spks)
             # best_perm: (batch_size, max_num_of_spks)
             # best_loss: (batch_size)
-            permed_labels, best_perm, best_loss = self.get_best_label_perm_and_loss(preds=probs, labels=labels, lengths=encoded_len)
+            permed_labels, best_perm, best_loss = self.get_best_label_perm_and_loss(
+                preds=probs, labels=labels, lengths=encoded_len
+            )
         else:
             permed_labels = labels
 
         loss, masks = self.bce_loss(probs=probs, labels=labels.detach(), lengths=encoded_len)
         loss = loss.sum(dim=1) / encoded_len.unsqueeze(-1)  # average across time, (batch_size, spk_num)
         loss = loss.mean(dim=1)  # average across speakers, (batch_size)
-        loss = loss.mean() # average across batch, (1)
+        loss = loss.mean()  # average across batch, (1)
 
         preds_vad, preds_ovl, targets_vad, targets_ovl = self.compute_aux_f1(probs, permed_labels)
         getattr(self, f"_reset_{mode}_f1_accs")()
@@ -434,13 +455,15 @@ class EncDecEESDModel(ModelPT, ExportableEncDecModel, ASRAdapterModelMixin):
         acc_vad = getattr(self, f"_accuracy_{mode}_vad").compute()
         acc_ovl = getattr(self, f"_accuracy_{mode}_ovl").compute()
 
-        metrics.update({
-            f'{mode}_loss': loss,
-            f'{mode}_f1_acc': acc,
-            f'{mode}_f1_acc_vad': acc_vad,
-            f'{mode}_f1_acc_ovl': acc_ovl,
-        })
-        
+        metrics.update(
+            {
+                f'{mode}_loss': loss,
+                f'{mode}_f1_acc': acc,
+                f'{mode}_f1_acc_vad': acc_vad,
+                f'{mode}_f1_acc_ovl': acc_ovl,
+            }
+        )
+
         return metrics
 
     def evaluation_epoch_end(self, outputs: List[Dict], dataloader_idx: int = 0, mode: str = 'val'):
@@ -464,12 +487,9 @@ class EncDecEESDModel(ModelPT, ExportableEncDecModel, ASRAdapterModelMixin):
             cer_all = torch.cat([x[f'{mode}_cer'] for x in outputs]).mean()
             miss_all = torch.cat([x[f'{mode}_miss'] for x in outputs]).mean()
             fa_all = torch.cat([x[f'{mode}_fa'] for x in outputs]).mean()
-            metrics.update({
-                f'{mode}_der': der_all,
-                f'{mode}_cer': cer_all,
-                f'{mode}_miss': miss_all,
-                f'{mode}_fa': fa_all,
-            })
+            metrics.update(
+                {f'{mode}_der': der_all, f'{mode}_cer': cer_all, f'{mode}_miss': miss_all, f'{mode}_fa': fa_all,}
+            )
 
         return {f'{mode}_loss': loss_value, 'log': metrics}
 
@@ -480,7 +500,7 @@ class EncDecEESDModel(ModelPT, ExportableEncDecModel, ASRAdapterModelMixin):
         else:
             self.validation_step_outputs.append(metrics)
         return metrics
-    
+
     def test_step(self, batch: EESDAudioRTTMBatch, batch_idx, dataloader_idx: int = 0):
         metrics = self.evaluation_step(batch, batch_idx, dataloader_idx, mode='test')
         if type(self.trainer.test_dataloaders) == list and len(self.trainer.test_dataloaders) > 1:
@@ -488,11 +508,10 @@ class EncDecEESDModel(ModelPT, ExportableEncDecModel, ASRAdapterModelMixin):
         else:
             self.test_step_outputs.append(metrics)
         return metrics
-        
 
     def multi_validation_epoch_end(self, outputs, dataloader_idx: int = 0):
         return self.evaluation_epoch_end(outputs, dataloader_idx, mode='val')
-    
+
     def multi_test_epoch_end(self, outputs, dataloader_idx: int = 0):
         return self.evaluation_epoch_end(outputs, dataloader_idx, mode='test')
 
@@ -508,27 +527,27 @@ class EncDecEESDModel(ModelPT, ExportableEncDecModel, ASRAdapterModelMixin):
             targets_ovl: (batch_size, frame_len, max_num_of_spks)
         """
         preds_bin = (preds > 0.5).to(torch.int64).detach()
-        targets_ovl_mask = (targets.sum(dim=2) >= 2)
-        preds_vad_mask = (preds_bin.sum(dim=2) > 0)
-        targets_vad_mask = (targets.sum(dim=2) > 0)
+        targets_ovl_mask = targets.sum(dim=2) >= 2
+        preds_vad_mask = preds_bin.sum(dim=2) > 0
+        targets_vad_mask = targets.sum(dim=2) > 0
         preds_ovl = preds[targets_ovl_mask, :].unsqueeze(0)
         targets_ovl = targets[targets_ovl_mask, :].unsqueeze(0)
         preds_vad_mask_ = preds_vad_mask.int().unsqueeze(0)
-        targets_vad_mask_ = targets_vad_mask.int().unsqueeze(0) 
+        targets_vad_mask_ = targets_vad_mask.int().unsqueeze(0)
         return preds_vad_mask_, preds_ovl, targets_vad_mask_, targets_ovl
-    
+
     def _reset_train_f1_accs(self):
-        self._accuracy_train.reset() 
+        self._accuracy_train.reset()
         self._accuracy_train_vad.reset()
         self._accuracy_train_ovl.reset()
 
     def _reset_val_f1_accs(self):
-        self._accuracy_val.reset() 
+        self._accuracy_val.reset()
         self._accuracy_val_vad.reset()
         self._accuracy_val_ovl.reset()
-    
+
     def _reset_test_f1_accs(self):
-        self._accuracy_test.reset() 
+        self._accuracy_test.reset()
         self._accuracy_test_vad.reset()
         self._accuracy_test_ovl.reset()
 
@@ -537,7 +556,9 @@ class EncDecEESDModel(ModelPT, ExportableEncDecModel, ASRAdapterModelMixin):
         self.collar = cfg.get('collar', self.collar)
         self.skip_overlap = cfg.get('skip_overlap', self.skip_overlap)
         self.output_dir = cfg.get('output_dir', None)
-        logging.info(f"Changed prediction parameters: threshold={self.threshold}, collar={self.collar}, skip_overlap={self.skip_overlap}")
+        logging.info(
+            f"Changed prediction parameters: threshold={self.threshold}, collar={self.collar}, skip_overlap={self.skip_overlap}"
+        )
 
     def get_inference_dataloader(self, cfg: DictConfig):
         data_cfg = {
@@ -560,9 +581,9 @@ class EncDecEESDModel(ModelPT, ExportableEncDecModel, ASRAdapterModelMixin):
         self.change_predict_params(cfg)
         dataloader = self._setup_dataloader_from_config(config=data_cfg)
         return dataloader
-    
+
     @rank_zero_only
-    def write_predictions(self, sample_idx, pred_annotations: List[Annotation], label_annotations = None):
+    def write_predictions(self, sample_idx, pred_annotations: List[Annotation], label_annotations=None):
         if not label_annotations:
             label_annotations = [None for _ in range(len(pred_annotations))]
         if not self.output_dir:
@@ -576,16 +597,20 @@ class EncDecEESDModel(ModelPT, ExportableEncDecModel, ASRAdapterModelMixin):
                 with open(f"{self.output_dir}/label_{sample_idx[i]}.rttm", 'w') as f:
                     label_anno.write_rttm(f)
 
+
 def rttm_to_annotation(rttm_files):
     annotations = []
     for f in rttm_files:
         anno = load_rttm(f) if f else Annotation()
         if isinstance(anno, dict):
             if len(anno) > 1:
-                logging.error(f"More than one audio clip in {f}. Please make sure there is only one audio clip per rttm file by using the same `uri`.")
+                logging.error(
+                    f"More than one audio clip in {f}. Please make sure there is only one audio clip per rttm file by using the same `uri`."
+                )
             anno = list(anno.values())[0]
         annotations.append(anno)
     return annotations
+
 
 def binary_labels_to_annotation(labels, label_lengths, frame_len_secs) -> List[Annotation]:
     """
@@ -622,7 +647,18 @@ def binary_labels_to_annotation(labels, label_lengths, frame_len_secs) -> List[A
     return annotations
 
 
-def get_diarization_error_rate(preds, labels, lengths, frame_len_secs, threshold = 0.5, collar = 0.25, skip_overlap = False, uem_list = None, detailed = True, rttm_files: Optional[List[str]] = None):
+def get_diarization_error_rate(
+    preds,
+    labels,
+    lengths,
+    frame_len_secs,
+    threshold=0.5,
+    collar=0.25,
+    skip_overlap=False,
+    uem_list=None,
+    detailed=True,
+    rttm_files: Optional[List[str]] = None,
+):
     """
     Args:
         preds: predictions (batch_size, frame_len, max_num_of_spks)

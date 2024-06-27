@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import collections
 import json
 import os
@@ -716,7 +717,15 @@ class DiarizationLabel(_Collection):
         data, duration_filtered = [], 0.0
 
         zipped_items = zip(
-            audio_files, uniq_ids, durations, rttm_files, offsets, target_spks_list, sess_spk_dicts, clus_spk_list, rttm_spk_list
+            audio_files,
+            uniq_ids,
+            durations,
+            rttm_files,
+            offsets,
+            target_spks_list,
+            sess_spk_dicts,
+            clus_spk_list,
+            rttm_spk_list,
         )
         for (
             audio_file,
@@ -816,7 +825,17 @@ class DiarizationSpeechLabel(DiarizationLabel):
         self.clus_label_dict = clus_label_dict
         self.seq_eval_mode = seq_eval_mode
         self.pairwise_infer = pairwise_infer
-        audio_files, uniq_ids, durations, rttm_files, offsets, target_spks_list, sess_spk_dicts, clus_spk_list, rttm_spk_list = (
+        (
+            audio_files,
+            uniq_ids,
+            durations,
+            rttm_files,
+            offsets,
+            target_spks_list,
+            sess_spk_dicts,
+            clus_spk_list,
+            rttm_spk_list,
+        ) = (
             [],
             [],
             [],
@@ -861,7 +880,6 @@ class DiarizationSpeechLabel(DiarizationLabel):
             sess_spk_dicts.append(sess_spk_dict)
             clus_spk_list.append(clus_speaker_digits)
             rttm_spk_list.append(rttm_speaker_digits)
-
 
         super().__init__(
             audio_files,
@@ -921,7 +939,7 @@ class DiarizationSpeechLabel(DiarizationLabel):
             raise ValueError(
                 f"Manifest file has invalid json line " f"structure: {line} without proper audio file key."
             )
-        
+
         if 'rttm_file' in item:
             pass
         elif 'rttm_filename' in item:
@@ -933,14 +951,16 @@ class DiarizationSpeechLabel(DiarizationLabel):
                 f"Manifest file has invalid json line " f"structure: {line} without proper rttm file key."
             )
 
-        if isinstance(item['audio_file'], list): 
-            item['audio_file'] = [manifest.get_full_path(audio_file_path, manifest_file) for audio_file_path in item['audio_file']]
+        if isinstance(item['audio_file'], list):
+            item['audio_file'] = [
+                manifest.get_full_path(audio_file_path, manifest_file) for audio_file_path in item['audio_file']
+            ]
         else:
             item['audio_file'] = manifest.get_full_path(item['audio_file'], manifest_file)
 
         item['rttm_file'] = manifest.get_full_path(item['rttm_file'], manifest_file)
 
-        if not isinstance(item['audio_file'], list): 
+        if not isinstance(item['audio_file'], list):
             if 'uniq_id' not in item:
                 item['uniq_id'] = os.path.splitext(os.path.basename(item['audio_file']))[0]
         elif 'uniq_id' not in item:

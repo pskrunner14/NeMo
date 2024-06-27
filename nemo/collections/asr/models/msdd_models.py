@@ -51,10 +51,10 @@ from nemo.collections.asr.parts.utils.speaker_utils import (
     get_embs_and_timestamps,
     get_id_tup_dict,
     get_scale_mapping_argmat,
+    get_uniq_id_from_manifest_line,
     get_uniq_id_list_from_manifest,
     labels_to_pyannote_object,
     make_rttm_with_overlap,
-    get_uniq_id_from_manifest_line,
     parse_scale_configs,
     rttm_to_labels,
 )
@@ -1371,7 +1371,9 @@ class NeuralDiarizer(LightningModule):
         preds_list, targets_list, signal_lengths_list = [], [], []
         uniq_id_list = get_uniq_id_list_from_manifest(self.msdd_model.cfg.test_ds.manifest_filepath)
         test_data_collection = [d for d in self.msdd_model.data_collection]
-        import ipdb; ipdb.set_trace()
+        import ipdb
+
+        ipdb.set_trace()
         for sidx, test_batch in enumerate(tqdm(self.msdd_model.test_dataloader())):
             signals, signal_lengths, _targets, emb_vectors = test_batch
             cumul_sample_count.append(cumul_sample_count[-1] + signal_lengths.shape[0])

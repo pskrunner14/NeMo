@@ -164,18 +164,18 @@ class ASRAdapterModelMixin(AdapterModelPTMixin):
             # Check if encoder adapters should be used
             # Dispatch the call to the encoder.
             if name is None or module_name in ('', 'encoder'):
-                if self.encoder.is_adapter_available():
+                if hasattr(self.encoder, "is_adapter_available") and self.encoder.is_adapter_available():
                     self.encoder.set_enabled_adapters(name=name, enabled=enabled)
 
             # Dispatch the call to the decoder.
             if name is None or module_name == 'decoder':
-                if self.decoder.is_adapter_available():
+                if hasattr(self.decoder, "is_adapter_available") and self.decoder.is_adapter_available():
                     self.decoder.set_enabled_adapters(name=name, enabled=enabled)
 
             # Dispatch the call to the joint.
             # Note: We need additional check for joint, since it may not exist (CTC models).
             if name is None or module_name == 'joint':
-                if hasattr(self, 'joint') and self.joint.is_adapter_available():
+                if hasattr(self, 'joint') and hasattr(self.joint, "is_adapter_available") and self.joint.is_adapter_available():
                     self.joint.set_enabled_adapters(name=name, enabled=enabled)
 
     def get_enabled_adapters(self) -> List[str]:

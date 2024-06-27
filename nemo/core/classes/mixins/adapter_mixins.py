@@ -627,7 +627,6 @@ class AdapterModelPTMixin(AdapterModuleMixin):
         # Convert to DictConfig from dict or Dataclass
         if is_dataclass(cfg):
             cfg = OmegaConf.structured(cfg)
-
         if not isinstance(cfg, DictConfig):
             cfg = DictConfig(cfg)
 

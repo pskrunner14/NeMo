@@ -49,10 +49,9 @@ class BCELoss(Loss, Typing):
         if class_normalization:
             self.reduction = 'none'
         else:
-            self.reduction = 'mean'
+            self.reduction = reduction
         self.loss_weight = weight
-        # self.loss_f = torch.nn.BCELoss(weight=self.loss_weight, reduction=self.reduction)
-        self.loss_f = torch.nn.BCELoss(reduction=self.reduction)
+        self.loss_f = torch.nn.BCELoss(weight=self.loss_weight, reduction=self.reduction)
         self.sorted_preds = sorted_preds
         self.sorted_loss = sorted_loss
         self.eps = 1e-6
@@ -111,3 +110,52 @@ class BCELoss(Loss, Typing):
             else:
                 return self.loss_f(probs, labels)
             
+
+class MaskedBCELoss(Loss):
+    """
+    Computes Binary Cross Entropy (BCE) loss. The BCELoss class expects output from Sigmoid function.
+    """
+
+    def __init__(self, reduction='mean', weight=None):
+        super().__init__()
+        self.reduction = str(reduction).lower()
+        self.bce_loss = torch.nn.BCELoss(reduction="none", weight=weight)
+
+    @property
+    def input_types(self):
+        """Input types definitions for AnguarLoss.
+        """
+        return {
+            "probs": NeuralType(('B', 'T', 'C'), ProbsType()),
+            'labels': NeuralType(('B', 'T', 'C'), LabelsType()),
+            "signal_lengths": NeuralType(tuple('B'), LengthsType()),
+        }
+
+    @property
+    def output_types(self):
+        """
+        Output types definitions for binary cross entropy loss. Weights for labels can be set using weight variables.
+        """
+        return {"loss": NeuralType(elements_type=LossType())}
+
+    def forward(self, probs, labels, lengths):
+        """
+        Args:
+            probs: [batch, time, channel]
+            labels: [batch, time, channel]
+            lengths: [batch]
+        Returns:
+            loss: if reduction is 'none', return same shape as probs, otherwise [1]
+        """
+
+        mask = torch.arange(probs.size(1), device=probs.device)[None, :, None] < lengths[:, None, None]
+        loss = self.bce_loss(probs, labels)
+        loss = loss * mask.float()
+        if self.reduction == 'mean':
+            return loss.sum() / mask.sum(), mask
+        elif self.reduction == 'sum':
+            return loss.sum(), mask
+        elif self.reduction == 'none':
+            return loss, mask
+        else:
+            raise ValueError(f"Unsupported reduction type {self.reduction}")

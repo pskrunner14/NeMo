@@ -1431,7 +1431,6 @@ class NeuralDiarizer(LightningModule):
                 all_hypothesis,
                 all_uem=all_uem,
                 collar=collar,
-                all_uem=all_uems,
                 ignore_overlap=ignore_overlap,
                 verbose=self._cfg.verbose,
             )

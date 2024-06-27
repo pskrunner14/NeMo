@@ -921,10 +921,24 @@ class DiarizationSpeechLabel(DiarizationLabel):
             raise ValueError(
                 f"Manifest file has invalid json line " f"structure: {line} without proper audio file key."
             )
-        if isinstance(item['audio_file'], list): 
-            item['audio_file'] = [os.path.expanduser(audio_file_path) for audio_file_path in item['audio_file']]
+        
+        if 'rttm_file' in item:
+            pass
+        elif 'rttm_filename' in item:
+            item['rttm_file'] = item.pop('rttm_filename')
+        elif 'rttm_filepath' in item:
+            item['rttm_file'] = item.pop('rttm_filepath')
         else:
-            item['audio_file'] = os.path.expanduser(item['audio_file'])
+            raise ValueError(
+                f"Manifest file has invalid json line " f"structure: {line} without proper rttm file key."
+            )
+
+        if isinstance(item['audio_file'], list): 
+            item['audio_file'] = [manifest.get_full_path(audio_file_path, manifest_file) for audio_file_path in item['audio_file']]
+        else:
+            item['audio_file'] = manifest.get_full_path(item['audio_file'], manifest_file)
+
+        item['rttm_file'] = manifest.get_full_path(item['rttm_file'], manifest_file)
 
         if not isinstance(item['audio_file'], list): 
             if 'uniq_id' not in item:
@@ -938,7 +952,7 @@ class DiarizationSpeechLabel(DiarizationLabel):
             audio_file=item['audio_file'],
             uniq_id=item['uniq_id'],
             duration=item['duration'],
-            rttm_file=item['rttm_filepath'],
+            rttm_file=item['rttm_file'],
             offset=item.get('offset', None),
         )
         return item

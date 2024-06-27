@@ -155,7 +155,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             raise ValueError(f"weights for PIL {pil_weight} and ATS {ats_weight} cannot sum to 0")
         self.pil_weight = pil_weight/(pil_weight + ats_weight)
         self.ats_weight = ats_weight/(pil_weight + ats_weight)
-        logging.info(f"Normalized weights for PIL {self.pil_weight} and ATS {self.ats_weight}")
+        #logging.info(f"Normalized weights for PIL {self.pil_weight} and ATS {self.ats_weight}")
         self.min_sample_duration = self.cfg_e2e_diarizer_model.get("min_sample_duration", -1)
 
         self.original_audio_offsets = {}
@@ -320,6 +320,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             pairwise_infer=False,
             global_rank=global_rank,
             encoder_infer_mode=self.encoder_infer_mode,
+            soft_targets=config.soft_targets if 'soft_targets' in config else False,
         )
         logging.info(f"AAB: Dataloader dataset is created, starting torch.utils.data.Dataloader step B: {time.time() - time_flag}")
 
@@ -669,7 +670,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
 
     def training_step(self, batch: list, batch_idx: int):
         audio_signal, audio_signal_length, ms_seg_counts, targets = batch
-
         #apply random cutting of subsegments 
         if self.min_sample_duration > 0:
             audio_signal_sec = audio_signal.shape[1] / self.preprocessor._sample_rate
@@ -725,7 +725,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         )
 
         # Arrival-time sorted (ATS) targets
-        targets_ats = self.sort_probs_and_labels(targets.clone(), discrete=True, accum_frames=self.sort_accum_frames)
+        targets_ats = self.sort_probs_and_labels(targets.clone(), discrete=False, accum_frames=self.sort_accum_frames)
         # Optimally permuted targets for Permutation-Invariant Loss (PIL)
         if self.use_new_pil:
             targets_pil = self.sort_targets_with_preds_new(targets.clone(), preds, self.pil_noise_level)
@@ -742,21 +742,15 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             targets_ats_rep = targets_ats.repeat(mid_layer_count+1,1,1)
             targets_pil_rep = targets_pil.repeat(mid_layer_count+1,1,1)
             sequence_lengths_rep = sequence_lengths.repeat(mid_layer_count+1)
-            if self.ats_weight > 0:
-                 ats_loss = self.loss(probs=preds_all, labels=targets_ats_rep, signal_lengths=sequence_lengths_rep)
-            if self.pil_weight > 0:
-                 pil_loss = self.loss(probs=preds_all, labels=targets_pil_rep, signal_lengths=sequence_lengths_rep)
+            ats_loss = self.loss(probs=preds_all, labels=targets_ats_rep, signal_lengths=sequence_lengths_rep)
+            pil_loss = self.loss(probs=preds_all, labels=targets_pil_rep, signal_lengths=sequence_lengths_rep)
         else:
-            if self.ats_weight > 0:
-                 ats_loss = self.loss(probs=preds, labels=targets_ats, signal_lengths=sequence_lengths)
-            if self.pil_weight > 0:
-                 pil_loss = self.loss(probs=preds, labels=targets_pil, signal_lengths=sequence_lengths)
+            ats_loss = self.loss(probs=preds, labels=targets_ats, signal_lengths=sequence_lengths)
+            pil_loss = self.loss(probs=preds, labels=targets_pil, signal_lengths=sequence_lengths)
         loss = self.ats_weight * ats_loss + self.pil_weight * pil_loss
         self.log('loss', loss, sync_dist=True)
-        if self.ats_weight > 0:
-            self.log('ats_loss', ats_loss, sync_dist=True)
-        if self.pil_weight > 0:
-            self.log('pil_loss', pil_loss, sync_dist=True)
+        self.log('ats_loss', ats_loss, sync_dist=True)
+        self.log('pil_loss', pil_loss, sync_dist=True)
         self.log('learning_rate', self._optimizer.param_groups[0]['lr'], sync_dist=True)
 
         self._reset_train_f1_accs()
@@ -833,7 +827,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         )
 
         # Arrival-time sorted (ATS) targets
-        targets_ats = self.sort_probs_and_labels(targets.clone(), discrete=True, accum_frames=self.sort_accum_frames)
+        targets_ats = self.sort_probs_and_labels(targets.clone(), discrete=False, accum_frames=self.sort_accum_frames)
         # Optimally permuted targets for Permutation-Invariant Loss (PIL)
         if self.use_new_pil:
             targets_pil = self.sort_targets_with_preds_new(targets.clone(), preds)
@@ -946,7 +940,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         )
 
         # Arrival-time sorted (ATS) targets
-        targets_ats = self.sort_probs_and_labels(targets.clone(), discrete=True, accum_frames=self.sort_accum_frames)
+        targets_ats = self.sort_probs_and_labels(targets.clone(), discrete=False, accum_frames=self.sort_accum_frames)
         # Optimally permuted targets for Permutation-Invariant Loss (PIL)
         if self.use_new_pil:
             targets_pil = self.sort_targets_with_preds_new(targets.clone(), preds)
@@ -987,7 +981,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
                     self.preds_total_list.extend(torch.split(preds, [1] * preds.shape[0]))
                 torch.cuda.empty_cache()
                 # Batch-wise evaluation: Arrival-time sorted (ATS) targets
-                targets_ats = self.sort_probs_and_labels(targets.clone(), discrete=True, accum_frames=self.sort_accum_frames)
+                targets_ats = self.sort_probs_and_labels(targets.clone(), discrete=False, accum_frames=self.sort_accum_frames)
                 # Optimally permuted targets for Permutation-Invariant Loss (PIL)
                 if self.use_new_pil:
                     targets_pil = self.sort_targets_with_preds_new(targets.clone(), preds)

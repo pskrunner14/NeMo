@@ -81,6 +81,7 @@ class DiarizationConfig:
     
     # General configs
     output_filename: Optional[str] = None
+    session_len_sec: float = -1 # End-to-end diarization session length in seconds
     batch_size: int = 4
     num_workers: int = 0
     random_seed: Optional[int] = None  # seed number going to be used in seed_everything()
@@ -326,6 +327,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     else:
         raise ValueError("cfg.model_path must end with.ckpt or.nemo!")
     diar_model._cfg.diarizer.out_dir = cfg.tensor_image_dir
+    diar_model._cfg.test_ds.session_len_sec = cfg.session_len_sec
     trainer = pl.Trainer(devices=device, accelerator=accelerator)
     diar_model.set_trainer(trainer)
     if cfg.eval_mode:

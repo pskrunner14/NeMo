@@ -294,6 +294,7 @@ class _AudioMSDDTrainDataset(Dataset):
         randomize_overlap_labels: bool = True,
         randomize_offset: bool = True,
         encoder_infer_mode: bool = False,
+        soft_targets: bool = False,
     ):
         super().__init__()
         self.collection = DiarizationSpeechLabel(
@@ -338,6 +339,7 @@ class _AudioMSDDTrainDataset(Dataset):
         self.global_speaker_label_table = get_speaker_labels_from_diar_rttms(self.collection)
         self.ch_clus_mat_dict = {}
         self.use_asr_style_frame_count = True
+        self.soft_targets = soft_targets
     
     def __len__(self):
         return len(self.collection)
@@ -402,8 +404,10 @@ class _AudioMSDDTrainDataset(Dataset):
 
         soft_target_seg = self.get_soft_targets_seg(feat_level_target=fr_level_target,
                                                     ms_seg_counts=ms_seg_counts)
-
-        step_target = (soft_target_seg >= self.soft_label_thres).float()
+        if self.soft_targets:
+            step_target = soft_target_seg
+        else:
+            step_target = (soft_target_seg >= self.soft_label_thres).float()
         return step_target
 
     def get_soft_targets_seg(self, feat_level_target, ms_seg_counts):
@@ -475,7 +479,11 @@ class _AudioMSDDTrainDataset(Dataset):
         if sample.offset is None:
             sample.offset = 0
         offset = sample.offset
-        session_len_sec = sample.duration
+        if self.session_len_sec < 0:
+            session_len_sec = sample.duration
+        else:
+            session_len_sec = min(sample.duration, self.session_len_sec)
+
         uniq_id = self.get_uniq_id_with_range(sample)
         audio_signal = self.featurizer.process(sample.audio_file, offset=offset, duration=session_len_sec)
         _audio_length = torch.tensor(audio_signal.shape[0]).long()
@@ -606,6 +614,7 @@ class AudioToSpeechMSDDTrainDataset(_AudioMSDDTrainDataset):
         pairwise_infer: bool,
         global_rank: int,
         encoder_infer_mode: bool,
+        soft_targets: bool,
     ):
         super().__init__(
             manifest_filepath=manifest_filepath,
@@ -622,6 +631,7 @@ class AudioToSpeechMSDDTrainDataset(_AudioMSDDTrainDataset):
             pairwise_infer=pairwise_infer,
             global_rank=global_rank,
             encoder_infer_mode=encoder_infer_mode,
+            soft_targets=soft_targets,
         )
 
     def msdd_train_collate_fn(self, batch):

@@ -106,31 +106,7 @@ model:
     pad_to: 0
     pad_value: 0.0
 
-  adapter:
-    enable: true
-    ### Config of the adapter training/eval script ###
-    adapter_name: eesd  # Name of the adapter, used by the script
-    adapter_type: "linear"  # Type of the adapter. Corresponds to the subconfigs below.
-    adapter_module_name: null  # Name of the adapter module. Combine multiple modules with '+' between module names.
-    adapter_state_dict_name: null  # If the individual adapters must be saved, a file name can be provided here. null disables this.
-
-    ### Adapter Configs ###
-    # Linear / Houlsby Adapter (https://arxiv.org/abs/1902.00751)
-    linear:
-      # Config of the adapter module itself
-      _target_: nemo.collections.common.parts.adapter_modules.LinearAdapter
-      in_features: ${model.encoder.d_model}  # User must provide the output dimension of the layers of the model, which is the input dimension of this adapter.
-      dim: 32  # The hidden dimension of the adapter, as chosen by user, but small values are preferred to reduce param count.
-      activation: swish
-      norm_position: 'pre'  # Can be `pre` or `post`
-      dropout: 0.0  # float, dropout for the adapter
-
-      # Adapter strategy config
-      adapter_strategy:
-        _target_: nemo.core.classes.mixins.adapter_mixin_strategies.ResidualAddAdapterStrategy
-        stochastic_depth: 0.0  # float, setting to > 0 will enable stochastic depth for each adapter block.
-        l2_lambda: 0.0  # float, setting to > 0 will enable l2 norm auxiliary loss for each adapter's output.
-
+  adapters:
     # Tiny-Attention Adapter (https://arxiv.org/abs/2211.01979)
     # NOTE: Only supported for Attention based encoders. Make sure to pass `adapter_module_name` as "encoder"
     tiny_attn:
@@ -160,7 +136,7 @@ model:
       check_joint_adapter: True  # ASR adapter key, determines whether to check if joint adapter modules is supported
 
   encoder:
-    _target_: nemo.collections.asr.modules.ConformerEncoder
+    _target_: nemo.collections.asr.modules.ConformerEncoderAdapter
     feat_in: ${model.preprocessor.features}
     feat_out: -1 # you may set it if you need different output size other than the default d_model
     n_layers: 18

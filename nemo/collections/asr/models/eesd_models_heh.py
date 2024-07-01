@@ -111,6 +111,7 @@ class EncDecEESDModel(ModelPT, ExportableEncDecModel, ASRAdapterModelMixin):
         self.frame_len_secs = self._cfg.frame_len_secs
         self.sample_rate = self._cfg.sample_rate
         self.use_pil = self._cfg.get('use_pil', True)
+        self.setup_adapters()
 
     def list_available_models(self):
         return []
@@ -298,6 +299,7 @@ class EncDecEESDModel(ModelPT, ExportableEncDecModel, ASRAdapterModelMixin):
             encoded_len = processed_signal_length
         else:
             # MLP encoder
+            processed_signal = processed_signal.transpose(1, 2)  # (B, C, T) -> (B, T, C)
             encoded = self.encoder(processed_signal)
             encoded_len = processed_signal_length
 

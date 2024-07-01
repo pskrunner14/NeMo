@@ -262,7 +262,7 @@ def get_audio_to_eesd_label_dataset_from_config(
     if config.get('is_tarred', False):
         raise ValueError("Tarred dataset not supported for EESD dataset yet")
 
-    augmentor = process_augmentations(config.get('augmentation', None), global_rank, world_size)
+    augmentor = process_augmentations(config.get('augmentor', None), global_rank, world_size)
 
     return AudioToEESDLabelDataset(
         manifest_filepath=config['manifest_filepath'],

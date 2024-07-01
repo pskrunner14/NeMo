@@ -90,8 +90,6 @@ def main(cfg):
         logging.info("Freezing encoder weights.")
         model.encoder.freeze()
 
-    model.setup_adapters()
-
     trainer.fit(model)
 
 

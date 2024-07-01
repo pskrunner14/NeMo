@@ -208,9 +208,13 @@ def ts_vad_post_processing(
                         [591.1200, 597.7600]])
     """
     ts_vad_binary_frames = torch.repeat_interleave(ts_vad_binary_vec, unit_10ms_frame_count)
-    speech_segments = binarization(ts_vad_binary_frames, cfg_vad_params)
     if not bypass_postprocessing:
+        speech_segments = binarization(ts_vad_binary_frames, cfg_vad_params)
         speech_segments = filtering(speech_segments, cfg_vad_params)
+    else:
+        cfg_vad_params.onset=0.5
+        cfg_vad_params.offset=0.5
+        speech_segments = binarization(ts_vad_binary_frames, cfg_vad_params)
     return speech_segments
 
 def get_uem_object(uem_lines: List[List[float]], uniq_id: str):

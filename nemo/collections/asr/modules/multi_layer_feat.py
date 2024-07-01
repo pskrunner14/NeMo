@@ -173,3 +173,46 @@ class ConformerMultiLayerFeaturePreprocessor(NeuralModule, Exportable, AccessMix
 
         encoded, encoded_len = self.feature_extractor(audio_signal=processed_signal, length=processed_signal_length)
         return encoded, encoded_len
+
+
+class ConformerFeaturePreprocessor(NeuralModule, Exportable, AccessMixin):
+    def __init__(
+        self,
+        preprocessor: AudioToMelSpectrogramPreprocessor,
+        encoder: ConformerEncoder,
+        aggregator: nn.Module = None,
+        spec_augment=None,
+        freeze_encoder: bool = False,
+    ):
+        super().__init__()
+        self.preprocessor = preprocessor
+        self.spec_augmentation = spec_augment
+        self.encoder = encoder
+        self.freeze_encoder = freeze_encoder
+        if freeze_encoder:
+            self.freeze()
+
+    def forward(self, input_signal, length):
+        """
+        Forward pass of the model.
+
+        Args:
+            input_signal: Tensor that represents a batch of raw audio signals,
+                of shape [B, T]. T here represents timesteps, with 1 second of audio represented as
+                `self.sample_rate` number of floating point values.
+            length: Vector of length B, that contains the individual lengths of the audio
+                sequences.
+        Returns:
+            encoded: A tensor of shape [B, D, T], where D represents the number of
+                feature dimensions extracted from the audio signal, and T represents the
+                number of timesteps in the processed audio signal.
+            encoded_len: A tensor of shape [B], that contains the lengths of the audio sequences.
+        """
+
+        processed_signal, processed_signal_length = self.preprocessor(input_signal=input_signal, length=length,)
+
+        if self.spec_augmentation is not None and self.training:
+            processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
+
+        encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
+        return encoded, encoded_len

@@ -247,12 +247,6 @@ class _AudioMSDDTrainDataset(Dataset):
             Featurizer instance for generating audio_signal from the raw waveform.
         window_stride (float):
             Window stride for acoustic feature. This value is used for calculating the numbers of feature-level frames.
-        emb_batch_size (int):
-            Number of embedding vectors that are trained with attached computational graphs.
-        pairwise_infer (bool):
-            This variable should be True if dataloader is created for an inference task.
-        random_flip (bool):
-            If True, the two labels and input signals are randomly flipped per every epoch while training.
     """
 
     @property
@@ -260,14 +254,9 @@ class _AudioMSDDTrainDataset(Dataset):
         """Returns definitions of module output ports."""
         output_types = {
             "audio_signal": NeuralType(('B', 'T'), AudioSignal()),
-            "feature_length": NeuralType(('B'), LengthsType()),
-            "ms_seg_timestamps": NeuralType(('B', 'C', 'T', 'D'), LengthsType()),
+            "audio_length": NeuralType(('B'), LengthsType()),
             "ms_seg_counts": NeuralType(('B', 'C'), LengthsType()),
-            "clus_label_index": NeuralType(('B', 'T'), LengthsType()),
-            "scale_mapping": NeuralType(('B', 'C', 'T'), LengthsType()),
-            "ch_clus_mat": NeuralType(('B', 'C', 'C'), LengthsType()),
             "targets": NeuralType(('B', 'T', 'C'), ProbsType()),
-            "global_spk_labels": NeuralType(('B', 'T'), LengthsType()),
         }
 
         return output_types
@@ -284,16 +273,11 @@ class _AudioMSDDTrainDataset(Dataset):
         num_spks: int,
         featurizer,
         window_stride,
-        emb_batch_size,
-        pairwise_infer: bool,
         min_subsegment_duration: float = 0.03,
-        random_flip: bool = True,
         global_rank: int = 0,
-        num_workers: int = 30,
         dtype=torch.float32,
         randomize_overlap_labels: bool = True,
         randomize_offset: bool = True,
-        encoder_infer_mode: bool = False,
         soft_targets: bool = False,
     ):
         super().__init__()
@@ -301,7 +285,7 @@ class _AudioMSDDTrainDataset(Dataset):
             manifests_files=manifest_filepath.split(','),
             emb_dict=None,
             clus_label_dict=None,
-            pairwise_infer=pairwise_infer,
+            pairwise_infer=True,
         )
         self.preprocessor = preprocessor
         self.featurizer = featurizer
@@ -314,32 +298,21 @@ class _AudioMSDDTrainDataset(Dataset):
 
         self.seg_stride = self.scale_dict[self.scale_n-1][1]
         self.max_raw_feat_len = int(self.multiscale_args_dict['scale_dict'][0][0] * self.feat_per_sec)
-        self.random_flip = random_flip
-        if random_flip:
-            self.randomize_overlap_labels = True
-            self.randomize_offset = False
-        else:
-            self.randomize_overlap_labels = False
-            self.randomize_offset = False
-
         self.div_n = 20
         self.emb_dir = emb_dir
         self.round_digits = 2
         self.decim = 10 ** self.round_digits
         self.soft_label_thres = soft_label_thres
-        self.pairwise_infer = pairwise_infer
         self.max_spks = num_spks
-        self.emb_batch_size = emb_batch_size
         self.global_rank = global_rank
         self.manifest_filepath = manifest_filepath
         self.min_subsegment_duration = min_subsegment_duration
-        self.num_workers = num_workers
         self.dtype = dtype
-        self.encoder_infer_mode = encoder_infer_mode
         self.global_speaker_label_table = get_speaker_labels_from_diar_rttms(self.collection)
         self.ch_clus_mat_dict = {}
         self.use_asr_style_frame_count = True
         self.soft_targets = soft_targets
+        self.floor_decimal = 10 ** self.round_digits
     
     def __len__(self):
         return len(self.collection)
@@ -486,16 +459,20 @@ class _AudioMSDDTrainDataset(Dataset):
 
         uniq_id = self.get_uniq_id_with_range(sample)
         audio_signal = self.featurizer.process(sample.audio_file, offset=offset, duration=session_len_sec)
-        _audio_length = torch.tensor(audio_signal.shape[0]).long()
-        audio_signal, _audio_length = audio_signal.to('cpu'), _audio_length.to('cpu')
-        feature_signal, feature_length = audio_signal, _audio_length
+        
+        # We should resolve the length mis-match from the round-off errors: `session_len_sec` and `audio_signal.shape[0]`
+        session_len_sec = np.floor(audio_signal.shape[0] / self.featurizer.sample_rate* self.floor_decimal)/self.floor_decimal
+        audio_signal = audio_signal[:int(self.featurizer.sample_rate*session_len_sec)]
+        
+        audio_signal_length = torch.tensor(audio_signal.shape[0]).long()
+        audio_signal, audio_signal_length = audio_signal.to('cpu'), audio_signal_length.to('cpu')
         ms_seg_timestamps, ms_seg_counts = self.get_ms_seg_timestamps(duration=session_len_sec, sample_rate=self.featurizer.sample_rate)
         targets = self.parse_rttm_for_ms_targets(uniq_id=uniq_id,
                                                  rttm_file=sample.rttm_file,
                                                  offset=offset,
                                                  duration=session_len_sec,
                                                  ms_seg_counts=ms_seg_counts)
-        return feature_signal, feature_length, ms_seg_counts, targets
+        return audio_signal, audio_signal_length, ms_seg_counts, targets
 
 def _msdd_train_collate_fn(self, batch):
     """
@@ -591,10 +568,6 @@ class AudioToSpeechMSDDTrainDataset(_AudioMSDDTrainDataset):
             Featurizer instance for generating features from the raw waveform.
         window_stride (float):
             Window stride for acoustic feature. This value is used for calculating the numbers of feature-level frames.
-        emb_batch_size (int):
-            Number of embedding vectors that are trained with attached computational graphs.
-        pairwise_infer (bool):
-            This variable should be True if dataloader is created for an inference task.
     """
 
     def __init__(
@@ -606,14 +579,10 @@ class AudioToSpeechMSDDTrainDataset(_AudioMSDDTrainDataset):
         emb_dir: str,
         soft_label_thres: float,
         session_len_sec: float,
-        random_flip: bool,
         num_spks: int,
         featurizer,
         window_stride,
-        emb_batch_size,
-        pairwise_infer: bool,
         global_rank: int,
-        encoder_infer_mode: bool,
         soft_targets: bool,
     ):
         super().__init__(
@@ -623,14 +592,10 @@ class AudioToSpeechMSDDTrainDataset(_AudioMSDDTrainDataset):
             emb_dir=emb_dir,
             soft_label_thres=soft_label_thres,
             session_len_sec=session_len_sec,
-            random_flip=random_flip,
             num_spks=num_spks,
             featurizer=featurizer,
             window_stride=window_stride,
-            emb_batch_size=emb_batch_size,
-            pairwise_infer=pairwise_infer,
             global_rank=global_rank,
-            encoder_infer_mode=encoder_infer_mode,
             soft_targets=soft_targets,
         )
 

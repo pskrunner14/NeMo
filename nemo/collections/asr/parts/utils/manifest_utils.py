@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Dict, List, Union
 
 import librosa
+import soundfile as sf
+
 import numpy as np
 
 from nemo.collections.asr.parts.utils.speaker_utils import (
@@ -443,6 +445,7 @@ def create_manifest(
         if add_duration:
             y, sr = librosa.load(audio_line, sr=None)
             duration = librosa.get_duration(y=y, sr=sr)
+            
         meta = [
             {
                 "audio_filepath": audio_line,

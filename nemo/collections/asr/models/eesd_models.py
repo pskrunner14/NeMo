@@ -105,10 +105,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         self._init_segmentation_info()
         if self._trainer:
             self.world_size = trainer.num_nodes * trainer.num_devices
-            self.pairwise_infer = False
         else:
             self.world_size = 1
-            self.pairwise_infer = True
 
         self._init_msdd_scales()  
         if self._trainer is not None and self.cfg_e2e_diarizer_model.get('augmentor', None) is not None:
@@ -161,7 +159,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         self.original_audio_offsets = {}
         self.eps = 1e-3
         self.emb_dim = self.cfg_e2e_diarizer_model.diarizer_module.emb_dim
-        self.encoder_infer_mode = False
 
         if trainer is not None:
 #            self.add_speaker_model_config(cfg)
@@ -308,18 +305,13 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             manifest_filepath=config.manifest_filepath,
             preprocessor=preprocessor,
             emb_dir=config.emb_dir,
-            # multiscale_args_dict=self.msdd_multiscale_args_dict,
             multiscale_args_dict=self.multiscale_args_dict,
             soft_label_thres=config.soft_label_thres,
-            random_flip=config.random_flip,
             session_len_sec=config.session_len_sec,
             num_spks=config.num_spks,
             featurizer=featurizer,
             window_stride=self.cfg_e2e_diarizer_model.preprocessor.window_stride,
-            emb_batch_size=100,
-            pairwise_infer=False,
             global_rank=global_rank,
-            encoder_infer_mode=self.encoder_infer_mode,
             soft_targets=config.soft_targets if 'soft_targets' in config else False,
         )
         logging.info(f"AAB: Dataloader dataset is created, starting torch.utils.data.Dataloader step B: {time.time() - time_flag}")
@@ -679,13 +671,11 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
                 sample_duration_sec = self.min_sample_duration + random.random() * (audio_signal_sec - self.min_sample_duration)
                 sample_offset_sec = random.random() * (audio_signal_sec - sample_duration_sec)
                 sample_length = int(sample_duration_sec * self.preprocessor._sample_rate)
-#                sample_offset = int(sample_offset_sec * self.preprocessor._sample_rate)
                 samples_per_frame = self.preprocessor._sample_rate * self.cfg_e2e_diarizer_model.interpolated_scale / 2
                 sample_duration_frames = int(sample_length / samples_per_frame) + 1
-#                sample_offset_frames = int(sample_offset / samples_per_frame + 0.5)
                 sample_offset_frames = int(sample_offset_sec * 2 / self.cfg_e2e_diarizer_model.interpolated_scale)
                 sample_offset = int(sample_offset_frames * samples_per_frame)
-                #check if subsegment is good
+                # check if subsegment is good
                 targets_from_offset = targets[:,sample_offset_frames:sample_offset_frames+check_window,:]
                 #logging.info(f"offset={sample_offset_frames} frames, targets from offset: {targets_from_offset}")
                 num_spks = torch.max(torch.sum(torch.max(targets_from_offset, dim=1).values, dim=1))
@@ -713,17 +703,12 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             audio_signal = audio_signal[:,sample_offset:sample_offset+sample_length]
             audio_signal_length[:] = sample_length
             targets = targets[:, sample_offset_frames:sample_offset_frames+sample_duration_frames, :]
-#            logging.info(f"samples_per_frame: {samples_per_frame}, sample_duration_sec={sample_duration_sec}, sample_offset_sec={sample_offset_sec}")
-#            logging.info(f"sample_length: {sample_length}, sample_offset: {sample_offset}, sample_duration_frames:{sample_duration_frames}, sample_offset_frames:{sample_offset_frames}")
 
         sequence_lengths = audio_signal_length
-#        logging.info(f"audio signal shape: {audio_signal.shape}, audio signal length: {audio_signal_length}, targets shape: {targets.shape}")
         preds, _preds, attn_score_stack, preds_list, encoder_states_list = self.forward(
             audio_signal=audio_signal,
             audio_signal_length=audio_signal_length,
-            # is_raw_waveform_input=False,
         )
-
         # Arrival-time sorted (ATS) targets
         targets_ats = self.sort_probs_and_labels(targets.clone(), discrete=False, accum_frames=self.sort_accum_frames)
         # Optimally permuted targets for Permutation-Invariant Loss (PIL)

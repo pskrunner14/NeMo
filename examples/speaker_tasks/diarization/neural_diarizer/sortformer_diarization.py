@@ -57,6 +57,7 @@ from nemo.core.config import hydra_runner
 
 
 seed_everything(42)
+torch.backends.cudnn.deterministic = True
 
 @dataclass
 class DiarizationConfig:
@@ -75,7 +76,7 @@ class DiarizationConfig:
     eval_config_yaml: Optional[str] = None  # Path to a yaml file of config of evaluation
     presort_manifest: bool = True  # Significant inference speedup on short-form data due to padding reduction
     interpolated_scale: float=0.16
-    eval_mode: bool = False
+    eval_mode: bool = True
     no_der: bool = False
     use_new_pil: bool = False
     
@@ -112,15 +113,8 @@ class VadParams:
     shift_length_in_sec: float = 0.01
     smoothing: str = False
     overlap: float = 0.5
-    
-    ## Meeting
-    # onset: float = 0.5
-    # offset: float = 0.5
-    
-    ## Telephonic  
-    onset: float = 0.65
-    offset: float = 0.65
-    
+    onset: float = 0.5
+    offset: float = 0.5
     pad_onset: float = 0.0
     pad_offset: float = 0.0
     min_duration_on: float = 0.0

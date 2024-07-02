@@ -28,7 +28,7 @@ Note: make sure basename for each file is unique and rttm files also has the cor
 
 
 def main(
-    wav_path, text_path=None, rttm_path=None, uem_path=None, ctm_path=None, manifest_filepath=None, add_duration=False
+    wav_path, text_path=None, rttm_path=None, uem_path=None, ctm_path=None, seglst_path=None, manifest_filepath=None, add_duration=False
 ):
     create_manifest(
         wav_path,
@@ -37,6 +37,7 @@ def main(
         rttm_path=rttm_path,
         uem_path=uem_path,
         ctm_path=ctm_path,
+        seglst_path=seglst_path,
         add_duration=add_duration,
     )
 
@@ -50,6 +51,7 @@ if __name__ == "__main__":
     parser.add_argument("--paths2rttm_files", help="path to text file containing list of rttm files", type=str)
     parser.add_argument("--paths2uem_files", help="path to uem files", type=str)
     parser.add_argument("--paths2ctm_files", help="path to ctm files", type=str)
+    parser.add_argument("--paths2seglst_files", help="path to seglst files", type=str)
     parser.add_argument("--manifest_filepath", help="path to output manifest file", type=str, required=True)
     parser.add_argument(
         "--add_duration", help="add duration of audio files to output manifest files.", action='store_true',
@@ -62,6 +64,7 @@ if __name__ == "__main__":
         args.paths2rttm_files,
         args.paths2uem_files,
         args.paths2ctm_files,
+        args.paths2seglst_files,
         args.manifest_filepath,
         args.add_duration,
     )

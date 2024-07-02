@@ -229,14 +229,15 @@ class EncDecEESDModel(ModelPT, ExportableEncDecModel, ASRAdapterModelMixin):
         # preds = torch.cat([p1, p2], dim=0).cuda()
         # labels = torch.cat([p2, p1], dim=0).cuda()
         # lengths = torch.tensor([10, 10]).cuda()
-
+        speaker_inds = list(range(self._cfg.max_num_of_spks))
+        spk_perm = torch.tensor(list(itertools.permutations(speaker_inds)), device=preds.device)
         batch_size = labels.size(0)
         num_frames = labels.size(1)
         num_speakers = labels.size(2)
-        perm_size = self.spk_perm.shape[0]
-        permed_labels = labels[:, :, self.spk_perm]  # (batch_size, frame_len, perm_size, max_num_of_spks)
+        perm_size = spk_perm.shape[0]
+        permed_labels = labels[:, :, spk_perm]  # (batch_size, frame_len, perm_size, max_num_of_spks)
         permed_preds = torch.unsqueeze(preds, 2).repeat(
-            1, 1, self.spk_perm.shape[0], 1
+            1, 1, spk_perm.shape[0], 1
         )  # (batch_size, frame_len, perm_size, max_num_of_spks)
 
         flattened_permed_labels = rearrange(permed_labels, 'b t p s -> (b p) t s')
@@ -255,12 +256,12 @@ class EncDecEESDModel(ModelPT, ExportableEncDecModel, ASRAdapterModelMixin):
 
         best_perm_idx = torch.argmin(permed_loss, dim=1)  # (batch_size)
         best_loss = permed_loss[torch.arange(batch_size), best_perm_idx]  # (batch_size)
-        best_perm = self.spk_perm[best_perm_idx]  # (batch_size, num_speakers)
+        best_perm = spk_perm[best_perm_idx]  # (batch_size, num_speakers)
         best_permed_labels = permed_labels[
             torch.arange(batch_size), :, best_perm_idx
         ]  # (batch_size, frame_len, max_num_of_spks)
 
-        return best_permed_labels, best_perm, best_loss
+        return best_permed_labels.detach(), best_perm.detach(), best_loss
 
     def forward(
         self, input_signal=None, input_signal_length=None, processed_signal=None, processed_signal_length=None

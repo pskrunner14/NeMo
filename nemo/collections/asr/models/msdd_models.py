@@ -54,6 +54,7 @@ from nemo.collections.asr.parts.utils.speaker_utils import (
     get_uniq_id_list_from_manifest,
     labels_to_pyannote_object,
     make_rttm_with_overlap,
+    get_uniq_id_from_manifest_line,
     parse_scale_configs,
     rttm_to_labels,
 )
@@ -1408,6 +1409,7 @@ class NeuralDiarizer(LightningModule):
             f"     [Threshold: {threshold:.4f}] [use_clus_as_main={self.use_clus_as_main}] [diar_window={self.diar_window_length}]"
         )
         outputs = []
+        all_uems = []
         manifest_filepath = self.msdd_model.cfg.test_ds.manifest_filepath
         rttm_map = audio_rttm_map(manifest_filepath)
         for k, (collar, ignore_overlap) in enumerate(self.diar_eval_settings):

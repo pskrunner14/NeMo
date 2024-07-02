@@ -366,7 +366,10 @@ class ClusteringDiarizer(torch.nn.Module, Model, DiarizationMixin):
             for i, line in enumerate(manifest.readlines()):
                 line = line.strip()
                 dic = json.loads(line)
-                uniq_name = get_uniqname_from_filepath(dic['audio_filepath'])
+                if 'uniq_id' in dic and '#' not in dic:
+                    uniq_name = dic['uniq_id']
+                else:
+                    uniq_name = get_uniqname_from_filepath(dic['audio_filepath'])
                 if uniq_name in self.embeddings:
                     self.embeddings[uniq_name] = torch.cat((self.embeddings[uniq_name], all_embs[i].view(1, -1)))
                 else:
@@ -469,6 +472,7 @@ class ClusteringDiarizer(torch.nn.Module, Model, DiarizationMixin):
             all_reference,
             all_hypothesis,
             collar=self._diarizer_params.collar,
+            all_uem=None,
             ignore_overlap=self._diarizer_params.ignore_overlap,
             verbose=self.verbose,
         )

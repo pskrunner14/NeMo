@@ -22,9 +22,6 @@ python $BASEPATH/neural_diarizer/sortformer_diarization.py \
     dataset_manifest=/path/to/diarization_path_to_manifest.json
 
 """
-
-
-
 import pytorch_lightning as pl
 from omegaconf import OmegaConf
 from pytorch_lightning import seed_everything
@@ -36,6 +33,7 @@ from nemo.collections.asr.metrics.der import score_labels
 import os
 
 from dataclasses import dataclass, is_dataclass
+from tqdm import tqdm
 from typing import Optional, Union, List, Tuple, Dict
 
 from pyannote.core import Segment, Timeline
@@ -47,13 +45,31 @@ generate_diarization_output_lines,
 rttm_to_labels,
 )
 
-from tqdm import tqdm
+
+
 import pytorch_lightning as pl
 import torch
 import logging
 from omegaconf import OmegaConf
 from nemo.core.config import hydra_runner
 
+import optuna
+import os
+import tempfile
+import time
+import json
+import subprocess
+import logging
+
+
+def optuna_suggest_params(vad_cfg, trial):
+    vad_cfg.onset=trial.suggest_float("onset", 0.1, 0.9, step=0.01)
+    vad_cfg.offset=trial.suggest_float("offset", 0.1, 0.9, step=0.01)
+    vad_cfg.pad_onset=trial.suggest_float("pad_onset", 0.0, 0.25, step=0.01)
+    vad_cfg.pad_offset=trial.suggest_float("pad_offset", 0.0, 0.25, step=0.01)
+    vad_cfg.min_duration_on=trial.suggest_float("min_duration_on", 0.0, 0.25, step=0.01)
+    vad_cfg.min_duration_off=trial.suggest_float("min_duration_off", 0.0, 0.25, step=0.01)
+    return vad_cfg
 
 seed_everything(42)
 torch.backends.cudnn.deterministic = True
@@ -103,42 +119,27 @@ class DiarizationConfig:
     amp_dtype: str = "float16"  # can be set to "float16" or "bfloat16" when using amp
     matmul_precision: str = "highest"  # Literal["highest", "high", "medium"]
     audio_type: str = "wav"
-
-
+    
+    # Optuna configs
+    optuna_study_name: str = "no_name"
+    storage: str = f"sqlite:///{optuna_study_name}.db" 
+    output_log_file: str = f"{optuna_study_name}.log"
+    optuna_n_trials: int = 100000
 
 @dataclass
-class VadParams():
-    # Trial 192 finished with value: 0.09667451687982179 and parameters: {'onset': 0.6, 'offset': 0.53, 'pad_onset': 0.22, 'pad_offset': 0.06, 'min_duration_on': 0.09, 'min_duration_off': 0.23}. Best is trial 192 with value: 0.09667451687982179.
-    # Trial 403 finished with value: 0.09651966305372756 and parameters: {'onset': 0.62, 'offset': 0.5, 'pad_onset': 0.22, 'pad_offset': 0.06, 'min_duration_on': 0.06, 'min_duration_off': 0.21}. Best is trial 403 with value: 0.09651966305372756.
-    # Trial 630 finished with value: 0.0963342856936812 and parameters: {'onset': 0.63, 'offset': 0.58, 'pad_onset': 0.24, 'pad_offset': 0.1, 'min_duration_on': 0.1, 'min_duration_off': 0.23}. Best is trial 630 with value: 0.0963342856936812.
-    opt_style = "callhome_part1"
-    if opt_style == "callhome_part1":
-        window_length_in_sec: float = 0.15
-        shift_length_in_sec: float = 0.01
-        smoothing: str = False
-        overlap: float = 0.5
-        onset: float = 0.6
-        offset: float = 0.53
-        pad_onset: float = 0.22
-        pad_offset: float = 0.06
-        min_duration_on: float = 0.09
-        min_duration_off: float = 0.23
-        filter_speech_first: bool = True
-    elif opt_style == "ami_dev":
-        window_length_in_sec: float = 0.15
-        shift_length_in_sec: float = 0.01
-        smoothing: str = False
-        overlap: float = 0.5
-        onset: float = 0.5
-        offset: float = 0.5
-        pad_onset: float = 0.0
-        pad_offset: float = 0.0
-        min_duration_on: float = 0.0
-        min_duration_off: float = 0.0
-        filter_speech_first: bool = True
-    else:
-        raise ValueError(f"Unknown opt_style: {opt_style}")
-        
+class VadParams:
+    window_length_in_sec: float = 0.15
+    shift_length_in_sec: float = 0.01
+    smoothing: str = False
+    overlap: float = 0.5
+    onset: float = 0.5
+    offset: float = 0.5
+    pad_onset: float = 0.0
+    pad_offset: float = 0.0
+    min_duration_on: float = 0.0
+    min_duration_off: float = 0.2
+    filter_speech_first: bool = True
+
 def timestamps_to_pyannote_object(speaker_timestamps: List[Tuple[float, float]],
                                   uniq_id: str, 
                                   audio_rttm_values: Dict[str, str], 
@@ -253,6 +254,7 @@ def get_uem_object(uem_lines: List[List[float]], uniq_id: str):
 
 def convert_pred_mat_to_segments(
     audio_rttm_map_dict: Dict[str, Dict[str, str]], 
+    vad_cfg,
     batch_preds_list: List[torch.Tensor], 
     unit_10ms_frame_count:int = 8,
     bypass_postprocessing: bool = False,
@@ -273,7 +275,8 @@ def convert_pred_mat_to_segments(
        all_uems (list): list of pyannote objects for each audio file.
     """
     batch_pred_ts_segs, all_hypothesis, all_reference, all_uems = [], [], [], []
-    cfg_vad_params = OmegaConf.structured(VadParams())
+    cfg_vad_params = OmegaConf.structured(vad_cfg)
+    # for sample_idx, (uniq_id, audio_rttm_values) in enumerate(audio_rttm_map_dict.items()):
     for sample_idx, (uniq_id, audio_rttm_values) in tqdm(enumerate(audio_rttm_map_dict.items()), total=len(audio_rttm_map_dict), desc="Running post-processing"):
         spk_ts = []
         offset, duration = audio_rttm_values['offset'], audio_rttm_values['duration']
@@ -298,6 +301,34 @@ def convert_pred_mat_to_segments(
                                                                             )
         batch_pred_ts_segs.append(spk_ts) 
     return all_hypothesis, all_reference, all_uems
+
+def diarization_objective(
+    trial, 
+    vad_cfg, 
+    temp_out_dir, 
+    infer_audio_rttm_dict, 
+    diar_model_preds_total_list, 
+    collar: float=0.25, 
+    ignore_overlap: bool=False
+    ):
+    with tempfile.TemporaryDirectory(dir=temp_out_dir, prefix="Diar_PostProcessing_") as local_temp_out_dir:
+        if trial is not None:
+            vad_cfg = optuna_suggest_params(vad_cfg, trial) 
+        all_hyps, all_refs, all_uems = convert_pred_mat_to_segments(infer_audio_rttm_dict, 
+                                                                    vad_cfg=vad_cfg, 
+                                                                    batch_preds_list=diar_model_preds_total_list, 
+                                                                    unit_10ms_frame_count=8,
+                                                                    bypass_postprocessing=False)
+        metric, mapping_dict, itemized_errors = score_labels(AUDIO_RTTM_MAP=infer_audio_rttm_dict, 
+                                                            all_reference=all_refs, 
+                                                            all_hypothesis=all_hyps, 
+                                                            all_uem=all_uems, 
+                                                            collar=collar, 
+                                                            ignore_overlap=ignore_overlap
+                                                            )
+        der = abs(metric)
+    return der
+    
 
 @hydra_runner(config_name="DiarizationConfig", schema=DiarizationConfig)
 def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
@@ -364,28 +395,43 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     diar_model.sortformer_diarizer.step_len = cfg.step_len
     diar_model.sortformer_diarizer.mem_len = cfg.mem_len
     diar_model.save_tensor_images = cfg.save_tensor_images
-    diar_model.test_batch()
-    # import ipdb; ipdb.set_trace() 
-    # Save the list of tensors
+   
+    # Check if the saved tensor exists:
     tensor_filename = os.path.basename(cfg.dataset_manifest).replace("manifest.", "").replace(".json", "")
-    save_path = f"/disk_a/models/sortformer_diarization/im303a_ft7_ep19_last/pred_tensors/{tensor_filename}.pt"
-    torch.save(diar_model.preds_total_list, save_path)
+    model_base_path = os.path.dirname(cfg.model_path)
+    tensor_path = f"{model_base_path}/pred_tensors/{tensor_filename}.pt"
+    if os.path.exists(tensor_path):
+        logging.info(f"Loading the saved tensors from {tensor_path}...")
+        diar_model_preds_total_list = torch.load(tensor_path)
+    else:
+        diar_model.test_batch()
+        torch.save(diar_model.preds_total_list, tensor_path)
+    # if temp_out_dir does not exist, create it:
+    temp_out_dir = os.path.join(model_base_path, "temp_out_dir")
+    if not os.path.exists(temp_out_dir):
+        os.makedirs(temp_out_dir)
     
-    # Evaluation
-    if not cfg.no_der:
-        all_hyps, all_refs, all_uems = convert_pred_mat_to_segments(infer_audio_rttm_dict, 
-                                                                    batch_preds_list=diar_model.preds_total_list, 
-                                                                    unit_10ms_frame_count=8,
-                                                                    bypass_postprocessing=cfg.bypass_postprocessing)
-        logging.info(f"Evaluating the model on the {len(diar_model.preds_total_list)} audio segments...")
-        metric, mapping_dict, itemized_errors = score_labels(AUDIO_RTTM_MAP=infer_audio_rttm_dict, 
-                                                            all_reference=all_refs, 
-                                                            all_hypothesis=all_hyps, 
-                                                            all_uem=all_uems, 
-                                                            collar=cfg.collar, 
-                                                            ignore_overlap=cfg.ignore_overlap
-                                                            )
-        print("VadParams:", VadParams())
+    vad_cfg = VadParams() 
+    worker_function = lambda trial: diarization_objective(
+        trial=trial,
+        vad_cfg=vad_cfg,
+        temp_out_dir=temp_out_dir,
+        infer_audio_rttm_dict=infer_audio_rttm_dict, 
+        diar_model_preds_total_list=diar_model_preds_total_list,
+    )
+    study = optuna.create_study(
+        direction="minimize", 
+        study_name=cfg.optuna_study_name, 
+        storage=cfg.storage, 
+        load_if_exists=True
+    )
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)  # Setup the root logger.
+    if cfg.output_log_file is not None:
+        logger.addHandler(logging.FileHandler(cfg.output_log_file, mode="a"))
+    logger.addHandler(logging.StreamHandler())
+    optuna.logging.enable_propagation()  # Propagate logs to the root logger.
+    study.optimize(worker_function, n_trials=cfg.optuna_n_trials)
 
 if __name__ == '__main__':
     main()

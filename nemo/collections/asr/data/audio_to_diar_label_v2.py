@@ -576,7 +576,6 @@ class _AudioMSDDInferDataset(Dataset):
         sample = self.collection[index]
         if sample.offset is None:
             sample.offset = 0
-
         # uniq_id = os.path.splitext(os.path.basename(sample.audio_file))[0]
         uniq_id = sample.uniq_id
         scale_n = len(self.emb_dict.keys())
@@ -588,6 +587,7 @@ class _AudioMSDDInferDataset(Dataset):
             avg_embs = _avg_embs
 
         if avg_embs.shape[2] > self.max_spks:
+            import ipdb; ipdb.set_trace()
             raise ValueError(
                 f" avg_embs.shape[2] {avg_embs.shape[2]} should be less than or equal to self.max_num_speakers {self.max_spks}"
             )

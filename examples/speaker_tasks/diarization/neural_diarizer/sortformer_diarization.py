@@ -22,9 +22,6 @@ python $BASEPATH/neural_diarizer/sortformer_diarization.py \
     dataset_manifest=/path/to/diarization_path_to_manifest.json
 
 """
-
-
-
 import pytorch_lightning as pl
 from omegaconf import OmegaConf
 from pytorch_lightning import seed_everything
@@ -104,27 +101,49 @@ class DiarizationConfig:
     matmul_precision: str = "highest"  # Literal["highest", "high", "medium"]
     audio_type: str = "wav"
 
-
+    # Optuna Config
+    optuna_study_name: str = "diar_study"
+    storage: str = f"sqlite:///{optuna_study_name}.db"
+    output_log_file: str = f"{optuna_study_name}.log"
+    optuna_n_trials: int = 100000
 
 @dataclass
 class VadParams():
-    # Trial 192 finished with value: 0.09667451687982179 and parameters: {'onset': 0.6, 'offset': 0.53, 'pad_onset': 0.22, 'pad_offset': 0.06, 'min_duration_on': 0.09, 'min_duration_off': 0.23}. Best is trial 192 with value: 0.09667451687982179.
-    # Trial 403 finished with value: 0.09651966305372756 and parameters: {'onset': 0.62, 'offset': 0.5, 'pad_onset': 0.22, 'pad_offset': 0.06, 'min_duration_on': 0.06, 'min_duration_off': 0.21}. Best is trial 403 with value: 0.09651966305372756.
-    # Trial 630 finished with value: 0.0963342856936812 and parameters: {'onset': 0.63, 'offset': 0.58, 'pad_onset': 0.24, 'pad_offset': 0.1, 'min_duration_on': 0.1, 'min_duration_off': 0.23}. Best is trial 630 with value: 0.0963342856936812.
+    # Trial 2522 finished with value: 0.09605644326924494 and parameters: {'onset': 0.62, 'offset': 0.57, 'pad_onset': 0.23, 'pad_offset': 0.09, 'min_duration_on': 0.13, 'min_duration_off': 0.25}. Best is trial 2522 with value: 0.09605644326924494. (im303a e19last)
+    # Trial 3683 finished with value: 0.09960175732817779 and parameters: {'onset': 0.6, 'offset': 0.6, 'pad_onset': 0.22, 'pad_offset': 0.1, 'min_duration_on': 0.06, 'min_duration_off': 0.25}. Best is trial 3683 with value: 0.09960175732817779. (im303a e6-e19)
     opt_style = "callhome_part1"
+    # opt_style = None
     if opt_style == "callhome_part1":
         window_length_in_sec: float = 0.15
         shift_length_in_sec: float = 0.01
         smoothing: str = False
         overlap: float = 0.5
-        onset: float = 0.6
-        offset: float = 0.53
-        pad_onset: float = 0.22
-        pad_offset: float = 0.06
-        min_duration_on: float = 0.09
-        min_duration_off: float = 0.23
+        onset: float = 0.62
+        offset: float = 0.57
+        pad_onset: float = 0.23
+        pad_offset: float = 0.09
+        min_duration_on: float = 0.13
+        min_duration_off: float = 0.25
+        # onset: float = 0.6
+        # offset: float = 0.53
+        # pad_onset: float = 0.22
+        # pad_offset: float = 0.06
+        # min_duration_on: float = 0.09
+        # min_duration_off: float = 0.23
         filter_speech_first: bool = True
     elif opt_style == "ami_dev":
+        window_length_in_sec: float = 0.15
+        shift_length_in_sec: float = 0.01
+        smoothing: str = False
+        overlap: float = 0.5
+        onset: float = 0.5
+        offset: float = 0.5
+        pad_onset: float = 0.0
+        pad_offset: float = 0.0
+        min_duration_on: float = 0.0
+        min_duration_off: float = 0.0
+        filter_speech_first: bool = True
+    elif opt_style is None:
         window_length_in_sec: float = 0.15
         shift_length_in_sec: float = 0.01
         smoothing: str = False
@@ -253,6 +272,7 @@ def get_uem_object(uem_lines: List[List[float]], uniq_id: str):
 
 def convert_pred_mat_to_segments(
     audio_rttm_map_dict: Dict[str, Dict[str, str]], 
+    vad_cfg, 
     batch_preds_list: List[torch.Tensor], 
     unit_10ms_frame_count:int = 8,
     bypass_postprocessing: bool = False,
@@ -273,7 +293,7 @@ def convert_pred_mat_to_segments(
        all_uems (list): list of pyannote objects for each audio file.
     """
     batch_pred_ts_segs, all_hypothesis, all_reference, all_uems = [], [], [], []
-    cfg_vad_params = OmegaConf.structured(VadParams())
+    cfg_vad_params = OmegaConf.structured(vad_cfg)
     for sample_idx, (uniq_id, audio_rttm_values) in tqdm(enumerate(audio_rttm_map_dict.items()), total=len(audio_rttm_map_dict), desc="Running post-processing"):
         spk_ts = []
         offset, duration = audio_rttm_values['offset'], audio_rttm_values['duration']
@@ -364,20 +384,27 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     diar_model.sortformer_diarizer.step_len = cfg.step_len
     diar_model.sortformer_diarizer.mem_len = cfg.mem_len
     diar_model.save_tensor_images = cfg.save_tensor_images
-    diar_model.test_batch()
-    # import ipdb; ipdb.set_trace() 
     # Save the list of tensors
     tensor_filename = os.path.basename(cfg.dataset_manifest).replace("manifest.", "").replace(".json", "")
-    save_path = f"/disk_a/models/sortformer_diarization/im303a_ft7_ep19_last/pred_tensors/{tensor_filename}.pt"
-    torch.save(diar_model.preds_total_list, save_path)
-    
+    model_base_path = os.path.dirname(cfg.model_path)
+    tensor_path = f"{model_base_path}/pred_tensors/{tensor_filename}.pt"
+    if os.path.exists(tensor_path):
+        logging.info(f"Loading the saved tensors from {tensor_path}...")
+        diar_model_preds_total_list = torch.load(tensor_path)
+    else:
+        diar_model.test_batch()
+        diar_model_preds_total_list = diar_model.preds_total_list
+        torch.save(diar_model_preds_total_list, tensor_path)
+
     # Evaluation
+    vad_cfg = VadParams()
     if not cfg.no_der:
-        all_hyps, all_refs, all_uems = convert_pred_mat_to_segments(infer_audio_rttm_dict, 
-                                                                    batch_preds_list=diar_model.preds_total_list, 
+        all_hyps, all_refs, all_uems = convert_pred_mat_to_segments(infer_audio_rttm_dict,
+                                                                    vad_cfg=vad_cfg, 
+                                                                    batch_preds_list=diar_model_preds_total_list, 
                                                                     unit_10ms_frame_count=8,
                                                                     bypass_postprocessing=cfg.bypass_postprocessing)
-        logging.info(f"Evaluating the model on the {len(diar_model.preds_total_list)} audio segments...")
+        logging.info(f"Evaluating the model on the {len(diar_model_preds_total_list)} audio segments...")
         metric, mapping_dict, itemized_errors = score_labels(AUDIO_RTTM_MAP=infer_audio_rttm_dict, 
                                                             all_reference=all_refs, 
                                                             all_hypothesis=all_hyps, 

@@ -129,7 +129,7 @@ def audio_rttm_map(manifest, attach_dur=False):
     AUDIO_RTTM_MAP = {}
     with open(manifest, 'r') as inp_file:
         lines = inp_file.readlines()
-        # logging.info("Number of files to diarize: {}".format(len(lines)))
+        logging.info("Number of files to diarize: {}".format(len(lines)))
         for line in lines:
             line = line.strip()
             dic = json.loads(line)
@@ -151,6 +151,7 @@ def audio_rttm_map(manifest, attach_dur=False):
                     uniqname = dic['uniq_id']
                 else:
                     uniqname = get_uniqname_from_filepath(filepath=meta['audio_filepath'])
+            meta['uniq_id'] = uniqname
 
             if uniqname not in AUDIO_RTTM_MAP:
                 AUDIO_RTTM_MAP[uniqname] = meta
@@ -477,9 +478,6 @@ def generate_cluster_labels(segment_ranges: List[str], cluster_labels: List[int]
         if offset is not None:
             stt = float(stt) + offset
             end = float(end) + offset
-        if 20 <= idx <= 24:
-            print(f"idx: {idx}, stt: {stt}, end: {end}, label:{label}")
-            import ipdb; ipdb.set_trace()
         lines.append(f"{stt} {end} {tag}")
     cont_lines = get_contiguous_stamps(lines)
     diar_hyp = merge_stamps(cont_lines)
@@ -1289,7 +1287,7 @@ def segments_manifest_to_subsegments_manifest(
             if include_uniq_id and 'uniq_id' in dic and dic['uniq_id'] is not None:
                 uniq_id = dic['uniq_id']
             else:
-                uniq_id = None
+                uniq_id = get_uniq_id_from_manifest_line(segment)
             for subsegment in subsegments:
                 start, dur = subsegment
                 if dur > min_subsegment_duration:
@@ -2016,10 +2014,11 @@ def get_id_tup_dict(uniq_id_list: List[str], test_data_collection, preds_list: L
     session_dict = {x: [] for x in uniq_id_list}
     for idx, line in enumerate(test_data_collection):
         # If the manifest file contains multi-channel files for a session, get `uniq_id` value from the `test_data_collection`.
-        if isinstance(line.audio_file, list):
-            uniq_id = line.uniq_id
-        else:
-            uniq_id = get_uniqname_from_filepath(line.audio_file)
+        # if isinstance(line.audio_file, list):
+        #     uniq_id = line.uniq_id
+        # else:
+        #     uniq_id = get_uniqname_from_filepath(line.audio_file)
+        uniq_id = line.uniq_id
         session_dict[uniq_id].append([line.target_spks, preds_list[idx]])
     return session_dict
 
@@ -2166,8 +2165,10 @@ def uem_timeline_from_manifest(manifest_dic, uniq_name):
      UNIQ_SPEAKER_ID CHANNEL START_TIME END_TIME
     """
     timeline = Timeline(uri=uniq_name)
-    start_time = float(manifest_dic[uniq_name]['offset']) 
-    end_time = start_time + float(manifest_dic[uniq_name]['duration'])
+    # start_time = float(manifest_dic[uniq_name]['offset']) 
+    # end_time = start_time + float(manifest_dic[uniq_name]['duration'])
+    start_time = float(manifest_dic['offset']) 
+    end_time = start_time + float(manifest_dic['duration'])
     timeline.add(Segment(float(start_time), float(end_time)))
     return timeline
 
@@ -2207,6 +2208,7 @@ def make_rttm_with_overlap(
     no_references = False
     with open(manifest_file_path, 'r', encoding='utf-8') as manifest:
         for i, line in enumerate(manifest.readlines()):
+            uniq_id = get_uniq_id_from_manifest_line(line)
             manifest_dic = AUDIO_RTTM_MAP[uniq_id]
             if 'uniq_id' in manifest_dic:
                 uniq_id = manifest_dic['uniq_id']
@@ -2214,14 +2216,14 @@ def make_rttm_with_overlap(
                 uniq_id = get_uniq_id_from_manifest_line(line)
                 
             clus_labels = clus_label_dict[uniq_id]
-            if 'offset' in manifest_dic and 'duration' in manifest_dic:
+            # if 'offset' in manifest_dic and 'duration' in manifest_dic:
+            if manifest_dic['offset'] is not None and manifest_dic['duration'] is not None:
                 offset, dur = float(manifest_dic['offset']), float(manifest_dic['duration'])
                 uem_lines = [[offset, dur+offset]] 
                 uem_obj = get_uem_object(uem_lines, uniq_id=uniq_id)
                 all_uems.append(uem_obj)
             else:
                 all_uems = None
-            # import ipdb; ipdb.set_trace()
             manifest_file_lengths_list.append(len(clus_labels))
             maj_labels, ovl_labels = generate_speaker_timestamps(clus_labels, msdd_preds[i], **params)
             if params['infer_overlap']:

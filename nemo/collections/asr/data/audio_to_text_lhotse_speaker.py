@@ -16,29 +16,14 @@ from typing import Dict, Optional, Tuple
 
 import torch.utils.data
 from lhotse.dataset import AudioSamples
-from lhotse.dataset.collation import collate_vectors
-
+from lhotse.dataset.collation import collate_vectors, collate_matrices
+from lhotse.utils import compute_num_samples
 from lhotse import SupervisionSet
-from lhotse.dataset.collation import collate_matrices
+
 from pathlib import Path
 import numpy as np
-from lhotse.utils import (
-    Decibels,
-    Pathlike,
-    Seconds,
-    SetContainingAnything,
-    add_durations,
-    asdict_nonull,
-    compute_num_samples,
-    compute_num_windows,
-    compute_start_duration_for_extended_cut,
-    fastcopy,
-    ifnone,
-    overlaps,
-    to_hashable,
-)
 
-
+from nemo.collections.asr.data.audio_to_text_lhotse import TokenizerWrapper
 from nemo.collections.common.tokenizers.aggregate_tokenizer import AggregateTokenizer
 from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
@@ -46,7 +31,7 @@ from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralT
 
 class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
     """
-    This dataset is based on BPE datasets from audio_to_text.py.
+    This dataset is based on BPE datasets from audio_to_text.py. It has the same functionality of LhotseSpeechToTextBpeDataset but also yield speaker target tensor.
     Unlike native NeMo datasets, Lhotse dataset defines only the mapping from
     a CutSet (meta-data) to a mini-batch with PyTorch tensors.
     Specifically, it performs tokenization, I/O, augmentation, and feature extraction (if any).
@@ -91,7 +76,18 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
 
     def speaker_to_target(self, cut, num_speakers: int = 4, num_sample_per_mel_frame: int = 160, num_mel_frame_per_asr_frame: int = 8, spk_tar_all_zero: bool = False):
         '''
-        get rttm samples corresponding to one cut, generate speaker_audio_mask numpy.ndarray
+        get rttm samples corresponding to one cut, generate speaker mask numpy.ndarray with shape (num_speaker, hidden_length)
+
+        Args:
+            cut: An audio cut
+            num_speakers: max number of speakers for all cuts ("mask" dim0), 4 by default
+            num_sample_per_mel_frame: number of sample per mel frame, sample_rate / 1000 * window_stride, 160 by default (10ms window stride)
+            num_mel_frame_per_asr_frame: encoder subsampling_factor, 8 by default
+            spk_tar_all_zero: set to True gives all zero "mask"
+        
+        Returns:
+            mask: speaker mask with shape (num_speaker, hidden_lenght)
+
         '''
 
         #get cut-related segments from rttms
@@ -112,8 +108,8 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
         }
 
         
-        #initialize mask matrices (num_speaker, encoder_hidden)
-        mask = np.zeros((num_speakers, int(np.ceil(np.ceil((cut.num_samples + 1) / num_sample_per_mel_frame) / num_mel_frame_per_asr_frame))))
+        #initialize mask matrices (num_speaker, encoder_hidden_len)
+        mask = np.zeros((num_speakers, self.get_hidden_length_from_sample_length(cut.num_samples, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)))
 
         if not spk_tar_all_zero:
             for rttm_sup in segments:
@@ -130,34 +126,10 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
                                 if rttm_sup.end < cut.duration
                                 else compute_num_samples(rttm_sup.duration, cut.sampling_rate)
                             )                   
-                    mask[speaker_idx, int(np.ceil(np.ceil((st + 1) / num_sample_per_mel_frame) / num_mel_frame_per_asr_frame)):int(np.ceil(np.ceil((et + 1) / num_sample_per_mel_frame) / num_mel_frame_per_asr_frame))] = 1
+                    mask[speaker_idx, self.get_hidden_length_from_sample_length(st, num_sample_per_mel_frame, num_mel_frame_per_asr_frame):self.get_hidden_length_from_sample_length(et, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)] = 1
 
         return mask
 
-
-class TokenizerWrapper:
-    """
-    Provide a unified interface for NeMo Tokenizer, AggregateTokenizer, and (char) Parser.
-    """
-
-    def __init__(self, tokenizer):
-        self._tokenizer = tokenizer
-        if isinstance(tokenizer, AggregateTokenizer):
-            self._impl = self._call_agg_tokenizer
-        elif isinstance(tokenizer, TokenizerSpec):
-            self._impl = self._call_tokenizer
-        else:
-            self._impl = self._call_parser
-
-    def __call__(self, text: str, lang: str | None = None):
-        return self._impl(text, lang)
-
-    def _call_agg_tokenizer(self, text: str, lang: str | None = None):
-        assert lang is not None, "Expected 'lang' to be set for AggregateTokenizer."
-        return self._tokenizer.text_to_ids(text, lang)
-
-    def _call_tokenizer(self, text: str, lang: str | None = None):
-        return self._tokenizer.text_to_ids(text)
-
-    def _call_parser(self, text: str, lang: str | None = None):
-        return self._tokenizer(text)
+    @staticmethod
+    def get_hidden_length_from_sample_length(num_samples: int, num_sample_per_mel_frame: int = 160, num_mel_frame_per_asr_frame: int = 8):
+        return int(np.ceil(np.ceil((num_samples + 1) / num_sample_per_mel_frame) / num_mel_frame_per_asr_frame))

@@ -97,12 +97,8 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
             manifest_filepath = os.path.join(config['temp_dir'], 'manifest.json')
             batch_size = min(config['batch_size'], len(config['paths2audio_files']))
 
-        if 'rttm_filepath' in config:
-            rttm_filepath = config['rttm_filepath']
-
         dl_config = {
             'manifest_filepath': manifest_filepath,
-            'rttm_filepath': rttm_filepath,
             'sample_rate': self.preprocessor._sample_rate,
             'batch_size': batch_size,
             'shuffle': False,

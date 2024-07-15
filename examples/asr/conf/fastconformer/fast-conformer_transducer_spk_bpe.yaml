@@ -52,14 +52,13 @@ model:
     enc_hidden: ${model.encoder.d_model}
     pred_hidden: 640
     joint_hidden: 640
-    num_speakers: 4 #specifies the max number of speaker, fixed dimension of spk_targets
-    spk_tar_all_zero: false #specifies whether set spk_targets tensor to be all 0
+    num_speakers: 4 # specifies the max number of speaker, fixed dimension of spk_targets
+    spk_tar_all_zero: false # specifies whether set spk_targets tensor to be all 0
     num_sample_per_mel_frame: 160 # sample_rate / 1000 * window_stride
-    num_mel_frame_per_asr_frame: 8 #subsampling_factor
+    num_mel_frame_per_asr_frame: 8 # subsampling_factor
 
   train_ds:
     manifest_filepath: ???
-    rttm_filepath: ???
     sample_rate: ${model.sample_rate}
     batch_size: 16 # you may increase batch_size if your memory allows
     shuffle: true
@@ -81,7 +80,6 @@ model:
 
   validation_ds:
     manifest_filepath: ???
-    rttm_filepath: ???
     sample_rate: ${model.sample_rate}
     batch_size: 16
     shuffle: false
@@ -95,7 +93,6 @@ model:
 
   test_ds:
     manifest_filepath: null
-    rttm_filepath: ???
     sample_rate: ${model.sample_rate}
     batch_size: 16
     shuffle: false

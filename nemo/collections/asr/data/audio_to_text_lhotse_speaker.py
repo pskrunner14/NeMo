@@ -20,7 +20,6 @@ from lhotse.dataset.collation import collate_vectors, collate_matrices
 from lhotse.utils import compute_num_samples
 from lhotse import SupervisionSet
 
-from pathlib import Path
 import numpy as np
 
 from nemo.collections.asr.data.audio_to_text_lhotse import TokenizerWrapper
@@ -55,7 +54,6 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
         self.tokenizer = TokenizerWrapper(tokenizer)
         self.load_audio = AudioSamples(fault_tolerant=True)
         self.cfg = cfg
-        self.rttms = SupervisionSet.from_rttm(Path(self.cfg.rttm_filepath).rglob('*.rttm'))
         self.spk_tar_all_zero = self.cfg.get('spk_tar_all_zero',False)
         self.num_speakers = self.cfg.get('num_speakers', 4)
         self.num_sample_per_mel_frame = self.cfg.get('num_sample_per_mel_frame', 160)
@@ -86,12 +84,13 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
             spk_tar_all_zero: set to True gives all zero "mask"
         
         Returns:
-            mask: speaker mask with shape (num_speaker, hidden_lenght)
+            mask: speaker mask with shape (num_speaker, hidden_length)
 
         '''
 
-        #get cut-related segments from rttms
-        segments_iterator = self.rttms.find(recording_id=cut.recording_id, start_after=cut.start, end_before=cut.end, adjust_offset=True)
+        #get cut-related segments from rttm of this cut's original recording
+        rttms = SupervisionSet.from_rttm(cut.rttm_filepath)
+        segments_iterator = rttms.find(recording_id=cut.recording_id, start_after=cut.start, end_before=cut.end, adjust_offset=True)
 
         segments = [s for s in segments_iterator]
 
@@ -107,9 +106,9 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
                 for idx, spk in enumerate(speaker_ats)
         }
 
-        
         #initialize mask matrices (num_speaker, encoder_hidden_len)
-        mask = np.zeros((num_speakers, self.get_hidden_length_from_sample_length(cut.num_samples, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)))
+        encoder_hidden_len = self.get_hidden_length_from_sample_length(cut.num_samples, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
+        mask = np.zeros((num_speakers, encoder_hidden_len))
 
         if not spk_tar_all_zero:
             for rttm_sup in segments:
@@ -126,7 +125,13 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
                                 if rttm_sup.end < cut.duration
                                 else compute_num_samples(rttm_sup.duration, cut.sampling_rate)
                             )                   
-                    mask[speaker_idx, self.get_hidden_length_from_sample_length(st, num_sample_per_mel_frame, num_mel_frame_per_asr_frame):self.get_hidden_length_from_sample_length(et, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)] = 1
+                    
+                    #map start time (st) and end time (et) to encoded hidden location
+                    st_encoder_loc = self.get_hidden_length_from_sample_length(st, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
+                    et_encoder_loc = self.get_hidden_length_from_sample_length(et, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
+
+
+                    mask[speaker_idx, st_encoder_loc:et_encoder_loc] = 1
 
         return mask
 

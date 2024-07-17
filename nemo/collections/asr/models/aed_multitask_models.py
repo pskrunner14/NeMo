@@ -993,6 +993,11 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
             self.diar = True
             # Initialize the speaker branch
             self._init_diar_model()
+
+            if 'max_num_speakers' in cfg:
+                self.max_num_speakers = cfg.max_num_speakers
+            else:
+                self.max_num_speakers = 4
             
             # layer normalization, ln, l2, or None
             if 'norm' in cfg:
@@ -1021,30 +1026,18 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
                 self.segment_shift = cfg.segment_shift
             else:
                 self.segment_shift = 8
+
+            self.diar_kernel_type = 'projection'
+            self.diar_kernal = self.joint_proj
+
+            if 'diar_kernel_type' in cfg:
+                if cfg.diar_kernel_type == 'sinusoidal':
+                    self.diar_kernel_type = cfg.diar_kernel_type
+                    self.diar_kernel = self.get_sinusoid_position_encoding(self.max_num_speakers, cfg.model_defaults.asr_enc_hidden)
+
         else:
             self.diar = False
             
-
-    # def _init_spk_model(self):
-    #     """
-    #     Initialize the speaker model.
-    #     """
-    #     self.spk_preprocessor = EncDecSpeakerLabelModel.from_config_dict(self.cfg.spk_preprocessor)
-    #     self.spk_encoder = EncDecSpeakerLabelModel.from_config_dict(self.cfg.spk_encoder)
-    #     self.spk_decoder = EncDecSpeakerLabelModel.from_config_dict(self.cfg.spk_decoder)
-
-    #     model_path = self.cfg.spk_model_path
-    #     if model_path is None:
-    #         model_path = 'titanet_small'
-    #     pretrained_spk_model = EncDecSpeakerLabelModel.from_pretrained(model_path, map_location="cpu")
-
-    #     logging.info("Restoring Speaker model from pretrained model.")
-    #     self.spk_encoder.load_state_dict(pretrained_spk_model.encoder.state_dict(), strict=True)
-    #     self.spk_decoder.load_state_dict(pretrained_spk_model.decoder.state_dict(), strict=True)
-
-    #     if self.cfg.freeze_spk:
-    #        self.spk_encoder.eval()
-    #        self.spk_decoder.eval()
 
     def _init_diar_model(self):
         """
@@ -1096,7 +1089,8 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
             self.encoder_decoder_proj.eval()
             if self.use_transf_encoder:
                 self.transf_encoder.eval()
-                
+
+
     def forward_asr(
         self,
         input_signal=None,
@@ -1254,17 +1248,30 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
 
         return extended_diar_preds
 
-    def kernel_diarization(
-        self,
-        asr_encoded_states,
-        diarization_preds,
-        kernel_strategy = "fixed"
-    ):
+    def get_sinusoid_position_encoding(self, max_position, embedding_dim):
         """
-        asr_encoded_states: Output from ASR encoder of shape [B, T, D]
-        diarization_preds: diarization output of shape [4, T, D]
+        Generates a sinusoid position encoding matrix.
+        
+        Args:
+        - max_position (int): The maximum position to generate encodings for.
+        - embedding_dim (int): The dimension of the embeddings.
+        
+        Returns:
+        - torch.Tensor: A tensor of shape (max_position, embedding_dim) containing the sinusoid position encodings.
         """
+        position = np.arange(max_position)[:, np.newaxis]
+        div_term = np.exp(np.arange(0, embedding_dim, 2) * -(np.log(10000.0) / embedding_dim))
+        
+        position_encoding = np.zeros((max_position, embedding_dim))
+        position_encoding[:, 0::2] = np.sin(position * div_term)
+        position_encoding[:, 1::2] = np.cos(position * div_term)
+        
+        # Convert the numpy array to a PyTorch tensor
+        position_encoding_tensor = torch.tensor(position_encoding, dtype=torch.float32)
+        
+        return position_encoding_tensor
 
+            
     @typecheck()
     def forward(
         self,
@@ -1331,32 +1338,15 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
             if diar_preds.shape[1] > asr_enc_states.shape[1]:
                 diar_preds = diar_preds[:, :asr_enc_states.shape[1], :]
 
-            concat_enc_states = torch.cat([asr_enc_states, diar_preds], dim=-1)
-            enc_states = self.joint_proj(concat_enc_states)
+            if self.diar_kernel_type == 'sinusoidal':
+                speaker_infusion_asr = torch.matmul(diar_preds, self.diar_kernel.to(diar_preds.device))
+                enc_states = speaker_infusion_asr + asr_enc_states
+            else:
+                concat_enc_states = torch.cat([asr_enc_states, diar_preds], dim=-1)
+                enc_states = self.joint_proj(concat_enc_states)
         else:
             enc_states = asr_enc_states
         
-        # # Spk branch: downsample rate is 1 for encoder, but downsample rate is 8 for decoder
-        # if self.spk == True:
-        #     with torch.set_grad_enabled(not self.cfg.freeze_spk):
-        #         spk_enc_states, spk_encoded_len = self.forward_spk( # B x T x D
-        #             input_signal, input_signal_length, self.segment_length, self.segment_shift
-        #         )
-        #     # Normalize the features
-        #     if self.norm == 'ln':
-        #         spk_enc_states = self.spk_norm(spk_enc_states)
-        #         asr_enc_states = self.asr_norm(asr_enc_states)
-        #     elif self.norm == 'l2':
-        #         spk_enc_states = torch.nn.functional.normalize(spk_enc_states, p=2, dim=-1)
-        #         asr_enc_states = torch.nn.functional.normalize(asr_enc_states, p=2, dim=-1)
-            
-        #     if spk_enc_states.shape[1] > asr_enc_states.shape[1]:
-        #         spk_enc_states = spk_enc_states[:, :asr_enc_states.shape[1], :]
-
-        #     concat_enc_states = torch.cat([asr_enc_states, spk_enc_states], dim=-1)
-        #     enc_states = self.joint_proj(concat_enc_states)
-        # else:
-        #     enc_states = asr_enc_states
             
         # merge two states
         transf_log_probs = None

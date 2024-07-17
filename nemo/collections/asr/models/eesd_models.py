@@ -33,6 +33,8 @@ import random
 import math
 
 from nemo.collections.asr.parts.preprocessing.perturb import process_augmentations
+from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
+from nemo.collections.asr.data.audio_to_eesd_label_lhotse import LhotseSpeechToSpeakerActivityDataset
 
 from nemo.collections.asr.data.audio_to_eesd_label import AudioToSpeechMSDDTrainDataset
 from nemo.collections.asr.metrics.multi_binary_acc import MultiBinaryAccuracy
@@ -280,6 +282,15 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             del cfg.speaker_model_cfg.validation_ds
     
     def __setup_dataloader_from_config(self, config):
+        # Switch to lhotse dataloader if specified in the config
+        if config.get("use_lhotse"):
+            return get_lhotse_dataloader_from_config(
+                config,
+                global_rank=self.global_rank,
+                world_size=self.world_size,
+                dataset=LhotseSpeechToSpeakerActivityDataset(cfg=config),
+            )
+
         featurizer = WaveformFeaturizer(
             sample_rate=config['sample_rate'], int_values=config.get('int_values', False), augmentor=self.augmentor
         )

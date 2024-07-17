@@ -26,7 +26,7 @@ import numpy as np
 # from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
 
-class LhotseSpeechToSpeakerActivityDataset(torch.utils.data.Dataset):
+class LhotseSpeechToDiarizationLabelDataset(torch.utils.data.Dataset):
     """
     This dataset is based on diarization datasets from audio_to_eesd_label.py.
     Unlike native NeMo datasets, Lhotse dataset defines only the mapping from
@@ -52,24 +52,22 @@ class LhotseSpeechToSpeakerActivityDataset(torch.utils.data.Dataset):
         self.cfg = cfg
         self.num_speakers = self.cfg.get('num_speakers', 4)
 
-        # TODO: need to compute these values from the config, e.g. 0.01*16000 and the subsampling_factor of encoder is 8
-        # Currently, these values are hardcoded
-        self.num_sample_per_mel_frame = self.cfg.get('num_sample_per_mel_frame', 160)
-        self.num_mel_frame_per_asr_frame = self.cfg.get('num_mel_frame_per_asr_frame', 8)
+        self.num_sample_per_mel_frame = int(self.cfg.get('window_stride', 0.01) * self.cfg.get('sample_rate', 16000)) # 160
+        self.num_mel_frame_per_target_frame = int(self.cfg.get('subsampling_factor', 8))
 
     def __getitem__(self, cuts) -> Tuple[torch.Tensor, ...]:
         audio, audio_lens, cuts = self.load_audio(cuts)
         
         speaker_activities = torch.stack([self.get_speaker_activity(cut) for cut in cuts])
         targets = collate_matrices(speaker_activities).transpose(1, 2)
-        target_lens = torch.tensor([[self.sample_length_to_target_length(l, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame)] for l in audio_lens])
+        target_lens = torch.tensor([[self.sample_length_to_target_length(l, self.num_sample_per_mel_frame, self.num_mel_frame_per_target_frame)] for l in audio_lens])
 
         return audio, audio_lens, target_lens, targets
     
     def get_speaker_activity(self, cut):
         # source from: https://github.com/lhotse-speech/lhotse/blob/0a4aed49754d61b781c14de85f7772dda71c6226/lhotse/cut/base.py#L882
         
-        n_frames = self.sample_length_to_target_length(cut.num_samples, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame)
+        n_frames = self.sample_length_to_target_length(cut.num_samples, self.num_sample_per_mel_frame, self.num_mel_frame_per_target_frame)
         speaker_activity = torch.zeros((self.num_speakers, n_frames))
 
         supervisions = SupervisionSet.from_rttm(cut.rttm_filepath)
@@ -96,17 +94,17 @@ class LhotseSpeechToSpeakerActivityDataset(torch.utils.data.Dataset):
                 if supervision.end < cut.duration
                 else compute_num_samples(supervision.duration, cut.sampling_rate)
             )   
-            target_start = self.sample_length_to_target_length(sample_start, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame)
-            target_end = self.sample_length_to_target_length(sample_end, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame)
+            target_start = self.sample_length_to_target_length(sample_start, self.num_sample_per_mel_frame, self.num_mel_frame_per_target_frame)
+            target_end = self.sample_length_to_target_length(sample_end, self.num_sample_per_mel_frame, self.num_mel_frame_per_target_frame)
             speaker_activity[speaker_idx, target_start:target_end] = 1
 
         return speaker_activity
 
     @staticmethod
-    def sample_length_to_target_length(num_samples: int, num_sample_per_mel_frame: int = 160, num_mel_frame_per_asr_frame: int = 8):
+    def sample_length_to_target_length(num_samples: int, num_sample_per_mel_frame: int = 160, num_mel_frame_per_target_frame: int = 8):
         '''
         This function solves the mismatch between the number of feature length and output length.
         input: the number of samples in the audio signal
         output: the number of frames in the output
         '''
-        return int(np.ceil(np.ceil((num_samples + 1) / num_sample_per_mel_frame) / num_mel_frame_per_asr_frame))
+        return int(np.ceil(np.ceil((num_samples + 1) / num_sample_per_mel_frame) / num_mel_frame_per_target_frame))

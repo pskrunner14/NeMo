@@ -34,7 +34,7 @@ import math
 
 from nemo.collections.asr.parts.preprocessing.perturb import process_augmentations
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
-from nemo.collections.asr.data.audio_to_eesd_label_lhotse import LhotseSpeechToSpeakerActivityDataset
+from nemo.collections.asr.data.audio_to_eesd_label_lhotse import LhotseSpeechToDiarizationLabelDataset
 
 from nemo.collections.asr.data.audio_to_eesd_label import AudioToSpeechMSDDTrainDataset
 from nemo.collections.asr.metrics.multi_binary_acc import MultiBinaryAccuracy
@@ -288,7 +288,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
                 config,
                 global_rank=self.global_rank,
                 world_size=self.world_size,
-                dataset=LhotseSpeechToSpeakerActivityDataset(cfg=config),
+                dataset=LhotseSpeechToDiarizationLabelDataset(cfg=config),
             )
 
         featurizer = WaveformFeaturizer(

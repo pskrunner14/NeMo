@@ -101,7 +101,7 @@ model:
     random_flip: False
     labels: null
     batch_size: ${batch_size}
-    shuffle: True
+    shuffle: False
     num_workers: ${num_workers}
     validation_mode: True
     # lhotse config
@@ -114,6 +114,8 @@ model:
   test_ds:
     manifest_filepath: null
     emb_dir: null
+    is_tarred: False
+    tarred_audio_filepaths: null
     sample_rate: 16000
     num_spks: ${model.max_num_of_spks}
     soft_label_thres: ${model.soft_label_thres}

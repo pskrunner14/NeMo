@@ -24,6 +24,7 @@ from lhotse.utils import compute_num_samples
 # from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
 
+import numpy as np
 class LhotseSpeechToDiarizationLabelDataset(torch.utils.data.Dataset):
     """
     This dataset is based on diarization datasets from audio_to_eesd_label.py.

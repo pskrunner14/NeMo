@@ -239,8 +239,6 @@ class _AudioMSDDTrainDataset(Dataset):
             Path to input manifest json files.
         multiscale_args_dict (dict):
             Dictionary containing the parameters for multiscale segmentation and clustering.
-        emb_dir (str):
-            Path to a temporary folder where segmentation information for embedding extraction is saved.
         soft_label_thres (float):
             Threshold that determines the label of each segment based on RTTM file information.
         featurizer:
@@ -255,8 +253,8 @@ class _AudioMSDDTrainDataset(Dataset):
         output_types = {
             "audio_signal": NeuralType(('B', 'T'), AudioSignal()),
             "audio_length": NeuralType(('B'), LengthsType()),
-            "ms_seg_counts": NeuralType(('B', 'C'), LengthsType()),
             "targets": NeuralType(('B', 'T', 'C'), ProbsType()),
+            "ms_seg_counts": NeuralType(('B', 'C'), LengthsType()),
         }
 
         return output_types
@@ -267,7 +265,6 @@ class _AudioMSDDTrainDataset(Dataset):
         manifest_filepath: str,
         preprocessor,
         multiscale_args_dict: str,
-        emb_dir: str,
         soft_label_thres: float,
         session_len_sec: float,
         num_spks: int,
@@ -299,7 +296,6 @@ class _AudioMSDDTrainDataset(Dataset):
         self.seg_stride = self.scale_dict[self.scale_n-1][1]
         self.max_raw_feat_len = int(self.multiscale_args_dict['scale_dict'][0][0] * self.feat_per_sec)
         self.div_n = 20
-        self.emb_dir = emb_dir
         self.round_digits = 2
         self.decim = 10 ** self.round_digits
         self.soft_label_thres = soft_label_thres
@@ -472,7 +468,7 @@ class _AudioMSDDTrainDataset(Dataset):
                                                  offset=offset,
                                                  duration=session_len_sec,
                                                  ms_seg_counts=ms_seg_counts)
-        return audio_signal, audio_signal_length, ms_seg_counts, targets
+        return audio_signal, audio_signal_length, targets, ms_seg_counts
 
 def _msdd_train_collate_fn(self, batch):
     """
@@ -504,7 +500,7 @@ def _msdd_train_collate_fn(self, batch):
     """
     packed_batch = list(zip(*batch))
     # audio_signal, feature_length, ms_seg_timestamps, ms_seg_counts, scale_mapping, targets  = packed_batch
-    audio_signal, feature_length, ms_seg_counts, targets  = packed_batch
+    audio_signal, feature_length, targets, ms_seg_counts = packed_batch
     audio_signal_list, feature_length_list = [], []
     ms_seg_counts_list, targets_list = [], []
 
@@ -514,7 +510,7 @@ def _msdd_train_collate_fn(self, batch):
         max_ch = max([feat.shape[1] for feat in audio_signal])
     else:
         max_ch = 1
-    for feat, feat_len, ms_seg_ct, tgt in batch:
+    for feat, feat_len, tgt, ms_seg_ct in batch:
         seq_len = tgt.shape[0]
         if len(feat.shape) > 1:
             pad_feat = (0, 0, 0, max_raw_feat_len - feat.shape[0])
@@ -525,6 +521,7 @@ def _msdd_train_collate_fn(self, batch):
             feat = torch.nn.functional.pad(feat, (0, feat_len_pad))
         pad_tgt = (0, 0, 0, max_target_len - seq_len)
         padded_feat = torch.nn.functional.pad(feat, pad_feat)
+        
         padded_tgt = torch.nn.functional.pad(tgt, pad_tgt)
         
         if max_ch > 1 and padded_feat.shape[1] < max_ch:
@@ -539,7 +536,7 @@ def _msdd_train_collate_fn(self, batch):
     feature_length = torch.stack(feature_length_list)
     ms_seg_counts = torch.stack(ms_seg_counts_list)
     targets = torch.stack(targets_list)
-    return audio_signal, feature_length, ms_seg_counts, targets
+    return audio_signal, feature_length, targets, ms_seg_counts
 
 class AudioToSpeechMSDDTrainDataset(_AudioMSDDTrainDataset):
     """
@@ -560,8 +557,6 @@ class AudioToSpeechMSDDTrainDataset(_AudioMSDDTrainDataset):
             Path to input manifest json files.
         multiscale_args_dict (dict):
             Dictionary containing the parameters for multiscale segmentation and clustering.
-        emb_dir (str):
-            Path to a temporary folder where segmentation information for embedding extraction is saved.
         soft_label_thres (float):
             A threshold that determines the label of each segment based on RTTM file information.
         featurizer:
@@ -576,7 +571,6 @@ class AudioToSpeechMSDDTrainDataset(_AudioMSDDTrainDataset):
         manifest_filepath: str,
         preprocessor,
         multiscale_args_dict: Dict,
-        emb_dir: str,
         soft_label_thres: float,
         session_len_sec: float,
         num_spks: int,
@@ -589,7 +583,6 @@ class AudioToSpeechMSDDTrainDataset(_AudioMSDDTrainDataset):
             manifest_filepath=manifest_filepath,
             preprocessor=preprocessor,
             multiscale_args_dict=multiscale_args_dict,
-            emb_dir=emb_dir,
             soft_label_thres=soft_label_thres,
             session_len_sec=session_len_sec,
             num_spks=num_spks,

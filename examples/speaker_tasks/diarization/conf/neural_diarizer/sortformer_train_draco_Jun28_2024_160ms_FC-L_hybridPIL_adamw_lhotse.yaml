@@ -62,7 +62,6 @@ model:
 
   train_ds:
     manifest_filepath: ???
-    emb_dir: ???
     sample_rate: ${sample_rate}
     num_spks: ${model.max_num_of_spks}
     soft_label_thres: ${model.soft_label_thres}
@@ -70,7 +69,7 @@ model:
     soft_targets: ${model.soft_targets}
     random_flip: ${model.random_flip}
     labels: null
-    batch_size: null
+    batch_size: ${batch_size}
     shuffle: True
     num_workers: ${num_workers}
     validation_mode: False
@@ -82,7 +81,7 @@ model:
     pin_memory: True
     max_duration: 90
     batch_duration: 1200
-    quadratic_duration: 60
+    quadratic_duration: 200
     bucket_buffer_size: 20000
     shuffle_buffer_size: 10000
     window_stride: ${model.preprocessor.window_stride}
@@ -90,7 +89,6 @@ model:
 
   validation_ds:
     manifest_filepath: ???
-    emb_dir: ???
     is_tarred: False
     tarred_audio_filepaths: null
     sample_rate: ${sample_rate}
@@ -113,7 +111,6 @@ model:
   
   test_ds:
     manifest_filepath: null
-    emb_dir: null
     is_tarred: False
     tarred_audio_filepaths: null
     sample_rate: 16000

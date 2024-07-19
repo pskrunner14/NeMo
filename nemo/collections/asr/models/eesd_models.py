@@ -401,7 +401,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
                 Dimension: (batch_size, max_seg_count)
             ms_avg_embs (torch.Tensor): tensor containing average embeddings of multiscale segments
                 Dimension: (batch_size, msdd_scale_n, emb_dim)
-
         """
         attn_score_list, preds_list, attn_score_stack, encoder_states_list = [], [], None, []
         encoder_mask = self.length_to_mask(emb_seq)
@@ -596,10 +595,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             labels_discrete[labels_discrete < thres] = 0
             labels_discrete[labels_discrete >= thres] = 1
         modi =torch.ones(labels.shape[1],labels.shape[1]).triu().to(labels.device)
-        try:
-            labels_accum = torch.matmul(labels_discrete.permute(0,2,1),modi).permute(0,2,1)
-        except:
-            import ipdb; ipdb.set_trace()
+        labels_accum = torch.matmul(labels_discrete.permute(0,2,1),modi).permute(0,2,1)
         labels_accum[labels_accum < accum_frames] = 0
         label_fz = self.find_first_nonzero(labels_accum, max_cap_val)
         label_fz[label_fz == -1] = max_cap_val
@@ -625,7 +621,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         max_score_permed_labels = torch.vstack([ labels[k, :, batch_perm_inds[k]].unsqueeze(0) for k in range(batch_perm_inds.shape[0])])
         return max_score_permed_labels
 
-    def sort_targets_with_preds_new(self, labels, preds, noise=0):
+    def sort_targets_with_preds_new(self, labels, preds, target_lens, noise=0):
         """
         Sorts labels and predictions to get optimal permutation
         New implementation based on losses, supports noising
@@ -635,7 +631,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         match_loss = torch.zeros(labels.shape[0], perm_size)
         for k in range(labels.shape[0]):
             for i in range(perm_size):
-                match_loss[k,i] = self.loss(probs=preds[k,:,:].unsqueeze(0), labels=permed_labels[k,:,i,:].unsqueeze(0), target_lens=torch.tensor([labels.shape[1]], dtype=torch.int32))
+                match_loss[k,i] = self.loss(probs=preds[k,:,:].unsqueeze(0), labels=permed_labels[k,:,i,:].unsqueeze(0), target_lens=target_lens)
         if noise > 0:
             min_loss = torch.min(match_loss, dim=1).values.reshape(-1,1).repeat(1,perm_size)
             match_loss = match_loss + torch.rand(labels.shape[0], self.spk_perm.shape[0])*min_loss*noise
@@ -718,7 +714,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         targets_ats = self.sort_probs_and_labels(targets.clone(), discrete=False, accum_frames=self.sort_accum_frames)
         # Optimally permuted targets for Permutation-Invariant Loss (PIL)
         if self.use_new_pil:
-            targets_pil = self.sort_targets_with_preds_new(targets.clone(), preds, self.pil_noise_level)
+            targets_pil = self.sort_targets_with_preds_new(targets=targets.clone(), preds=preds, target_lens=target_lens, noise=self.pil_noise_level)
         else:
             targets_pil = self.sort_targets_with_preds(targets.clone(), preds)
 
@@ -805,7 +801,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         targets_ats = self.sort_probs_and_labels(targets.clone(), discrete=False, accum_frames=self.sort_accum_frames)
         # Optimally permuted targets for Permutation-Invariant Loss (PIL)
         if self.use_new_pil:
-            targets_pil = self.sort_targets_with_preds_new(targets.clone(), preds)
+            targets_pil = self.sort_targets_with_preds_new(targets=targets.clone(), preds=preds, target_lens=target_lens)
         else:
             targets_pil = self.sort_targets_with_preds(targets.clone(), preds)
 
@@ -902,7 +898,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         targets_ats = self.sort_probs_and_labels(targets.clone(), discrete=False, accum_frames=self.sort_accum_frames)
         # Optimally permuted targets for Permutation-Invariant Loss (PIL)
         if self.use_new_pil:
-            targets_pil = self.sort_targets_with_preds_new(targets.clone(), preds)
+            targets_pil = self.sort_targets_with_preds_new(targets.clone(), preds, target_lens)
         else:
             targets_pil = self.sort_targets_with_preds(targets.clone(), preds)
 
@@ -942,7 +938,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
                 targets_ats = self.sort_probs_and_labels(targets.clone(), discrete=False, accum_frames=self.sort_accum_frames)
                 # Optimally permuted targets for Permutation-Invariant Loss (PIL)
                 if self.use_new_pil:
-                    targets_pil = self.sort_targets_with_preds_new(targets.clone(), preds)
+                    targets_pil = self.sort_targets_with_preds_new(targets.clone(), preds, target_lens)
                 else:
                     targets_pil = self.sort_targets_with_preds(targets.clone(), preds)
                 preds_vad, preds_ovl, targets_vad, targets_ovl = self.compute_aux_f1(preds, targets_pil)

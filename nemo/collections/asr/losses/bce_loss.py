@@ -33,7 +33,7 @@ class BCELoss(Loss, Typing):
         return {
             "probs": NeuralType(('B', 'T', 'C'), ProbsType()),
             'labels': NeuralType(('B', 'T', 'C'), LabelsType()),
-            "signal_lengths": NeuralType(tuple('B'), LengthsType()),
+            "target_lens": NeuralType(('B', 'C'), LengthsType()),
         }
 
     @property
@@ -51,31 +51,30 @@ class BCELoss(Loss, Typing):
         else:
             self.reduction = 'mean'
         self.loss_weight = weight
-        # self.loss_f = torch.nn.BCELoss(weight=self.loss_weight, reduction=self.reduction)
         self.loss_f = torch.nn.BCELoss(reduction=self.reduction)
         self.sorted_preds = sorted_preds
         self.sorted_loss = sorted_loss
         self.eps = 1e-6
 
     @typecheck()
-    def forward(self, probs, labels, signal_lengths):
+    def forward(self, probs, labels, target_lens):
         """
-        Calculate binary cross entropy loss based on probs, labels and signal_lengths variables.
+        Calculate binary cross entropy loss based on probs, labels and target_lens variables.
 
         Args:
             probs (torch.tensor)
                 Predicted probability value which ranges from 0 to 1. Sigmoid output is expected.
             labels (torch.tensor)
                 Groundtruth label for the predicted samples.
-            signal_lengths (torch.tensor):
+            target_lens (torch.tensor):
                 The actual length of the sequence without zero-padding.
 
         Returns:
             loss (NeuralType)
                 Binary cross entropy loss value.
         """
-        probs_list = [probs[k, : signal_lengths[k], :] for k in range(probs.shape[0])]
-        targets_list = [labels[k, : signal_lengths[k], :] for k in range(labels.shape[0])]
+        probs_list = [probs[k, : target_lens[k], :] for k in range(probs.shape[0])]
+        targets_list = [labels[k, : target_lens[k], :] for k in range(labels.shape[0])]
         probs = torch.cat(probs_list, dim=0)
         labels = torch.cat(targets_list, dim=0)
         if self.class_normalization in ['class', 'class_binary', 'binary']:

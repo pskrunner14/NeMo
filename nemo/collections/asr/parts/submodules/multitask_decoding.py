@@ -301,7 +301,8 @@ class AbstractMultiTaskDecoding(ABC):
         Note that if any label/pred is of format <token>, it will be stripped
         """
         assert isinstance(text, str), f"Expected str, got {type(text)}"
-        text = re.sub(r'<[^>]+>', '', text)
+        # text = re.sub(r'<[^>]+>', '', text)
+        text = re.sub(r'<(?!\/?\|spltoken\d+\b\|)[^>]+>', '', text) # keep <|spltokens|> for mutli-speaker ASR
         # strip spaces at the beginning and end;
         # this is training data artifact, will be fixed in future (@kpuvvada)
         return text.strip()

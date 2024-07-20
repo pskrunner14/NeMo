@@ -43,7 +43,7 @@ def main(cfg):
     logging.info(f'Hydra config: {OmegaConf.to_yaml(cfg)}')
     trainer = pl.Trainer(**cfg.trainer)
     exp_manager(trainer, cfg.get("exp_manager", None))
-    msdd_model = EncDecDiarLabelModel(cfg=cfg.model, trainer=trainer)
+    msdd_model = EncDecDiarLabelModel(cfg=cfg.model, trainer=trainer).to("cuda:0")
     trainer.fit(msdd_model)
 
 

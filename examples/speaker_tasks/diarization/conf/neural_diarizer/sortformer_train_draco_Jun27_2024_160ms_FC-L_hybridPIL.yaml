@@ -22,27 +22,33 @@ model:
         shift_length_in_sec: [0.24] # Shift length(s) in sec (floating-point number). either a number or a list. ex) 0.75 or [0.75,0.5,0.25]
         multiscale_weights: [1] # Weight for each scale. should be null (for single scale) or a list matched with window/shift scale count. ex) [0.33,0.33,0.33]
         save_embeddings: True # Save embeddings as pickle file for each audio input.
-  
-  use_mock_embs: False
-  use_pil_train: False
-  use_pil_f1_score: False
-  perm_mock_embs: True
+
+  use_new_pil: False
+  pil_noise_level: 0.0 #add random noise of [0, pil_noise_level*min_permutation_loss) to loss values when looking for the optimal permutation
+  min_sample_duration: -1 #if > 0, will cut a random subsegment of [min_sample_duration, session_len_sec] seconds for each training batch
+  subsegment_check_frames: 5 #if use subsegmenting, will use this number of starting frames to ensure that the subsegment is good (no multiple speakers and no short segments)
+  sort_accum_frames: 1
+  sort_preds: False
+  pil_weight: 0.5
+  ats_weight: 0.5
+  use_raw_encoder: True
+  use_raw_encoder_only: True
   multi_scale_method: 'only_interpolate' # 'mean', 'attention', 'only_interpolate'
   streaming_mode: False
-  use_positional_embedding: False
-  variance_in_mock_embs: 0.05
+  use_positional_embedding: True
+  use_roformer: False
   alpha: 0.5 # mix ratio between final pred and skip pred connections
   sort_layer_on: pre # pre, post, False
   sort_bin_order: False
-  mock_emb_noise_std: 0.05
   num_workers: ${num_workers}
-  heads: 12
+  heads: 8
   inner: 768
   max_num_of_spks: 4 # Number of speakers per model. This is currently fixed at 6.
   scale_n: 3 # Number of scales for MSDD model and initializing clustering.
   interpolated_scale: 0.16 # The length of the interpolated scale
   soft_label_thres: 0.5 # Threshold for creating discretized speaker label from continuous speaker label in RTTM files.
-  session_len_sec: 15
+  session_len_sec: 90
+  soft_targets: True
   freeze_speaker_model: True # If True, speaker model is frozen and only MSDD module is trained.
   random_flip: True
   restore_from: null
@@ -61,20 +67,14 @@ model:
     num_spks: ${model.max_num_of_spks}
     soft_label_thres: ${model.soft_label_thres}
     session_len_sec: ${model.session_len_sec}
+    soft_targets: ${model.soft_targets}
     random_flip: ${model.random_flip}
     labels: null
     batch_size: ${batch_size}
     shuffle: True
     num_workers: ${num_workers}
-    perm_mock_embs: ${model.perm_mock_embs}
-    mock_emb_noise_std: ${model.mock_emb_noise_std}
-    mock_emb_degree_of_freedom: 8
     validation_mode: False
-<<<<<<< HEAD
-  
-=======
 
->>>>>>> origin/multispeaker_canary_sortformer
   validation_ds:
     manifest_filepath: ???
     emb_dir: ???
@@ -82,14 +82,12 @@ model:
     num_spks: ${model.max_num_of_spks}
     soft_label_thres: ${model.soft_label_thres}
     session_len_sec: ${model.session_len_sec}
+    soft_targets: False
     random_flip: False
     labels: null
     batch_size: ${batch_size}
     shuffle: True
     num_workers: ${num_workers}
-    perm_mock_embs: ${model.perm_mock_embs}
-    mock_emb_noise_std: ${model.mock_emb_noise_std}
-    mock_emb_degree_of_freedom: 48
     validation_mode: True
   
   test_ds:
@@ -99,15 +97,13 @@ model:
     num_spks: ${model.max_num_of_spks}
     soft_label_thres: ${model.soft_label_thres}
     session_len_sec: ${model.session_len_sec}
+    soft_targets: False
     random_flip: False
     labels: null
     batch_size: ${batch_size}
     shuffle: False
     seq_eval_mode: True
     num_workers: ${num_workers}
-    perm_mock_embs: ${model.perm_mock_embs}
-    mock_emb_noise_std: ${model.mock_emb_noise_std}
-    mock_emb_degree_of_freedom: 48
     validation_mode: True
 
   preprocessor:
@@ -137,6 +133,50 @@ model:
     use_amsl_layer: True
     sort_final_layer_on: False
 
+  encoder:
+    _target_: nemo.collections.asr.modules.ConformerEncoder
+    feat_in: ${model.preprocessor.features}
+    feat_out: -1
+    n_layers: 18
+    d_model: 512
+
+    # Sub-sampling parameters
+    subsampling: dw_striding # vggnet, striding, stacking or stacking_norm, dw_striding
+    subsampling_factor: 8 # must be power of 2 for striding and vggnet
+    subsampling_conv_channels: 256 # set to -1 to make it equal to the d_model
+    causal_downsampling: false
+
+    # Feed forward module's params
+    ff_expansion_factor: 4
+
+    # Multi-headed Attention Module's params
+    self_attention_model: rel_pos # rel_pos or abs_pos
+    n_heads: 8 # may need to be lower for smaller d_models
+    # [left, right] specifies the number of steps to be seen from left and right of each step in self-attention
+    att_context_size: [-1, -1] # -1 means unlimited context
+    att_context_style: regular # regular or chunked_limited
+    xscaling: true # scales up the input embeddings by sqrt(d_model)
+    untie_biases: true # unties the biases of the TransformerXL layers
+    pos_emb_max_len: 5000
+
+    # Convolution module's params
+    conv_kernel_size: 9
+    conv_norm_type: 'batch_norm' # batch_norm or layer_norm or groupnormN (N specifies the number of groups)
+    # conv_context_size can be"causal" or a list of two integers while conv_context_size[0]+conv_context_size[1]+1==conv_kernel_size
+    # null means [(kernel_size-1)//2, (kernel_size-1)//2], and 'causal' means [(kernel_size-1), 0]
+    conv_context_size: null
+
+    ### regularization
+    dropout: 0.1 # The dropout used in most of the Conformer Modules
+    dropout_pre_encoder: 0.1 # The dropout used before the encoder
+    dropout_emb: 0.0 # The dropout used for embeddings
+    dropout_att: 0.1 # The dropout for multi-headed attention modules
+
+    # set to non-zero to enable stochastic depth
+    stochastic_depth_drop_prob: 0.0
+    stochastic_depth_mode: linear  # linear or uniform
+    stochastic_depth_start_layer: 1
+
   position_embedding:
     _target_: nemo.collections.asr.modules.transformer.transformer_modules.FixedPositionalEncoding
     hidden_size: 192
@@ -144,7 +184,8 @@ model:
 
   sortformer_encoder:
     _target_: nemo.collections.asr.modules.transformer.sortformer_encoders.SortformerEncoder
-    num_layers: 6
+    num_layers: 0
+    use_roformer: ${model.use_roformer} # Uses roformer (transformer+RoPE) instead of Sort-layer included sortformer
     hidden_size: 192 # Needs to be multiple of num_attention_heads
     inner_size: ${model.inner}
     num_attention_heads: ${model.heads}
@@ -159,26 +200,11 @@ model:
     sort_layer_type: "parallel"
     seq_var_sort: False
     sort_bin_order: ${model.sort_bin_order}
-    layer_arrival_time_sort: ${model.layer_arrival_time_sort}
     num_classes: ${model.max_num_of_spks}
-    detach_preds: False
-
-  transformer_encoder_row:
-    _target_: nemo.collections.asr.modules.transformer.transformer_encoders.TransformerEncoder
-    num_layers: 3
-    hidden_size: 299 # Needs to be multiple of num_attention_heads
-    inner_size: 598
-    num_attention_heads: ${model.heads}
-    attn_score_dropout: 0.5
-    attn_layer_dropout: 0.5
-    ffn_dropout: 0.5
-    hidden_act: relu
-    pre_ln: False
-    pre_ln_final_layer_norm: True
 
   transformer_encoder:
     _target_: nemo.collections.asr.modules.transformer.transformer_encoders.TransformerEncoder
-    num_layers: 6
+    num_layers: 18
     hidden_size: 192 # Needs to be multiple of num_attention_heads
     inner_size: ${model.inner}
     num_attention_heads: ${model.heads}
@@ -218,14 +244,6 @@ model:
     margin: 0.1
 
   lr: 0.0001
-  optim_param_groups:
-    sortformer_diarizer._speaker_model.encoder: # NOTE: Only EncDecDiarLabelModel class supports multi-level optim_param_groups
-      lr: ${model.lr}
-      weight_decay: 0.005
-
-      sched:
-        name: InverseSquareRootAnnealing
-        min_lr: 0.00005
 
   optim:
     name: adam

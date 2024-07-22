@@ -35,9 +35,7 @@ python <NEMO_ROOT>/scripts/tokenizers/process_asr_text_tokenizer.py \
 python speech_to_text_rnnt_spk_bpe.py \
     # (Optional: --config-path=<path to dir of configs> --config-name=<name of config without .yaml>) \
     model.train_ds.manifest_filepath=<path to train manifest> \
-    model.train_ds.rttm_filepath=<path to directory of train rttms> \
     model.validation_ds.manifest_filepath=<path to val/test manifest> \
-    model.validation_ds.rttm_filepath=<path to directory of val/test rttms> \
     model.tokenizer.dir=<path to directory of tokenizer (not full path to the vocab file!)> \
     model.tokenizer.type=<either bpe or wpe> \
     trainer.devices=-1 \

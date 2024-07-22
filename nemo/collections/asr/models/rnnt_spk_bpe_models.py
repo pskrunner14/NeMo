@@ -131,7 +131,7 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
         if AccessMixin.is_access_enabled(self.model_guid):
             AccessMixin.reset_registry(self)
 
-        signal, signal_len, transcript, transcript_len, spk_targets = batch
+        signal, signal_len, transcript, transcript_len, spk_targets, spk_mappings = batch
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
@@ -232,7 +232,7 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
 
     def validation_pass(self, batch, batch_idx, dataloader_idx=0):
 
-        signal, signal_len, transcript, transcript_len, spk_targets = batch
+        signal, signal_len, transcript, transcript_len, spk_targets, spk_mappings = batch
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:

@@ -47,6 +47,11 @@ model:
   log_prediction: true # enables logging sample predictions in the output during training
   rnnt_reduction: 'mean_volume'
   skip_nan_grad: false
+  # Speaker supervision from a diarization model
+  freeze_diar: true # If True, diarization model is not trained
+  spk_supervision_strategy: "rttm" # Options: "rttm", "diar" and "mix"
+  rttm_mix_prob: 0.5 # The sampling probability when mixing RTTMs
+  shuffle_spk_mapping: True # Shuffle the speaker mapping in both transcript and RTTM/diar_preds
 
   model_defaults:
     enc_hidden: ${model.encoder.d_model}

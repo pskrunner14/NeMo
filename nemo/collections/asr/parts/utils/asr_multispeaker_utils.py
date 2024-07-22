@@ -145,6 +145,8 @@ def speaker_to_target(
             spk: idx
             for idx, spk in enumerate(speaker_ats)
     }
+    if len(speaker_to_idx_map) > num_speakers:
+        raise ValueError(f"Number of speakers {len(speaker_to_idx_map)} is larger than the maximum number of speakers {num_speakers}")
     # initialize mask matrices (num_speaker, encoder_hidden_len)
     if spk_tar_all_zero: 
         mask = np.zeros((num_speakers, get_hidden_length_from_sample_length(cut.num_samples, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)))
@@ -176,22 +178,21 @@ def get_mask_from_segments(segments, cut, speaker_to_idx_map, num_speakers=4, nu
     for rttm_sup in segments:
         speaker_idx = speaker_to_idx_map[rttm_sup.speaker]
         # only consider the first <num_speakers> speakers
-        if speaker_idx < num_speakers:
-            stt = (
-                        compute_num_samples(rttm_sup.start, cut.sampling_rate)
-                        if rttm_sup.start > 0
-                        else 0
-                    )
-            ent = (
-                        compute_num_samples(rttm_sup.end, cut.sampling_rate)
-                        if rttm_sup.end < cut.duration
-                        else compute_num_samples(rttm_sup.duration, cut.sampling_rate)
-                    )                   
+        stt = (
+                    compute_num_samples(rttm_sup.start, cut.sampling_rate)
+                    if rttm_sup.start > 0
+                    else 0
+                )
+        ent = (
+                    compute_num_samples(rttm_sup.end, cut.sampling_rate)
+                    if rttm_sup.end < cut.duration
+                    else compute_num_samples(rttm_sup.duration, cut.sampling_rate)
+                )                   
 
-            # map start time (st) and end time (et) to encoded hidden location
-            st_encoder_loc = get_hidden_length_from_sample_length(stt, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
-            et_encoder_loc = get_hidden_length_from_sample_length(ent, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
-            mask[speaker_idx, st_encoder_loc:et_encoder_loc] = 1
+        # map start time (st) and end time (et) to encoded hidden location
+        st_encoder_loc = get_hidden_length_from_sample_length(stt, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
+        et_encoder_loc = get_hidden_length_from_sample_length(ent, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
+        mask[speaker_idx, st_encoder_loc:et_encoder_loc] = 1
     return mask 
 
 def get_hidden_length_from_sample_length(

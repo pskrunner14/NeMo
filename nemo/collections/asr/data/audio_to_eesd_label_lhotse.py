@@ -15,17 +15,14 @@
 from typing import Dict, Optional, Tuple
 
 import torch.utils.data
-from lhotse import SupervisionSet
 from lhotse.dataset import AudioSamples
 from lhotse.dataset.collation import collate_matrices
-from lhotse.utils import compute_num_samples
 
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
 from nemo.collections.asr.parts.utils.asr_multispeaker_utils import (
     speaker_to_target, 
     get_hidden_length_from_sample_length, 
 )
-import numpy as np
 
 class LhotseSpeechToDiarizationLabelDataset(torch.utils.data.Dataset):
     """

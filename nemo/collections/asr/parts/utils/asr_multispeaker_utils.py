@@ -12,35 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import omegaconf
 import os
-import torch.utils.data
-from pathlib import Path
-from lhotse import CutSet
-from lhotse.cut import MixedCut, MonoCut
-from lhotse.dataset import AudioSamples
-from lhotse.dataset.collation import collate_vectors, collate_matrices
-from lhotse.utils import compute_num_samples
-from lhotse import SupervisionSet
-import numpy as np
-
+import math
+from copy import deepcopy
 from typing import Dict, Optional, Tuple, List
 
 import torch.utils.data
-import re
-from lhotse.dataset import AudioSamples
-from lhotse.dataset.collation import collate_vectors, collate_matrices
+from lhotse import CutSet
+from lhotse.cut import MixedCut, MonoCut
 from lhotse.utils import compute_num_samples
 from lhotse import SupervisionSet
-
-from pathlib import Path
-import numpy as np
-from copy import deepcopy
-from nemo.collections.asr.data.audio_to_text_lhotse import TokenizerWrapper
-from nemo.collections.common.tokenizers.aggregate_tokenizer import AggregateTokenizer
-from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
-from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
-
 
 def apply_spk_mapping(diar_preds: torch.Tensor, spk_mappings: torch.Tensor) -> torch.Tensor:
     """ 
@@ -149,7 +130,7 @@ def speaker_to_target(
         raise ValueError(f"Number of speakers {len(speaker_to_idx_map)} is larger than the maximum number of speakers {num_speakers}")
     # initialize mask matrices (num_speaker, encoder_hidden_len)
     if spk_tar_all_zero: 
-        mask = np.zeros((num_speakers, get_hidden_length_from_sample_length(cut.num_samples, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)))
+        mask = torch.zeros((num_speakers, get_hidden_length_from_sample_length(cut.num_samples, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)))
     else:
         mask = get_mask_from_segments(segments, cut, speaker_to_idx_map, num_speakers, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
     return mask
@@ -174,7 +155,7 @@ def get_mask_from_segments(segments, cut, speaker_to_idx_map, num_speakers=4, nu
             Dimension: (num_speakers, num_frames)
     """
     encoder_hidden_len = get_hidden_length_from_sample_length(cut.num_samples, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
-    mask = np.zeros((num_speakers, encoder_hidden_len))
+    mask = torch.zeros((num_speakers, encoder_hidden_len))
     for rttm_sup in segments:
         speaker_idx = speaker_to_idx_map[rttm_sup.speaker]
         # only consider the first <num_speakers> speakers
@@ -215,6 +196,6 @@ def get_hidden_length_from_sample_length(
     Returns:
         hidden_length (int): The calculated hidden length in terms of the number of frames.
     """
-    mel_frame_count = np.ceil((num_samples + 1) / num_sample_per_mel_frame)
-    hidden_length = np.ceil(mel_frame_count / num_mel_frame_per_asr_frame)
+    mel_frame_count = math.ceil((num_samples + 1) / num_sample_per_mel_frame)
+    hidden_length = math.ceil(mel_frame_count / num_mel_frame_per_asr_frame)
     return int(hidden_length)

@@ -113,7 +113,7 @@ class PromptedAudioToTextSpkLhotseDataset(torch.utils.data.Dataset):
         self.inference = inference
         
         self.spk_tar_all_zero = self.cfg.get('spk_tar_all_zero',False)
-        self.shuffle_spk_mapping = self.cfg.get('shuffle_spk_mapping', True)
+        self.shuffle_spk_mapping = self.cfg.get('shuffle_spk_mapping', False)
         self.num_speakers = self.cfg.get('num_speakers', 4)
         self.num_sample_per_mel_frame = self.cfg.get('num_sample_per_mel_frame', 160)
         self.num_mel_frame_per_asr_frame = self.cfg.get('num_mel_frame_per_asr_frame', 8)

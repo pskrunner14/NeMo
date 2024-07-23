@@ -57,12 +57,14 @@ class LhotseSpeechToDiarizationLabelDataset(torch.utils.data.Dataset):
         audio, audio_lens, cuts = self.load_audio(cuts)
         speaker_activities = []
         for cut in cuts:
-            speaker_activity = speaker_to_target(a_cut=cut,
-                                                num_speakers=self.num_speakers,
-                                                num_sample_per_mel_frame=self.num_sample_per_mel_frame,
-                                                num_mel_frame_per_asr_frame=self.num_mel_frame_per_target_frame,
-                                                spk_tar_all_zero=self.spk_tar_all_zero
-                                                )
+            speaker_activity = speaker_to_target(
+                a_cut=cut,
+                num_speakers=self.num_speakers,
+                num_sample_per_mel_frame=self.num_sample_per_mel_frame,
+                num_mel_frame_per_asr_frame=self.num_mel_frame_per_target_frame,
+                spk_tar_all_zero=self.spk_tar_all_zero,
+                boundary_segments=True
+            )
             speaker_activities.append(speaker_activity) 
         targets = collate_matrices(speaker_activities).transpose(1, 2).to(audio.dtype)
         target_lens_list = []
@@ -70,4 +72,5 @@ class LhotseSpeechToDiarizationLabelDataset(torch.utils.data.Dataset):
             target_fr_len = get_hidden_length_from_sample_length(audio_len, self.num_sample_per_mel_frame, self.num_mel_frame_per_target_frame)
             target_lens_list.append([target_fr_len])
         target_lens = torch.tensor(target_lens_list)
+
         return audio, audio_lens, targets, target_lens

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import re
 import math
 from copy import deepcopy
 from typing import Dict, Optional, Tuple, List
@@ -79,12 +80,45 @@ def shuffle_spk_mapping(cuts: list, num_speakers: int, shuffle_spk_mapping: bool
         spk_mappings = torch.arange(num_speakers).unsqueeze(0).repeat(len(cuts), 1)    
     return cuts, spk_mappings 
 
+def find_segments_from_rttm(
+        recording_id, 
+        rttms, 
+        start_after, 
+        end_before, 
+        adjust_offset=True, 
+        tolerance=0.001):
+    """ 
+    Finds segments from the given rttm file.
+
+    Args:
+        rttms (SupervisionSet): The SupervisionSet instance.
+        start (float): The start time.
+        end (float): The end time.
+    
+    Returns:
+        segments (List[SupervisionSegment]): A list of SupervisionSegment instances.
+    """
+    segment_by_recording_id = rttms._segments_by_recording_id
+    if segment_by_recording_id is None:
+        from cytoolz import groupby
+        segment_by_recording_id = groupby(lambda seg: seg.recording_id, rttms)
+
+    return [
+            # We only modify the offset - the duration remains the same, as we're only shifting the segment
+            # relative to the Cut's start, and not truncating anything.
+            segment.with_offset(-start_after) if adjust_offset else segment
+            for segment in segment_by_recording_id.get(recording_id, [])
+            if segment.start < end_before + tolerance
+            and segment.end > start_after + tolerance
+        ]
+
 def speaker_to_target(
     a_cut,
     num_speakers: int = 4, 
     num_sample_per_mel_frame: int = 160, 
     num_mel_frame_per_asr_frame: int = 8, 
-    spk_tar_all_zero: bool = False
+    spk_tar_all_zero: bool = False,
+    boundary_segments: bool = False
     ):
     '''
     Get rttm samples corresponding to one cut, generate speaker mask numpy.ndarray with shape (num_speaker, hidden_length)
@@ -96,6 +130,7 @@ def speaker_to_target(
         num_sample_per_mel_frame (int): number of sample per mel frame, sample_rate / 1000 * window_stride, 160 by default (10ms window stride)
         num_mel_frame_per_asr_frame (int): encoder subsampling_factor, 8 by default
         spk_tar_all_zero (Tensor): set to True gives all zero "mask"
+        boundary_segments (bool): set to True to include segments containing the boundary of the cut, False by default for multi-speaker ASR training
     
     Returns:
         mask (Tensor): speaker mask with shape (num_speaker, hidden_lenght)
@@ -112,9 +147,13 @@ def speaker_to_target(
     
     segments_total = []
     for cut in cut_list:
-        segments_iterator = rttms.find(recording_id=cut.recording_id, start_after=cut.start, end_before=cut.end, adjust_offset=True)
+        if boundary_segments: # segments with seg_start < total_end and seg_end > total_start are included
+            segments_iterator = find_segments_from_rttm(recording_id=cut.recording_id, rttms=rttms, start_after=cut.start, end_before=cut.end)
+        else: # segments with seg_start > total_start and seg_end < total_end are included
+            segments_iterator = rttms.find(recording_id=cut.recording_id, start_after=cut.start, end_before=cut.end, adjust_offset=True)
         segments = [s for s in segments_iterator]
         segments_total.extend(segments)
+    
     # apply arrival time sorting to the existing segments
     segments_total.sort(key = lambda rttm_sup: rttm_sup.start)
 
@@ -133,6 +172,7 @@ def speaker_to_target(
         mask = torch.zeros((num_speakers, get_hidden_length_from_sample_length(cut.num_samples, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)))
     else:
         mask = get_mask_from_segments(segments, cut, speaker_to_idx_map, num_speakers, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
+
     return mask
 
 def get_mask_from_segments(segments, cut, speaker_to_idx_map, num_speakers=4, num_sample_per_mel_frame=160, num_mel_frame_per_asr_frame=8):
@@ -159,21 +199,13 @@ def get_mask_from_segments(segments, cut, speaker_to_idx_map, num_speakers=4, nu
     for rttm_sup in segments:
         speaker_idx = speaker_to_idx_map[rttm_sup.speaker]
         # only consider the first <num_speakers> speakers
-        stt = (
-                    compute_num_samples(rttm_sup.start, cut.sampling_rate)
-                    if rttm_sup.start > 0
-                    else 0
-                )
-        ent = (
-                    compute_num_samples(rttm_sup.end, cut.sampling_rate)
-                    if rttm_sup.end < cut.duration
-                    else compute_num_samples(rttm_sup.duration, cut.sampling_rate)
-                )                   
-
+        stt = compute_num_samples(max(rttm_sup.start, 0), cut.sampling_rate)
+        ent = compute_num_samples(min(rttm_sup.end, cut.duration), cut.sampling_rate)
         # map start time (st) and end time (et) to encoded hidden location
-        st_encoder_loc = get_hidden_length_from_sample_length(stt, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
+        st_encoder_loc = 0 if stt == 0 else get_hidden_length_from_sample_length(stt, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
         et_encoder_loc = get_hidden_length_from_sample_length(ent, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
         mask[speaker_idx, st_encoder_loc:et_encoder_loc] = 1
+
     return mask 
 
 def get_hidden_length_from_sample_length(

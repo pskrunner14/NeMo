@@ -1365,7 +1365,7 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
         Returns:
             mix_prob (float): Tensor of shape [B, T, D] representing the probablistic mixture of speaker labels for each time step.
         """
-        batch_probs_raw = torch.distributions.categorical.Categorical(probs=torch.tensor(torch.tensor([(1-rttm_mix_prob), rttm_mix_prob]).repeat(diar_preds.shape[0],1))).sample()
+        batch_probs_raw = torch.distributions.categorical.Categorical(probs=torch.tensor([(1-rttm_mix_prob), rttm_mix_prob]).repeat(diar_preds.shape[0],1)).sample()
         batch_probs = (batch_probs_raw.view(diar_preds.shape[0], 1, 1).repeat(1, diar_preds.shape[1], diar_preds.shape[2])).to(diar_preds.device)
         batch_diar_preds = (1 - batch_probs) * diar_preds + batch_probs * spk_targets
         return batch_diar_preds 

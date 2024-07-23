@@ -57,7 +57,6 @@ def dump_json_to_file(file_path: str, session_trans_dict: dict):
     with open(file_path, "w") as outfile:
         json.dump(session_trans_dict, outfile, indent=4)
 
-
 def write_txt(w_path: str, val: str):
     """
     Write a text file from the string input.
@@ -172,8 +171,6 @@ def convert_word_dict_seq_to_ctm(
             Example:
             >>> ctm_lines_list= ["my_audio_01 speaker_0 0.0 0.34 right 0",
                                   my_audio_01 speaker_0 0.64 0.81 and 0",
-
-
     """
     ctm_lines = []
     confidence = 0

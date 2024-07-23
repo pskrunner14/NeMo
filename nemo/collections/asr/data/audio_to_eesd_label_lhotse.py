@@ -54,10 +54,7 @@ class LhotseSpeechToDiarizationLabelDataset(torch.utils.data.Dataset):
         self.spk_tar_all_zero = self.cfg.get('spk_tar_all_zero',False)
         
     def __getitem__(self, cuts) -> Tuple[torch.Tensor, ...]:
-        try:
-            audio, audio_lens, cuts = self.load_audio(cuts)
-        except:
-            import ipdb; ipdb.set_trace()
+        audio, audio_lens, cuts = self.load_audio(cuts)
         speaker_activities = []
         for cut in cuts:
             speaker_activity = speaker_to_target(

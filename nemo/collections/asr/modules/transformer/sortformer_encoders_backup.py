@@ -223,7 +223,6 @@ class SortformerEncoderBlock(nn.Module):
         return sorted_output_states
     
     def p2_norm(self, sorted_output_states):
-        # import ipdb; ipdb.set_trace()
         return torch.nn.functional.normalize(sorted_output_states, p=2, dim=-1)
 
     def find_first_nonzero(self, mat, max_cap_val=-1):

@@ -1218,7 +1218,8 @@ class NeuralDiarizer(LightningModule):
                 Length of the sequence determined by `self.diar_window_length` variable.
         """
         emb_vectors_split = torch.zeros_like(emb_vectors)
-        uniq_id = os.path.splitext(os.path.basename(test_data_collection.audio_file))[0]
+        # uniq_id = os.path.splitext(os.path.basename(test_data_collection.audio_file))[0]
+        uniq_id = test_data_collection.uniq_id
         clus_label_tensor = torch.tensor([x[-1] for x in self.msdd_model.clus_test_label_dict[uniq_id]])
         for spk_idx in range(len(test_data_collection.target_spks)):
             stt, end = (
@@ -1228,13 +1229,14 @@ class NeuralDiarizer(LightningModule):
             seq_len = end - stt
             if stt < clus_label_tensor.shape[0]:
                 target_clus_label_tensor = clus_label_tensor[stt:end]
-                emb_seq, seg_length = (
-                    signals[stt:end, :, :],
-                    min(
-                        self.diar_window_length,
-                        clus_label_tensor.shape[0] - diar_window_index * self.diar_window_length,
-                    ),
-                )
+                # emb_seq, seg_length = (
+                #     signals[stt:end, :, :],
+                #     min(
+                #         self.diar_window_length,
+                #         clus_label_tensor.shape[0] - diar_window_index * self.diar_window_length,
+                #     ),
+                # )
+                emb_seq = signals[stt:end, :, :]
                 target_clus_label_bool = target_clus_label_tensor == test_data_collection.target_spks[spk_idx]
 
                 # There are cases where there is no corresponding speaker in split range, so any(target_clus_label_bool) could be False.
@@ -1371,7 +1373,7 @@ class NeuralDiarizer(LightningModule):
         preds_list, targets_list, signal_lengths_list = [], [], []
         uniq_id_list = get_uniq_id_list_from_manifest(self.msdd_model.cfg.test_ds.manifest_filepath)
         test_data_collection = [d for d in self.msdd_model.data_collection]
-        import ipdb; ipdb.set_trace()
+        # import ipdb; ipdb.set_trace()
         for sidx, test_batch in enumerate(tqdm(self.msdd_model.test_dataloader())):
             signals, signal_lengths, _targets, emb_vectors = test_batch
             cumul_sample_count.append(cumul_sample_count[-1] + signal_lengths.shape[0])

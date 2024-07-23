@@ -76,7 +76,8 @@ def prepare_manifest(config: dict) -> str:
         input_list = []
         with open(config['input'], 'r', encoding='utf-8') as manifest:
             for line in manifest.readlines():
-                input_list.append(json.loads(line.strip()))
+                loaded_dict = json.loads(line.strip())
+                input_list.append(loaded_dict)
     elif type(config['input']) == list:
         input_list = config['input']
     else:
@@ -148,7 +149,7 @@ def write_vad_infer_manifest(file: dict, args_func: dict) -> list:
     filepath = file['audio_filepath']
     in_duration = file.get('duration', None)
     in_offset = file.get('offset', 0)
-
+    uniq_id = file.get('uniq_id', None)
     # if filepath is not found, try to find it in the dir of manifest
     if not Path(filepath).is_file():
         new_filepath = Path(args_func['manifest_dir']) / filepath
@@ -191,6 +192,7 @@ def write_vad_infer_manifest(file: dict, args_func: dict) -> list:
                 left -= split_duration
 
             metadata = {
+                'uniq_id': uniq_id,
                 'audio_filepath': filepath,
                 'duration': write_duration,
                 'label': label,

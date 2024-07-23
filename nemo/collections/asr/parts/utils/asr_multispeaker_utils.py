@@ -159,7 +159,7 @@ def speaker_to_target(
 
     seen = set()
     seen_add = seen.add
-    speaker_ats = [s.speaker for s in segments if not (s.speaker in seen or seen_add(s.speaker))]
+    speaker_ats = [s.speaker for s in segments_total if not (s.speaker in seen or seen_add(s.speaker))]
     
     speaker_to_idx_map = {
             spk: idx
@@ -171,7 +171,7 @@ def speaker_to_target(
     if spk_tar_all_zero: 
         mask = torch.zeros((num_speakers, get_hidden_length_from_sample_length(cut.num_samples, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)))
     else:
-        mask = get_mask_from_segments(segments, cut, speaker_to_idx_map, num_speakers, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
+        mask = get_mask_from_segments(segments_total, cut_list[0], speaker_to_idx_map, num_speakers, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
 
     return mask
 

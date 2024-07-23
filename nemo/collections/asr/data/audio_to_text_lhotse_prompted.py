@@ -111,7 +111,6 @@ class PromptedAudioToTextSpkLhotseDataset(torch.utils.data.Dataset):
         self.padding_value = self.tokenizer._tokenizer.pad_id
         self.prompt_format_fn = prompt_format_fn
         self.inference = inference
-
         
         self.spk_tar_all_zero = self.cfg.get('spk_tar_all_zero',False)
         self.shuffle_spk_mapping = self.cfg.get('shuffle_spk_mapping', True)

@@ -143,7 +143,6 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
         #concatenate and projection
         encoded = torch.cat([torch.transpose(encoded, 1, 2), spk_targets], dim = 2) #concatenate speaker tar with encoded 
         encoded = torch.transpose(self.enc_spk_proj(encoded), 1, 2) #transpose to make  (B, T, D)
-
  
         # During training, loss must be computed, so decoder forward is necessary
         decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)

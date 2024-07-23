@@ -31,8 +31,8 @@ model:
   prompt_format: ???   # Options supported: ["canary"]
 
   freeze_diar: true
-  spk_supervision_strategy: "rttm" # Options: "rttm", "diar" and "mix"
-  rttm_mix_prob: 0.5 # The sampling probability when mixing RTTMs
+  spk_supervision_strategy: "mix" # Options: "rttm", "diar" and "mix"
+  rttm_mix_prob: 0.9 # The sampling probability when mixing RTTMs
   shuffle_spk_mapping: True # Shuffle the speaker mapping in both transcript and RTTM/diar_preds
 
   model_defaults:
@@ -76,7 +76,7 @@ model:
     spk_tar_all_zero: ${model.model_defaults.spk_tar_all_zero}
     num_sample_per_mel_frame: ${model.model_defaults.num_sample_per_mel_frame}
     num_mel_frame_per_asr_frame: ${model.model_defaults.num_mel_frame_per_asr_frame}
-
+    shuffle_spk_mapping: ${model.shuffle_spk_mapping}
 
   validation_ds:
     use_lhotse: true
@@ -91,6 +91,7 @@ model:
     spk_tar_all_zero: ${model.model_defaults.spk_tar_all_zero}
     num_sample_per_mel_frame: ${model.model_defaults.num_sample_per_mel_frame}
     num_mel_frame_per_asr_frame: ${model.model_defaults.num_mel_frame_per_asr_frame}
+    shuffle_spk_mapping: False
 
   test_ds:
     use_lhotse: true

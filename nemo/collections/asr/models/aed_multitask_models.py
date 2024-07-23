@@ -1354,7 +1354,7 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
         diarization_preds: diarization output of shape [4, T, D]
         """
 
-    def _get_probablistic_mix(self, diar_preds, spk_targets, mix_prob:float=0.0):
+    def _get_probablistic_mix(self, diar_preds, spk_targets, rttm_mix_prob:float=0.0):
         """ 
         Sample a probablistic mixture of speaker labels for each time step then apply it to the diarization predictions and the speaker targets.
         
@@ -1365,9 +1365,9 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
         Returns:
             mix_prob (float): Tensor of shape [B, T, D] representing the probablistic mixture of speaker labels for each time step.
         """
-        batch_probs_raw = torch.distributions.categorical.Categorical(probs=torch.tensor(torch.tensor([(1-mix_prob), mix_prob]).repeat(diar_preds.shape[0],1))).sample()
+        batch_probs_raw = torch.distributions.categorical.Categorical(probs=torch.tensor(torch.tensor([(1-rttm_mix_prob), rttm_mix_prob]).repeat(diar_preds.shape[0],1))).sample()
         batch_probs = (batch_probs_raw.view(diar_preds.shape[0], 1, 1).repeat(1, diar_preds.shape[1], diar_preds.shape[2])).to(diar_preds.device)
-        batch_diar_preds = batch_probs * diar_preds + (1 - batch_probs) * spk_targets
+        batch_diar_preds = (1 - batch_probs) * diar_preds + batch_probs * spk_targets
         return batch_diar_preds 
     
     @typecheck()
@@ -1420,6 +1420,24 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
                 # pred shape = B * T (-1 or -2) * D 
                 # May 23 2024 -> sortformer produces 1 or 2 frames less than FC, FIX!!!
 
+            # Speaker supervision strategy settings
+            if self.cfg.spk_supervision_strategy == 'rttm':
+                if spk_targets is not None:
+                    diar_preds = spk_targets 
+                else:
+                    raise ValueError("`spk_targets` is required for speaker supervision strategy 'rttm'")
+            elif self.cfg.spk_supervision_strategy == 'diar':
+                if diar_preds is None:
+                    raise ValueError("`diar_pred`is required for speaker supervision strategy 'diar'")
+            elif self.cfg.spk_supervision_strategy == 'mix':
+                diar_preds = self._get_probablistic_mix(diar_preds=diar_preds, spk_targets=spk_targets, rttm_mix_prob=float(self.cfg.rttm_mix_prob))
+            else:
+                raise ValueError(f"Invalid RTTM strategy {self.cfg.spk_supervision_strategy} is not supported.")
+            
+            # Speaker mapping shuffling to equalize the speaker label's distributions
+            if self.cfg.shuffle_spk_mapping:
+                diar_preds = apply_spk_mapping(diar_preds, spk_mappings)
+            
             if(diar_preds.shape[1]!=asr_enc_states.shape[1]):
             # KD duct-tape solution for extending the speaker predictions 
                 asr_frame_count = asr_enc_states.shape[1]
@@ -1435,22 +1453,6 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
             
             if diar_preds.shape[1] > asr_enc_states.shape[1]:
                 diar_preds = diar_preds[:, :asr_enc_states.shape[1], :]
-            
-            if self.cfg.spk_supervision_strategy == 'rttm':
-                if spk_targets is not None:
-                    diar_preds = spk_targets 
-                else:
-                    raise ValueError("`spk_targets` is required for speaker supervision strategy 'rttm'")
-            elif self.cfg.spk_supervision_strategy == 'diar':
-                if diar_preds is None:
-                    raise ValueError("`diar_pred`is required for speaker supervision strategy 'diar'")
-            elif self.cfg.spk_supervision_strategy == 'mix':
-                diar_preds = self._get_probablistic_mix(diar_preds=diar_preds, spk_targets=spk_targets, mix_prob=float(self.cfg.rttm_mix_prob))
-            else:
-                raise ValueError(f"Invalid RTTM strategy {self.cfg.spk_supervision_strategy} is not supported.")
-              
-            if self.cfg.shuffle_spk_mapping:
-                diar_preds = apply_spk_mapping(diar_preds, spk_mappings)
               
             concat_enc_states = torch.cat([asr_enc_states, diar_preds], dim=-1)
             enc_states = self.joint_proj(concat_enc_states)

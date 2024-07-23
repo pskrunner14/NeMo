@@ -139,7 +139,7 @@ def speaker_to_target(
     rttms = SupervisionSet.from_rttm(a_cut.rttm_filepath)
     basename = os.path.basename(a_cut.rttm_filepath).replace('.rttm', '')
     if isinstance(a_cut, MixedCut):
-        cut_list = [track.cut for track in cut.tracks] 
+        cut_list = [track.cut for track in a_cut.tracks] 
     elif isinstance(a_cut, MonoCut):
         cut_list = [a_cut]
     else:

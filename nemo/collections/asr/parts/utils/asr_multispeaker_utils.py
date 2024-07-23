@@ -43,9 +43,13 @@ def apply_spk_mapping(diar_preds: torch.Tensor, spk_mappings: torch.Tensor) -> t
 
 def shuffle_spk_mapping(cuts: list, num_speakers: int, shuffle_spk_mapping: bool = False, pattern= r'<\|spltoken\d+\|>') -> Tuple[CutSet, torch.Tensor]:
     """ 
-    Applies a shuffle mapping to speaker labels in the cuts.
-    Debug with:
-    # print(f"idx: {idx} : spk mapping {spk_mappings[idx]} | word: {word} -> new_word: {new_word}")
+    Applies a shuffle mapping to speaker text labels in the cuts.
+    Example:
+        Original cut.text:
+            "<|spltoken0|> we do shuffle <|spltoken1|> and map speakers <|spltoken0|> yes <|spltoken2|> we keep dimensions" 
+        Speaker Mapping: [3, 0, 1, 2]
+        Shuffled cut.text:
+            "<|spltoken3|> we do shuffle <|spltoken0|> and map speakers <|spltoken3|> yes <|spltoken1|> we keep dimensions" 
 
     Args:
         cuts (List[MonoCut, MixedCut]): A list of Cut instances.
@@ -55,45 +59,46 @@ def shuffle_spk_mapping(cuts: list, num_speakers: int, shuffle_spk_mapping: bool
 
     Returns:
         cuts (list): The updated CutSet with shuffled speaker mappings.
-        spk_mappings (Tensor): The shuffled speaker mappings.
+        spk_mappings (Tensor): The shuffled speaker mappings in batch.
     """ 
     if shuffle_spk_mapping:
         batch_size = len(cuts) 
-        numbers = torch.tensor([x for x in range(num_speakers)]).repeat(batch_size, 1)
         permuted_indices = torch.rand(batch_size, 4).argsort(dim=1)
-        spk_mappings = torch.gather(numbers, 1, permuted_indices)
+        spk_mappings = torch.gather(torch.arange(num_speakers).repeat(batch_size, 1), 1, permuted_indices)
         str_pattern = pattern.replace("\\", '')
         left_str, right_str = str_pattern.split('d+')[0], str_pattern.split('d+')[1]
         for idx, cut in enumerate(cuts):
-            new_cut_text = deepcopy(cut.text)
             word_list = []
-            for word in new_cut_text.split(): 
+            for word in deepcopy(cut.text).split(): 
                 if len(re.findall(pattern, word)) > 0:
                     spk_token_int = int(word.replace(left_str,'').replace(right_str, ''))
                     new_spk = spk_mappings[idx][spk_token_int]
-                    new_word = f'{left_str}{new_spk}{right_str}'
-                    word_list.append(new_word)
+                    word_list.append(f'{left_str}{new_spk}{right_str}')
                 else:
                     word_list.append(word)
             cuts[idx].text = ' '.join(word_list)
     else:
-        spk_mappings = torch.arange(num_speakers).unsqueeze(0).repeat(len(cuts), 1)    
+        spk_mappings = torch.arange(num_speakers).unsqueeze(0).repeat(batch_size, 1)    
     return cuts, spk_mappings 
 
 def find_segments_from_rttm(
-        recording_id, 
+        recording_id: str, 
         rttms, 
-        start_after, 
-        end_before, 
+        start_after: float, 
+        end_before: float, 
         adjust_offset=True, 
         tolerance=0.001):
     """ 
     Finds segments from the given rttm file.
+    This function is designed to replace rttm
 
     Args:
+        recording_id (str): The recording ID in string format.
         rttms (SupervisionSet): The SupervisionSet instance.
-        start (float): The start time.
-        end (float): The end time.
+        start_after (float): The start time after which segments are selected.
+        end_before (float): The end time before which segments are selected.
+        adjust_offset (bool): Whether to adjust the offset of the segments.
+        tolerance (float): The tolerance for time matching. 0.001 by default.
     
     Returns:
         segments (List[SupervisionSegment]): A list of SupervisionSegment instances.
@@ -160,7 +165,7 @@ def speaker_to_target(
     seen = set()
     seen_add = seen.add
     speaker_ats = [s.speaker for s in segments_total if not (s.speaker in seen or seen_add(s.speaker))]
-    
+     
     speaker_to_idx_map = {
             spk: idx
             for idx, spk in enumerate(speaker_ats)
@@ -169,18 +174,15 @@ def speaker_to_target(
         raise ValueError(f"Number of speakers {len(speaker_to_idx_map)} is larger than the maximum number of speakers {num_speakers}")
     # initialize mask matrices (num_speaker, encoder_hidden_len)
     if spk_tar_all_zero: 
-        mask = torch.zeros((num_speakers, get_hidden_length_from_sample_length(cut.num_samples, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)))
+        mask = torch.zeros((num_speakers, get_hidden_length_from_sample_length(a_cut.num_samples, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)))
     else:
         mask = get_mask_from_segments(segments_total, cut_list[0], speaker_to_idx_map, num_speakers, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
-
     return mask
 
-def get_mask_from_segments(segments, cut, speaker_to_idx_map, num_speakers=4, num_sample_per_mel_frame=160, num_mel_frame_per_asr_frame=8):
+def get_mask_from_segments(segments: list, cut, speaker_to_idx_map: torch.Tensor, num_speakers: int =4, num_sample_per_mel_frame: int=160, num_mel_frame_per_asr_frame:int=8):
     """ 
     Generate mask matrix from segments list.
     This function is needed for speaker diarization with ASR model trainings.
-    Debug with:
-    # print(f"id: {cut.recording_id} spk_idx: {speaker_idx} st: {stt}, et: {ent}, st_encoder_loc: {st_encoder_loc}, et_encoder_loc: {et_encoder_loc}")
     
     Args:
         segments: A list of Lhotse Supervision segments iterator.

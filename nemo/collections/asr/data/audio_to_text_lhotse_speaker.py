@@ -69,7 +69,7 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, cuts) -> Tuple[torch.Tensor, ...]:
         cuts, spk_mappings = shuffle_spk_mapping(cuts=cuts, num_speakers=self.num_speakers, shuffle_spk_mapping=self.shuffle_spk_mapping, pattern=self.spk_token_pattern)
-        spk_targets = [torch.transpose(torch.as_tensor(speaker_to_target(cut, self.num_speakers, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, self.spk_tar_all_zero), dtype=torch.float32), 0, 1) for cut in cuts]
+        spk_targets = [torch.as_tensor(speaker_to_target(cut, self.num_speakers, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, self.spk_tar_all_zero), dtype=torch.float32) for cut in cuts]
         audio, audio_lens, cuts = self.load_audio(cuts)
         tokens = [torch.as_tensor(self.tokenizer(c.supervisions[0].text, c.supervisions[0].language)) for c in cuts]
         token_lens = torch.tensor([t.size(0) for t in tokens], dtype=torch.long)

@@ -34,6 +34,7 @@ model:
   spk_supervision_strategy: "mix" # Options: "rttm", "diar" and "mix"
   rttm_mix_prob: 0.9 # The sampling probability when mixing RTTMs
   shuffle_spk_mapping: True # Shuffle the speaker mapping in both transcript and RTTM/diar_preds
+  max_num_speakers: 4 # Maximum number of speakers in the dataset
 
   model_defaults:
     # asr

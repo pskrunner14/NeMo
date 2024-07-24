@@ -34,6 +34,7 @@ from nemo.collections.asr.parts.utils.speaker_utils import (
     audio_rttm_map,
     get_embs_and_timestamps,
     get_uniqname_from_filepath,
+    get_uniq_id_from_manifest_line,
     parse_scale_configs,
     perform_clustering,
     segments_manifest_to_subsegments_manifest,
@@ -211,8 +212,10 @@ class ClusteringDiarizer(torch.nn.Module, Model, DiarizationMixin):
         all_len = 0
         data = []
         for line in open(manifest_file, 'r', encoding='utf-8'):
-            file = json.loads(line)['audio_filepath']
-            data.append(get_uniqname_from_filepath(file))
+            # manifest_dic = json.loads(line)
+            # file = manifest_dic['audio_filepath']
+            uniq_id = get_uniq_id_from_manifest_line(line)
+            data.append(uniq_id)
 
         status = get_vad_stream_status(data)
         for i, test_batch in enumerate(
@@ -456,7 +459,7 @@ class ClusteringDiarizer(torch.nn.Module, Model, DiarizationMixin):
         )
 
         # Clustering
-        all_reference, all_hypothesis = perform_clustering(
+        all_reference, all_hypothesis, all_uem = perform_clustering(
             embs_and_timestamps=embs_and_timestamps,
             AUDIO_RTTM_MAP=self.AUDIO_RTTM_MAP,
             out_rttm_dir=out_rttm_dir,
@@ -472,7 +475,7 @@ class ClusteringDiarizer(torch.nn.Module, Model, DiarizationMixin):
             all_reference,
             all_hypothesis,
             collar=self._diarizer_params.collar,
-            all_uem=None,
+            all_uem=all_uem,
             ignore_overlap=self._diarizer_params.ignore_overlap,
             verbose=self.verbose,
         )

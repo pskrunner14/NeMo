@@ -59,11 +59,13 @@ def shuffle_spk_mapping(cuts: list, num_speakers: int, shuffle_spk_mapping: bool
 
     Returns:
         cuts (list): The updated CutSet with shuffled speaker mappings.
-        spk_mappings (Tensor): The shuffled speaker mappings in batch.
+        spk_mappings (Tensor): 
+            If shuffle_speaker_mapping is True, shuffled speaker mappings in batch.
+            If shuffle_speaker_mapping is False, speaker mappings in batch is not permuted and returns torch.arange() values.
     """ 
-    batch_size = len(cuts)
-    if shuffle_spk_mapping: 
-        permuted_indices = torch.rand(batch_size, 4).argsort(dim=1)
+    batch_size = len(cuts) 
+    if shuffle_spk_mapping:
+        permuted_indices = torch.rand(batch_size, num_speakers).argsort(dim=1)
         spk_mappings = torch.gather(torch.arange(num_speakers).repeat(batch_size, 1), 1, permuted_indices)
         str_pattern = pattern.replace("\\", '')
         left_str, right_str = str_pattern.split('d+')[0], str_pattern.split('d+')[1]
@@ -78,7 +80,7 @@ def shuffle_spk_mapping(cuts: list, num_speakers: int, shuffle_spk_mapping: bool
                     word_list.append(word)
             cuts[idx].text = ' '.join(word_list)
     else:
-        spk_mappings = torch.arange(num_speakers).unsqueeze(0).repeat(batch_size, 1)    
+        spk_mappings = torch.arange(num_speakers).unsqueeze(0).repeat(batch_size, 1)
     return cuts, spk_mappings 
 
 def find_segments_from_rttm(
@@ -164,8 +166,8 @@ def speaker_to_target(
 
     seen = set()
     seen_add = seen.add
-    speaker_ats = [s.speaker for s in segments if not (s.speaker in seen or seen_add(s.speaker))]
-    
+    speaker_ats = [s.speaker for s in segments_total if not (s.speaker in seen or seen_add(s.speaker))]
+     
     speaker_to_idx_map = {
             spk: idx
             for idx, spk in enumerate(speaker_ats)
@@ -176,11 +178,10 @@ def speaker_to_target(
     if spk_tar_all_zero: 
         mask = torch.zeros((num_speakers, get_hidden_length_from_sample_length(a_cut.num_samples, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)))
     else:
-        mask = get_mask_from_segments(segments, a_cut, speaker_to_idx_map, num_speakers, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
-
+        mask = get_mask_from_segments(segments_total, a_cut, speaker_to_idx_map, num_speakers, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
     return mask
 
-def get_mask_from_segments(segments: list, cut, speaker_to_idx_map: torch.Tensor, num_speakers: int =4, num_sample_per_mel_frame: int=160, num_mel_frame_per_asr_frame:int=8):
+def get_mask_from_segments(segments: list, a_cut, speaker_to_idx_map: torch.Tensor, num_speakers: int =4, num_sample_per_mel_frame: int=160, num_mel_frame_per_asr_frame:int=8):
     """ 
     Generate mask matrix from segments list.
     This function is needed for speaker diarization with ASR model trainings.
@@ -197,18 +198,17 @@ def get_mask_from_segments(segments: list, cut, speaker_to_idx_map: torch.Tensor
         mask (Tensor): A numpy array of shape (num_speakers, encoder_hidden_len).
             Dimension: (num_speakers, num_frames)
     """
-    encoder_hidden_len = get_hidden_length_from_sample_length(cut.num_samples, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
+    encoder_hidden_len = get_hidden_length_from_sample_length(a_cut.num_samples, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
     mask = torch.zeros((num_speakers, encoder_hidden_len))
     for rttm_sup in segments:
         speaker_idx = speaker_to_idx_map[rttm_sup.speaker]
         # only consider the first <num_speakers> speakers
-        stt = compute_num_samples(max(rttm_sup.start, 0), cut.sampling_rate)
-        ent = compute_num_samples(min(rttm_sup.end, cut.duration), cut.sampling_rate)
+        stt = compute_num_samples(max(rttm_sup.start, 0), a_cut.sampling_rate)
+        ent = compute_num_samples(min(rttm_sup.end, a_cut.duration), a_cut.sampling_rate)
         # map start time (st) and end time (et) to encoded hidden location
         st_encoder_loc = 0 if stt == 0 else get_hidden_length_from_sample_length(stt, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
         et_encoder_loc = get_hidden_length_from_sample_length(ent, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
         mask[speaker_idx, st_encoder_loc:et_encoder_loc] = 1
-
     return mask 
 
 def get_hidden_length_from_sample_length(

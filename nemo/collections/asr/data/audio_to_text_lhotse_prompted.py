@@ -15,11 +15,19 @@ from typing import Callable, Sequence
 
 import omegaconf
 import torch.utils.data
+from pathlib import Path
 from lhotse import CutSet
 from lhotse.cut import MixedCut, MonoCut
 from lhotse.dataset import AudioSamples
-from lhotse.dataset.collation import collate_vectors
-
+from lhotse.dataset.collation import collate_vectors, collate_matrices
+from lhotse.utils import compute_num_samples
+from lhotse import SupervisionSet
+from nemo.collections.asr.parts.utils.asr_multispeaker_utils import (
+    speaker_to_target, 
+    get_hidden_length_from_sample_length, 
+    get_mask_from_segments,
+    shuffle_spk_mapping
+)
 from nemo.collections.asr.data.audio_to_text_lhotse import TokenizerWrapper
 from nemo.collections.common.tokenizers import CanaryTokenizer, TokenizerSpec
 
@@ -73,6 +81,68 @@ class PromptedAudioToTextLhotseDataset(torch.utils.data.Dataset):
 
         return audio, audio_lens, tokens, token_lens, prompt_tokens, prompt_token_lens
 
+class PromptedAudioToTextSpkLhotseDataset(torch.utils.data.Dataset):
+    """
+    This dataset is based on :class:`~nemo.collections.asr.data.audio_to_text_lhotse.LhotseSpeechToTextBpeDataset`.
+    It is a Lhotse-style dataset that converts a mini-batch of Cuts into tensors.
+    The main difference from ``LhotseSpeechToTextBpeDataset`` is that we introduce
+    a special prompt format for multitask encoder-decoder models.
+
+    To perform the prompt formatting, we accept a ``prompt_format_fn``.
+    It's expected to accept:
+    * a ``CutSet`` which it will internally iterate over for utterances, and
+    * a ``TokenizerWrapper`` object that will be internally used to tokenize the utterances
+
+    Tokenized utterances will be extended with special prompt tokens according to ``prompt_format_fn`` logic.
+    We support cuts with multiple supervision segments -- their tokenized texts will be concatenated before we add the prompt tokens.
+    This is useful, for example, in code-switched scenarios where each segment is spoken in a different language.
+    """
+    def __init__(
+        self,
+        cfg,
+        tokenizer: TokenizerSpec,
+        prompt_format_fn: Callable[[CutSet, TokenizerWrapper, bool], Sequence[Sequence[int]]],
+        inference: bool = False,
+    ):
+        super().__init__()
+        self.cfg = cfg
+        self.tokenizer = TokenizerWrapper(tokenizer)
+        self.load_audio = AudioSamples(fault_tolerant=True)
+        self.padding_value = self.tokenizer._tokenizer.pad_id
+        self.prompt_format_fn = prompt_format_fn
+        self.inference = inference
+        
+        self.spk_tar_all_zero = self.cfg.get('spk_tar_all_zero',False)
+        self.shuffle_spk_mapping = self.cfg.get('shuffle_spk_mapping', False)
+        self.num_speakers = self.cfg.get('num_speakers', 4)
+        self.num_sample_per_mel_frame = self.cfg.get('num_sample_per_mel_frame', 160)
+        self.num_mel_frame_per_asr_frame = self.cfg.get('num_mel_frame_per_asr_frame', 8)
+        self.spk_token_pattern= r'<\|spltoken\d+\|>'
+     
+    def __getitem__(self, cuts: CutSet) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        cuts, spk_mappings = shuffle_spk_mapping(cuts=cuts, 
+                                                 num_speakers=self.num_speakers, 
+                                                 shuffle_spk_mapping=self.shuffle_spk_mapping, 
+                                                 pattern=self.spk_token_pattern
+                                                )
+        audio, audio_lens, cuts = self.load_audio(cuts)
+        tokens, prompt_tokens = self.prompt_format_fn(cuts, self.tokenizer, inference=self.inference)
+
+        tokens = [torch.as_tensor(t) for t in tokens]
+        token_lens = torch.tensor([t.size(0) for t in tokens], dtype=torch.long)
+        tokens = collate_vectors(tokens, padding_value=self.padding_value)
+
+        if self.inference:
+            prompt_tokens = [torch.as_tensor(t) for t in prompt_tokens]
+            prompt_token_lens = torch.tensor([t.size(0) for t in prompt_tokens], dtype=torch.long)
+            prompt_tokens = collate_vectors(prompt_tokens, padding_value=self.padding_value)
+        else:
+            prompt_tokens = None
+            prompt_token_lens = None
+
+        spk_targets = [torch.transpose(torch.as_tensor(speaker_to_target(_cut, self.num_speakers, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, self.spk_tar_all_zero), dtype=torch.float32), 0, 1) for _cut in cuts]
+        spk_targets = collate_matrices(spk_targets)
+        return audio, audio_lens, tokens, token_lens, prompt_tokens, prompt_token_lens, spk_targets, spk_mappings
 
 # Mapping from a string name to a known prompt formatter function.
 PROMPT_FORMAT_FNS = {}
@@ -128,7 +198,6 @@ def canary(cuts: CutSet, tokenizer: TokenizerWrapper, inference: bool = False) -
     (i.e., spoken language in the recording) and the second occurrence is for the "target" language
     (i.e., the language in which we are going to output the text).
     """
-
     assert isinstance(
         tokenizer._tokenizer, CanaryTokenizer
     ), "To use 'canary' prompt format, you must use the CanaryTokenizer."

@@ -24,6 +24,7 @@ from pytorch_lightning import Trainer
 
 from nemo.collections.asr.data.audio_to_text_lhotse_prompted import (
     PromptedAudioToTextLhotseDataset,
+    PromptedAudioToTextSpkLhotseDataset,
     get_prompt_format_fn,
 )
 from nemo.collections.asr.metrics import BLEU, WER
@@ -44,6 +45,7 @@ from nemo.collections.asr.parts.utils import manifest_utils
 from nemo.collections.asr.parts.utils.audio_utils import ChannelSelectorType
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 from nemo.collections.common import tokenizers
+from nemo.collections.asr.parts.utils.asr_multispeaker_utils import apply_spk_mapping
 # from nemo.collections.common.data.lhotse.dataloader import get_lhotse_dataloader_from_config
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 from nemo.collections.common.metrics import GlobalAverageLossMetric
@@ -103,7 +105,6 @@ class MultiTaskTranscriptionConfig(TranscribeConfig):
     """
     Configuration for Multi Task Transcription
     """
-
     task: Optional[str] = None
     pnc: Optional[bool] = None
     source_lang: Optional[str] = None
@@ -1023,28 +1024,44 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
                 self.segment_shift = 8
         else:
             self.diar = False
-            
+        self.spk_token_pattern = r'<\|spltoken\d+\|>'
+        
+    @property
+    def input_types(self) -> Optional[Dict[str, NeuralType]]:
+        if hasattr(self.preprocessor, '_sample_rate'):
+            input_signal_eltype = AudioSignal(freq=self.preprocessor._sample_rate)
+        else:
+            input_signal_eltype = AudioSignal()
+        return {
+            "input_signal": NeuralType(('B', 'T'), input_signal_eltype, optional=True),
+            "input_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
+            "processed_signal": NeuralType(('B', 'D', 'T'), SpectrogramType(), optional=True),
+            "processed_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
+            "transcript": NeuralType(('B', 'T'), LabelsType(), optional=True),
+            "transcript_length": NeuralType(tuple('B'), LengthsType(), optional=True),
+            "prompt": NeuralType(('B', 'T'), LabelsType(), optional=True),
+            "prompt_length": NeuralType(tuple('B'), LengthsType(), optional=True),
+            "sample_id": NeuralType(tuple('B'), LengthsType(), optional=True),
+            "spk_targets": NeuralType(('B', 'T', 'D'), LabelsType(), optional=True),
+            "spk_mappings": NeuralType(('B', 'D'), LabelsType(), optional=True),
+        }
 
-    # def _init_spk_model(self):
-    #     """
-    #     Initialize the speaker model.
-    #     """
-    #     self.spk_preprocessor = EncDecSpeakerLabelModel.from_config_dict(self.cfg.spk_preprocessor)
-    #     self.spk_encoder = EncDecSpeakerLabelModel.from_config_dict(self.cfg.spk_encoder)
-    #     self.spk_decoder = EncDecSpeakerLabelModel.from_config_dict(self.cfg.spk_decoder)
-
-    #     model_path = self.cfg.spk_model_path
-    #     if model_path is None:
-    #         model_path = 'titanet_small'
-    #     pretrained_spk_model = EncDecSpeakerLabelModel.from_pretrained(model_path, map_location="cpu")
-
-    #     logging.info("Restoring Speaker model from pretrained model.")
-    #     self.spk_encoder.load_state_dict(pretrained_spk_model.encoder.state_dict(), strict=True)
-    #     self.spk_decoder.load_state_dict(pretrained_spk_model.decoder.state_dict(), strict=True)
-
-    #     if self.cfg.freeze_spk:
-    #        self.spk_encoder.eval()
-    #        self.spk_decoder.eval()
+    def _setup_dataloader_from_config(self, config: Optional[Dict], inference: bool = False):
+        assert config.get("use_lhotse", False), (
+            "Multi-task model only supports dataloading with Lhotse. "
+            "Please set config.{train,validation,test}_ds.use_lhotse=True"
+        )
+        return get_lhotse_dataloader_from_config(
+            config,
+            global_rank=self.global_rank,
+            world_size=self.world_size,
+            dataset=PromptedAudioToTextSpkLhotseDataset(
+                cfg=config,
+                tokenizer=self.tokenizer,
+                prompt_format_fn=get_prompt_format_fn(self.prompt_format),
+                inference=inference,
+            ),
+        )
 
     def _init_diar_model(self):
         """
@@ -1189,6 +1206,78 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
 
         return mask, feat * mask
        
+    def training_step(self, batch, batch_nb):
+
+        if batch is None:
+            return torch.tensor([0.0])
+
+        # During training prompt and prompt_len are null, ignore.
+        signal, signal_len, transcript, transcript_len, prompt, prompt_len, spk_targets, spk_mappings = batch
+        input_ids, labels = transcript[:, :-1], transcript[:, 1:]
+
+        transf_log_probs, encoded_len, enc_states, enc_mask = self.forward(
+            input_signal=signal,
+            input_signal_length=signal_len,
+            transcript=input_ids,
+            transcript_length=transcript_len,
+            spk_targets=spk_targets,
+            spk_mappings=spk_mappings,
+        )
+
+        audio_loss = self.loss(log_probs=transf_log_probs, labels=labels)
+
+        tensorboard_logs = {
+            'train_loss': audio_loss,
+            'learning_rate': self._optimizer.param_groups[0]['lr'],
+        }
+
+        return {'loss': audio_loss, 'log': tensorboard_logs}
+
+    def validation_pass(self, batch, batch_idx, dataloader_idx=0, eval_mode="val"):
+        # During inference, dataloader passes pure prompt without transcript text.
+        signal, signal_len, transcript, transcript_len, prompt, prompt_len, spk_targets, spk_mappings = batch
+        input_ids, labels = transcript[:, :-1], transcript[:, 1:]
+
+        transf_log_probs, encoded_len, enc_states, enc_mask = self.forward(
+            input_signal=signal,
+            input_signal_length=signal_len,
+            transcript=input_ids,
+            transcript_length=transcript_len,
+            spk_targets=spk_targets,
+            spk_mappings=spk_mappings,
+        )
+
+        transf_loss = self.loss(log_probs=transf_log_probs, labels=labels)
+        self.val_loss(loss=transf_loss, num_measurements=transf_log_probs.shape[0] * transf_log_probs.shape[1])
+        output_dict = {
+            f'{eval_mode}_loss': transf_loss,
+        }
+
+        self.wer.update(
+            predictions=enc_states,
+            predictions_lengths=encoded_len,
+            targets=transcript,
+            targets_lengths=transcript_len,
+            predictions_mask=enc_mask,
+            input_ids=prompt,
+        )
+        wer, wer_num, wer_denom = self.wer.compute()
+        output_dict.update({"val_wer": wer, "val_wer_num": wer_num, "val_wer_denom": wer_denom})
+        self.wer.reset()
+
+        self.bleu.update(
+            predictions=enc_states,
+            predictions_lengths=encoded_len,
+            targets=transcript,
+            targets_lengths=transcript_len,
+            predictions_mask=enc_mask,
+            input_ids=prompt,
+        )
+        bleu_metrics = self.bleu.compute(prefix=f"{eval_mode}_")
+        output_dict.update(bleu_metrics)
+        self.bleu.reset()
+
+        return output_dict
 
     def forward_spk(
         self,
@@ -1265,6 +1354,22 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
         diarization_preds: diarization output of shape [4, T, D]
         """
 
+    def _get_probablistic_mix(self, diar_preds, spk_targets, rttm_mix_prob:float=0.0):
+        """ 
+        Sample a probablistic mixture of speaker labels for each time step then apply it to the diarization predictions and the speaker targets.
+        
+        Args:
+            diar_preds (Tensor): Tensor of shape [B, T, D] representing the diarization predictions.
+            spk_targets (Tensor): Tensor of shape [B, T, D] representing the speaker targets.
+            
+        Returns:
+            mix_prob (float): Tensor of shape [B, T, D] representing the probablistic mixture of speaker labels for each time step.
+        """
+        batch_probs_raw = torch.distributions.categorical.Categorical(probs=torch.tensor([(1-rttm_mix_prob), rttm_mix_prob]).repeat(diar_preds.shape[0],1)).sample()
+        batch_probs = (batch_probs_raw.view(diar_preds.shape[0], 1, 1).repeat(1, diar_preds.shape[1], diar_preds.shape[2])).to(diar_preds.device)
+        batch_diar_preds = (1 - batch_probs) * diar_preds + batch_probs * spk_targets
+        return batch_diar_preds 
+    
     @typecheck()
     def forward(
         self,
@@ -1273,7 +1378,9 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
         processed_signal=None,
         processed_signal_length=None,
         transcript=None,
-        transcript_length=None
+        transcript_length=None,
+        spk_targets=None,
+        spk_mappings=None,
     ):
         """
         Forward pass of the model.
@@ -1300,8 +1407,6 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
             4) The speaker embeddings of shape [B, D]
         """
         #logging.info('.......................', self.training, self.cfg.zero_prob)
-        
-        
 
         # ASR branch: downsample rate is 8
         with torch.set_grad_enabled(not self.cfg.freeze_asr):
@@ -1315,6 +1420,24 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
                 # pred shape = B * T (-1 or -2) * D 
                 # May 23 2024 -> sortformer produces 1 or 2 frames less than FC, FIX!!!
 
+            # Speaker supervision strategy settings
+            if self.cfg.spk_supervision_strategy == 'rttm':
+                if spk_targets is not None:
+                    diar_preds = spk_targets 
+                else:
+                    raise ValueError("`spk_targets` is required for speaker supervision strategy 'rttm'")
+            elif self.cfg.spk_supervision_strategy == 'diar':
+                if diar_preds is None:
+                    raise ValueError("`diar_pred`is required for speaker supervision strategy 'diar'")
+            elif self.cfg.spk_supervision_strategy == 'mix':
+                diar_preds = self._get_probablistic_mix(diar_preds=diar_preds, spk_targets=spk_targets, rttm_mix_prob=float(self.cfg.rttm_mix_prob))
+            else:
+                raise ValueError(f"Invalid RTTM strategy {self.cfg.spk_supervision_strategy} is not supported.")
+            
+            # Speaker mapping shuffling to equalize the speaker label's distributions
+            if self.cfg.shuffle_spk_mapping:
+                diar_preds = apply_spk_mapping(diar_preds, spk_mappings)
+            
             if(diar_preds.shape[1]!=asr_enc_states.shape[1]):
             # KD duct-tape solution for extending the speaker predictions 
                 asr_frame_count = asr_enc_states.shape[1]
@@ -1330,7 +1453,7 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
             
             if diar_preds.shape[1] > asr_enc_states.shape[1]:
                 diar_preds = diar_preds[:, :asr_enc_states.shape[1], :]
-
+              
             concat_enc_states = torch.cat([asr_enc_states, diar_preds], dim=-1)
             enc_states = self.joint_proj(concat_enc_states)
         else:

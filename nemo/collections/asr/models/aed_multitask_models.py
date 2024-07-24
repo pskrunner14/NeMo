@@ -1008,6 +1008,11 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
             else:
                 self.norm = None
 
+            if 'kernel_norm' in cfg:
+                self.kernel_norm = cfg.kernel_norm
+            else:
+                self.kernel_norm = None
+
             # projection layer
             proj_in_size = 4 + cfg.model_defaults.asr_enc_hidden
             proj_out_size = cfg.model_defaults.lm_dec_hidden
@@ -1027,14 +1032,14 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
             else:
                 self.segment_shift = 8
 
-            self.diar_kernel_type = 'projection'
-            self.diar_kernal = self.joint_proj
-
             if 'diar_kernel_type' in cfg:
                 if cfg.diar_kernel_type == 'sinusoidal':
                     self.diar_kernel_type = cfg.diar_kernel_type
                     self.diar_kernel = self.get_sinusoid_position_encoding(self.max_num_speakers, cfg.model_defaults.asr_enc_hidden)
-
+            else:
+                self.diar_kernel_type = 'projection'
+                self.diar_kernel = self.joint_proj
+                
         else:
             self.diar = False
             
@@ -1340,6 +1345,9 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
 
             if self.diar_kernel_type == 'sinusoidal':
                 speaker_infusion_asr = torch.matmul(diar_preds, self.diar_kernel.to(diar_preds.device))
+                if self.kernel_norm == 'l2':
+                    speaker_infusion_asr = torch.nn.functional.normalize(speaker_infusion_asr, p=2, dim=-1)
+                
                 enc_states = speaker_infusion_asr + asr_enc_states
             else:
                 concat_enc_states = torch.cat([asr_enc_states, diar_preds], dim=-1)

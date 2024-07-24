@@ -264,7 +264,7 @@ class _AudioMSDDTrainDataset(Dataset):
         *,
         manifest_filepath: str,
         preprocessor,
-        multiscale_args_dict: str,
+        # multiscale_args_dict: str,
         soft_label_thres: float,
         session_len_sec: float,
         num_spks: int,
@@ -276,6 +276,7 @@ class _AudioMSDDTrainDataset(Dataset):
         randomize_overlap_labels: bool = True,
         randomize_offset: bool = True,
         soft_targets: bool = False,
+        interpolate_scale: float = 0.16,
     ):
         super().__init__()
         self.collection = DiarizationSpeechLabel(
@@ -286,10 +287,15 @@ class _AudioMSDDTrainDataset(Dataset):
         )
         self.preprocessor = preprocessor
         self.featurizer = featurizer
-        self.multiscale_args_dict = multiscale_args_dict
+        self.interpolate_scale = interpolate_scale
+        self.multiscale_args_dict = {'use_single_scale_clustering': False, 
+                                     'scale_dict': {0: (interpolate_scale, interpolate_scale/2)}, 
+                                     'multiscale_weights': [1.0]}
+        
+        # self.multiscale_args_dict = multiscale_args_dict
         self.session_len_sec = session_len_sec
         self.scale_n = len(self.multiscale_args_dict['scale_dict'])
-        self.scale_dict = {int(k): v for k, v in multiscale_args_dict['scale_dict'].items()}
+        self.scale_dict = {int(k): v for k, v in self.multiscale_args_dict['scale_dict'].items()}
         self.feat_per_sec = int(1 / window_stride)
         self.feat_per_segment = int(self.scale_dict[self.scale_n-1][0] / window_stride)
 
@@ -570,7 +576,7 @@ class AudioToSpeechMSDDTrainDataset(_AudioMSDDTrainDataset):
         *,
         manifest_filepath: str,
         preprocessor,
-        multiscale_args_dict: Dict,
+        # multiscale_args_dict: Dict,
         soft_label_thres: float,
         session_len_sec: float,
         num_spks: int,
@@ -582,7 +588,7 @@ class AudioToSpeechMSDDTrainDataset(_AudioMSDDTrainDataset):
         super().__init__(
             manifest_filepath=manifest_filepath,
             preprocessor=preprocessor,
-            multiscale_args_dict=multiscale_args_dict,
+            # multiscale_args_dict=multiscale_args_dict,
             soft_label_thres=soft_label_thres,
             session_len_sec=session_len_sec,
             num_spks=num_spks,

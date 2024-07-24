@@ -94,15 +94,12 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         random.seed(42)
         self._trainer = trainer if trainer else None
         self.cfg_e2e_diarizer_model = cfg
-        self.encoder_infer_mode = False
         
-        self._init_segmentation_info()
         if self._trainer:
             self.world_size = trainer.num_nodes * trainer.num_devices
         else:
             self.world_size = 1
 
-        self._init_msdd_scales()  
         if self._trainer is not None and self.cfg_e2e_diarizer_model.get('augmentor', None) is not None:
             self.augmentor = process_augmentations(self.cfg_e2e_diarizer_model.augmentor)
         else:
@@ -161,11 +158,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             self.loss = instantiate(self.cfg_e2e_diarizer_model.loss)
             self.multichannel_mixing = self.cfg_e2e_diarizer_model.get('multichannel_mixing', True)
 
-        self.multiscale_layer = MultiScaleLayer(cfg_e2e_diarizer_model=cfg, 
-                                                preprocessor_cfg=self.preprocessor._cfg,
-                                                speaker_model=self.sortformer_diarizer._speaker_model,
-        )
-        self.msdd_multiscale_args_dict = self.multiscale_layer.multiscale_args_dict
         self.streaming_mode = self.cfg_e2e_diarizer_model.get("streaming_mode", False)
         self.use_positional_embedding = self.cfg_e2e_diarizer_model.get("use_positional_embedding", False)
         self.use_roformer = self.cfg_e2e_diarizer_model.get("use_roformer", False)
@@ -191,86 +183,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         speaker_inds = list(range(self.cfg_e2e_diarizer_model.max_num_of_spks))
         self.spk_perm = torch.tensor(list(itertools.permutations(speaker_inds))) # Get all permutations
 
-    def _init_segmentation_info(self):
-        """Initialize segmentation settings: window, shift and multiscale weights.
-        """
-        self._diarizer_params = self.cfg_e2e_diarizer_model.diarizer
-        intp_scale = self.cfg_e2e_diarizer_model.interpolated_scale
-        self.multiscale_args_dict = {'use_single_scale_clustering': False, 
-                                     'scale_dict': {0: (intp_scale, intp_scale/2)}, 
-                                     'multiscale_weights': [1.0]}
-    
-    def _init_msdd_scales(self,):
-        window_length_in_sec = self.cfg_e2e_diarizer_model.diarizer.speaker_embeddings.parameters.window_length_in_sec
-        self.msdd_multiscale_args_dict = self.multiscale_args_dict
-        self.model_spk_num = self.cfg_e2e_diarizer_model.max_num_of_spks
-        if self.cfg_e2e_diarizer_model.get('interpolated_scale', None) is not None:
-            self.cfg_e2e_diarizer_model.scale_n = len(window_length_in_sec) + 1 # Adding one interpolated scale
-            self.emb_scale_n = len(window_length_in_sec) # Scales that are extracted from the audio
-            self.msdd_multiscale_args_dict['scale_dict'][self.emb_scale_n] = (self.cfg_e2e_diarizer_model.interpolated_scale, self.cfg_e2e_diarizer_model.interpolated_scale/2)
-            self.msdd_multiscale_args_dict['multiscale_weights'] = [1.0] * (self.emb_scale_n+1)
-            self.msdd_scale_n = int(self.emb_scale_n+1) if self.cfg_e2e_diarizer_model.interpolated_scale is not None else int(self.emb_scale_n)
-        else:
-            # Only use the scales in window_length_in_sec
-            self.cfg_e2e_diarizer_model.scale_n = len(window_length_in_sec)
-            self.emb_scale_n = self.cfg_e2e_diarizer_model.scale_n
-            self.msdd_scale_n = self.cfg_e2e_diarizer_model.scale_n
-
-    def setup_optimizer_param_groups(self):
-        """
-        Override function in ModelPT to allow for different parameter groups for the speaker model and the MSDD model.
-        """
-        if not hasattr(self, "parameters"):
-            self._optimizer_param_groups = None
-            return
-
-        param_groups, known_groups = [], []
-        if "optim_param_groups" in self.cfg:
-            param_groups_cfg = self.cfg.optim_param_groups
-            for group_levels, group_cfg_levels in param_groups_cfg.items():
-                retriever = attrgetter(group_levels)
-                module = retriever(self)
-                if module is None:
-                    raise ValueError(f"{group_levels} not found in model.")
-                elif hasattr(module, "parameters"):
-                    known_groups.append(group_levels)
-                    new_group = {"params": module.parameters()}
-                    for k, v in group_cfg_levels.items():
-                        new_group[k] = v
-                    param_groups.append(new_group)
-                else:
-                    raise ValueError(f"{group_levels} does not have parameters.")
-
-            other_params = []
-            for n, p in self.named_parameters():
-                is_unknown = True
-                for group in known_groups:
-                    if group in n :
-                        is_unknown = False
-                if is_unknown:
-                    other_params.append(p)
-
-            if len(other_params):
-                param_groups = [{"params": other_params}] + param_groups
-        else:
-            param_groups = [{"params": self.parameters()}]
-
-        self._optimizer_param_groups = param_groups
-
-    def add_speaker_model_config(self, cfg):
-        """
-        Add config dictionary of the speaker model to the model's config dictionary. This is required to
-        save and load speaker model with MSDD model.
-
-        Args:
-            cfg (DictConfig): DictConfig type variable that conatains hyperparameters of MSDD model.
-        """
-        with open_dict(cfg):
-            cfg_cp = copy.copy(self.sortformer_diarizer._speaker_model.cfg)
-            cfg.speaker_model_cfg = cfg_cp
-            del cfg.speaker_model_cfg.train_ds
-            del cfg.speaker_model_cfg.validation_ds
-    
     def __setup_dataloader_from_config(self, config):
         # Switch to lhotse dataloader if specified in the config
         if config.get("use_lhotse"):
@@ -299,13 +211,13 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         logging.info("AAB: Starting Dataloader Instance loading... Step A")
         
         AudioToSpeechDiarTrainDataset = AudioToSpeechMSDDTrainDataset
-        self._init_segmentation_info()
+        # self._init_segmentation_info()
         
         preprocessor = EncDecSpeakerLabelModel.from_config_dict(self.cfg_e2e_diarizer_model.preprocessor)
         dataset = AudioToSpeechDiarTrainDataset(
             manifest_filepath=config.manifest_filepath,
             preprocessor=preprocessor,
-            multiscale_args_dict=self.multiscale_args_dict,
+            # multiscale_args_dict=self.multiscale_args_dict,
             soft_label_thres=config.soft_label_thres,
             session_len_sec=config.session_len_sec,
             num_spks=config.num_spks,
@@ -440,23 +352,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         processed_signal, processed_signal_length = self.preprocessor(input_signal=audio_signal, length=audio_signal_length) 
         return processed_signal, processed_signal_length
         
-    def _forward_multiscale_encoder_from_processed(
-        self, 
-        processed_signal, 
-        processed_signal_len,
-    ):
-        """
-        Encoder part for end-to-end diarizaiton model.
-
-        """
-        ms_emb_seq = self.multiscale_layer.forward_multiscale(
-            processed_signal=processed_signal, 
-            processed_signal_len=processed_signal_len, 
-        )
-        if self._cfg.freeze_speaker_model:
-            ms_emb_seq = ms_emb_seq.detach()
-        return ms_emb_seq
-   
     def _forward_multiscale_encoder_from_waveform(
         self, 
         audio_signal, 
@@ -487,55 +382,30 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         Forward pass for training.
         """
         if is_raw_waveform_input:
-            if self.use_raw_encoder:
-                processed_signal, processed_signal_length = self._extract_embeddings(audio_signal=audio_signal, audio_signal_length=audio_signal_length)
-                processed_signal = processed_signal[:, :, :processed_signal_length.max()]
-                # Spec augment is not applied during evaluation/testing
-                if self.spec_augmentation is not None and self.training:
-                    processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
-                self.encoder = self.encoder.to(self.device)
-                raw_emb, raw_emb_length = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
-                raw_emb = raw_emb.transpose(1, 2)
-                if self.cfg_e2e_diarizer_model.encoder.d_model != self.cfg_e2e_diarizer_model.diarizer_module.emb_dim:
-                    self.encoder_proj = self.encoder_proj.to(self.device)
-                    raw_emb = self.encoder_proj(raw_emb)
-            if not self.use_raw_encoder_only:
-                ms_emb_seq = self._forward_multiscale_encoder_from_waveform(
-                    audio_signal=audio_signal, 
-                    audio_signal_length=audio_signal_length,
-                ) # [batch_size, max_seg_count, msdd_scale_n, emb_dim]
+            # if self.use_raw_encoder:
+            processed_signal, processed_signal_length = self._extract_embeddings(audio_signal=audio_signal, audio_signal_length=audio_signal_length)
+            processed_signal = processed_signal[:, :, :processed_signal_length.max()]
+            # Spec augment is not applied during evaluation/testing
+            if self.spec_augmentation is not None and self.training:
+                processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
+            self.encoder = self.encoder.to(self.device)
+            raw_emb, raw_emb_length = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
+            raw_emb = raw_emb.transpose(1, 2)
+            if self.cfg_e2e_diarizer_model.encoder.d_model != self.cfg_e2e_diarizer_model.diarizer_module.emb_dim:
+                self.encoder_proj = self.encoder_proj.to(self.device)
+                raw_emb = self.encoder_proj(raw_emb)
         else:
-            if self.use_raw_encoder:
-                # Spec augment is not applied during evaluation/testing
-                if self.spec_augmentation is not None and self.training:
-                    audio_signal = self.spec_augmentation(input_spec=audio_signal, length=audio_signal_length)
-                self.encoder = self.encoder.to(self.device)
-                raw_emb, raw_emb_length = self.encoder(audio_signal=audio_signal, length=audio_signal_length)
-                raw_emb = raw_emb.transpose(1, 2)
-                if self.cfg_e2e_diarizer_model.encoder.d_model != self.cfg_e2e_diarizer_model.diarizer_module.emb_dim:
-                    self.encoder_proj = self.encoder_proj.to(self.device)
-                    raw_emb = self.encoder_proj(raw_emb)
-            if not self.use_raw_encoder_only:
-                ms_emb_seq = self._forward_multiscale_encoder_from_processed(
-                    processed_signal=audio_signal, 
-                    processed_signal_len=audio_signal_length,
-                ) # [batch_size, max_seg_count, msdd_scale_n, emb_dim]
+            # Spec augment is not applied during evaluation/testing
+            if self.spec_augmentation is not None and self.training:
+                audio_signal = self.spec_augmentation(input_spec=audio_signal, length=audio_signal_length)
+            self.encoder = self.encoder.to(self.device)
+            raw_emb, raw_emb_length = self.encoder(audio_signal=audio_signal, length=audio_signal_length)
+            raw_emb = raw_emb.transpose(1, 2)
+            if self.cfg_e2e_diarizer_model.encoder.d_model != self.cfg_e2e_diarizer_model.diarizer_module.emb_dim:
+                self.encoder_proj = self.encoder_proj.to(self.device)
+                raw_emb = self.encoder_proj(raw_emb)
 
-        if self.use_raw_encoder and self.use_raw_encoder_only:
-            emb_seq = raw_emb
-        else:
-            if self.cfg_e2e_diarizer_model.get("multi_scale_method", None) == "mean":
-                emb_seq = ms_emb_seq.mean(dim=2)
-            elif self.cfg_e2e_diarizer_model.get("multi_scale_method", None) == "attention":
-                emb_seq, _ = self.sortformer_diarizer.apply_attention_weight(ms_emb_seq=ms_emb_seq)
-            elif self.cfg_e2e_diarizer_model.get("multi_scale_method", None) == "only_interpolate":
-                emb_seq = ms_emb_seq[:, :, -1, :] 
-            else:
-                raise ValueError(f"Unknown multi-scale method: {self.cfg_e2e_diarizer_model.get('multi_scale_method', None)}")
-            if self.use_raw_encoder:
-                self.emb_combine = self.emb_combine.to(self.device)
-                emb_seq = self.emb_combine(torch.cat((emb_seq, raw_emb), dim=2))
-
+        emb_seq = raw_emb
         if self.streaming_mode:
             preds, _preds, attn_score_stack, total_memory_list, encoder_states_list = self.forward_streaming_infer(emb_seq, streaming_mode=self.streaming_mode) 
         else:
@@ -543,7 +413,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             total_memory_list = []
         return preds, _preds, attn_score_stack, total_memory_list, encoder_states_list
     
-    def forward_streaming_infer(self, emb_seq, streaming_mode=True, AMP_QUANT=5.0):
+    def forward_streaming_infer(self, emb_seq, streaming_mode=True):
         total_pred_list, total_memory_list = [], []
         memory_buff, memory_label = None, None
         chunk_n = torch.ceil(torch.tensor((emb_seq.shape[1]- self.sortformer_diarizer.mem_len)/ self.sortformer_diarizer.step_len)).int().item() + 1
@@ -572,7 +442,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
                 memory_buff, memory_label = self.sortformer_diarizer.memory_compressor(step_idx, chunk_emb_seq, prev_preds=preds_mem_new_binary, memory_buff=memory_buff, memory_label=memory_label)
 
             total_memory_list.append(memory_label.detach().cpu())
-            quant_memory = (AMP_QUANT*memory_buff.detach().cpu()).round().to(torch.int8)
+            quant_memory = (memory_buff.detach().cpu()).round().to(torch.int8)
             self.sortformer_diarizer.embedding_list.append(quant_memory)
             del chunk_emb_seq, preds_mem_new_binary
             torch.cuda.empty_cache()

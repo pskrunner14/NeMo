@@ -32,7 +32,7 @@ from nemo.collections.asr.metrics.der import score_labels
 
 import os
 
-from dataclasses import dataclass, is_dataclass
+from dataclasses import dataclass, is_dataclass, field
 from typing import Optional, Union, List, Tuple, Dict
 
 from pyannote.core import Segment, Timeline
@@ -107,50 +107,67 @@ class DiarizationConfig:
     output_log_file: str = f"{optuna_study_name}.log"
     optuna_n_trials: int = 100000
 
+
+
 @dataclass
-class VadParams():
-    # Trial 2522 finished with value: 0.09605644326924494 and parameters: {'onset': 0.62, 'offset': 0.57, 'pad_onset': 0.23, 'pad_offset': 0.09, 'min_duration_on': 0.13, 'min_duration_off': 0.25}. Best is trial 2522 with value: 0.09605644326924494. (im303a e19last)
-    # Trial 3683 finished with value: 0.09960175732817779 and parameters: {'onset': 0.6, 'offset': 0.6, 'pad_onset': 0.22, 'pad_offset': 0.1, 'min_duration_on': 0.06, 'min_duration_off': 0.25}. Best is trial 3683 with value: 0.09960175732817779. (im303a e6-e19)
-    opt_style = "callhome_part1"
-    # opt_style = None
-    if opt_style == "callhome_part1":
-        window_length_in_sec: float = 0.15
-        shift_length_in_sec: float = 0.01
-        smoothing: str = False
-        overlap: float = 0.5
-        onset: float = 0.62
-        offset: float = 0.57
-        pad_onset: float = 0.23
-        pad_offset: float = 0.09
-        min_duration_on: float = 0.13
-        min_duration_off: float = 0.25
-        filter_speech_first: bool = True
-    elif opt_style == "dh3_dev":
-        window_length_in_sec: float = 0.15
-        shift_length_in_sec: float = 0.01
-        smoothing: str = False
-        overlap: float = 0.5
-        onset: float = 0.5
-        offset: float = 0.5
-        pad_onset: float = 0.0
-        pad_offset: float = 0.0
-        min_duration_on: float = 0.0
-        min_duration_off: float = 0.0
-        filter_speech_first: bool = True
-    elif opt_style is None:
-        window_length_in_sec: float = 0.15
-        shift_length_in_sec: float = 0.01
-        smoothing: str = False
-        overlap: float = 0.5
-        onset: float = 0.5
-        offset: float = 0.5
-        pad_onset: float = 0.0
-        pad_offset: float = 0.0
-        min_duration_on: float = 0.0
-        min_duration_off: float = 0.0
-        filter_speech_first: bool = True
-    else:
-        raise ValueError(f"Unknown opt_style: {opt_style}")
+class VadParams:
+    """
+    Vad parameters from Optuna optimization studies. 
+    Trial 2522 finished with value: 0.09605644326924494 and parameters: {'onset': 0.62, 'offset': 0.57, 'pad_onset': 0.23, 'pad_offset': 0.09, 'min_duration_on': 0.13, 'min_duration_off': 0.25}. Best is trial 2522 with value: 0.09605644326924494. (im303a e19last)
+    Trial 3683 finished with value: 0.09960175732817779 and parameters: {'onset': 0.6, 'offset': 0.6, 'pad_onset': 0.22, 'pad_offset': 0.1, 'min_duration_on': 0.06, 'min_duration_off': 0.25}. Best is trial 3683 with value: 0.09960175732817779. (im303a e6-e19)
+    """
+    opt_style: str
+    window_length_in_sec: float = field(init=False)
+    shift_length_in_sec: float = field(init=False)
+    smoothing: str = field(init=False)
+    overlap: float = field(init=False)
+    onset: float = field(init=False)
+    offset: float = field(init=False)
+    pad_onset: float = field(init=False)
+    pad_offset: float = field(init=False)
+    min_duration_on: float = field(init=False)
+    min_duration_off: float = field(init=False)
+    filter_speech_first: bool = field(init=False)
+
+    def __post_init__(self):
+        if self.opt_style == "callhome_part1":
+            self.window_length_in_sec = 0.15
+            self.shift_length_in_sec = 0.01
+            self.smoothing = False
+            self.overlap = 0.5
+            self.onset = 0.62
+            self.offset = 0.57
+            self.pad_onset = 0.23
+            self.pad_offset = 0.09
+            self.min_duration_on = 0.13
+            self.min_duration_off = 0.25
+            self.filter_speech_first = True
+        elif self.opt_style == "dh3_dev":
+            self.window_length_in_sec = 0.15
+            self.shift_length_in_sec = 0.01
+            self.smoothing = False
+            self.overlap = 0.5
+            self.onset = 0.5
+            self.offset = 0.5
+            self.pad_onset = 0.0
+            self.pad_offset = 0.0
+            self.min_duration_on = 0.0
+            self.min_duration_off = 0.0
+            self.filter_speech_first = True
+        elif self.opt_style is None:
+            self.window_length_in_sec = 0.15
+            self.shift_length_in_sec = 0.01
+            self.smoothing = False
+            self.overlap = 0.5
+            self.onset = 0.5
+            self.offset = 0.5
+            self.pad_onset = 0.0
+            self.pad_offset = 0.0
+            self.min_duration_on = 0.0
+            self.min_duration_off = 0.0
+            self.filter_speech_first = True
+        else:
+            raise ValueError(f"Unknown opt_style: {self.opt_style}")
         
 def timestamps_to_pyannote_object(speaker_timestamps: List[Tuple[float, float]],
                                   uniq_id: str, 
@@ -367,10 +384,6 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     diar_model._cfg.test_ds.batch_size = cfg.batch_size
     diar_model.use_new_pil = cfg.use_new_pil
     
-    # Force the model to use the designated hop length
-    scale_n = len(diar_model.msdd_multiscale_args_dict['scale_dict'])
-    diar_model.msdd_multiscale_args_dict['scale_dict'][scale_n-1] = (float(cfg.interpolated_scale), float(cfg.interpolated_scale/2))
-    
     # Model setup for inference 
     diar_model._cfg.test_ds.num_workers = cfg.num_workers
     diar_model.setup_test_data(test_data_config=diar_model._cfg.test_ds)    
@@ -391,7 +404,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         torch.save(diar_model_preds_total_list, tensor_path)
 
     # Evaluation
-    vad_cfg = VadParams()
+    vad_cfg = VadParams(opt_style='callhome_part1')
     if not cfg.no_der:
         all_hyps, all_refs, all_uems = convert_pred_mat_to_segments(infer_audio_rttm_dict,
                                                                     vad_cfg=vad_cfg, 
@@ -406,7 +419,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
                                                             collar=cfg.collar, 
                                                             ignore_overlap=cfg.ignore_overlap
                                                             )
-        print("VadParams:", VadParams())
+        print("VadParams:", vad_cfg)
 
 if __name__ == '__main__':
     main()

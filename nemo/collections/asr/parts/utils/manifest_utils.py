@@ -20,10 +20,11 @@ from pathlib import Path
 from typing import Dict, List, Union
 
 import librosa
+import math
 import soundfile as sf
 
 import numpy as np
-
+from tqdm import tqdm
 from nemo.collections.asr.parts.utils.speaker_utils import (
     audio_rttm_map,
     get_subsegments,
@@ -293,8 +294,11 @@ def get_dict_from_wavlist(pathlist: List[str]) -> Dict[str, str]:
     path_dict = od()
     pathlist = sorted(pathlist)
     for line_path in pathlist:
-        uniq_id = os.path.basename(line_path).split('.')[0]
+        # uniq_id = os.path.basename(line_path).split('.')[0]
+        uniq_id = os.path.basename(line_path).replace('.wav', '').strip()
+        print(f"Reading: {line_path} | {uniq_id}")
         path_dict[uniq_id] = line_path
+    
     return path_dict
 
 
@@ -310,10 +314,12 @@ def get_dict_from_list(data_pathlist: List[str], uniqids: List[str]) -> Dict[str
     """
     path_dict = {}
     for line_path in data_pathlist:
-        uniq_id = os.path.basename(line_path).split('.')[0]
+        # uniq_id = os.path.basename(line_path).split('.')[0]
+        uniq_id = os.path.basename(line_path).replace('.wav', '').replace('.rttm', '').replace('.seglst', '').replace('.ctm','').replace('.uem','').strip()
         if uniq_id in uniqids:
             path_dict[uniq_id] = line_path
         else:
+            import ipdb; ipdb.set_trace()
             raise ValueError(f'uniq id {uniq_id} is not in wav filelist')
     return path_dict
 
@@ -407,14 +413,19 @@ def create_manifest(
     len_wavs = len(wav_pathlist)
     uniqids = sorted(wav_pathdict.keys())
 
+    logging.info(f"Reading the {len_wavs} utterances")
     text_pathdict = get_path_dict(text_path, uniqids, len_wavs)
+    logging.info(f"{len(text_pathdict)} text files loaded.")
     rttm_pathdict = get_path_dict(rttm_path, uniqids, len_wavs)
+    logging.info(f"{len(rttm_pathdict)} rttm files loaded.")
     uem_pathdict = get_path_dict(uem_path, uniqids, len_wavs)
+    logging.info(f"{len(uem_pathdict)} uem files loaded.")
     ctm_pathdict = get_path_dict(ctm_path, uniqids, len_wavs)
+    logging.info(f"{len(ctm_pathdict)} ctm files loaded.")
     seglst_pathdict = get_path_dict(seglst_path, uniqids, len_wavs)
-
+    logging.info(f"{len(seglst_pathdict)} seglst files loaded.")
     lines = []
-    for uid in uniqids:
+    for uid in tqdm(uniqids, total=len_wavs, desc="Indexing uniq_ids"):
         wav, text, rttm, uem, ctm, seglst = (
             wav_pathdict[uid],
             text_pathdict[uid],
@@ -449,8 +460,11 @@ def create_manifest(
 
         duration = None
         if add_duration:
-            y, sr = librosa.load(audio_line, sr=None)
-            duration = librosa.get_duration(y=y, sr=sr)
+            # y, sr = librosa.load(audio_line, sr=None)
+            # duration = librosa.get_duration(y=y, sr=sr)
+            data, samplerate = sf.read(audio_line)
+            length_in_seconds = len(data) / samplerate
+            duration = math.floor(length_in_seconds * 1000) / 1000
             
         meta = [
             {

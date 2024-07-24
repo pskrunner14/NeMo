@@ -124,14 +124,8 @@ class VadParams():
         pad_offset: float = 0.09
         min_duration_on: float = 0.13
         min_duration_off: float = 0.25
-        # onset: float = 0.6
-        # offset: float = 0.53
-        # pad_onset: float = 0.22
-        # pad_offset: float = 0.06
-        # min_duration_on: float = 0.09
-        # min_duration_off: float = 0.23
         filter_speech_first: bool = True
-    elif opt_style == "ami_dev":
+    elif opt_style == "dh3_dev":
         window_length_in_sec: float = 0.15
         shift_length_in_sec: float = 0.01
         smoothing: str = False
@@ -388,7 +382,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     tensor_filename = os.path.basename(cfg.dataset_manifest).replace("manifest.", "").replace(".json", "")
     model_base_path = os.path.dirname(cfg.model_path)
     tensor_path = f"{model_base_path}/pred_tensors/{tensor_filename}.pt"
-    if os.path.exists(tensor_path):
+    if False:
         logging.info(f"Loading the saved tensors from {tensor_path}...")
         diar_model_preds_total_list = torch.load(tensor_path)
     else:

@@ -1037,7 +1037,10 @@ def is_overlap(rangeA: List[float], rangeB: List[float]) -> bool:
             Boolean that indicates whether the input ranges have overlap.
     """
     start1, end1 = rangeA[0], rangeA[1]
-    start2, end2 = rangeB[0], rangeB[1]
+    try:
+        start2, end2 = rangeB[0], rangeB[1]
+    except:
+        import ipdb; ipdb.set_trace()
     return end1 > start2 and end2 > start1
 
 

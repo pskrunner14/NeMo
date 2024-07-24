@@ -59,11 +59,13 @@ def shuffle_spk_mapping(cuts: list, num_speakers: int, shuffle_spk_mapping: bool
 
     Returns:
         cuts (list): The updated CutSet with shuffled speaker mappings.
-        spk_mappings (Tensor): The shuffled speaker mappings in batch.
+        spk_mappings (Tensor): 
+            If shuffle_speaker_mapping is True, shuffled speaker mappings in batch.
+            If shuffle_speaker_mapping is False, speaker mappings in batch is not permuted and returns torch.arange() values.
     """ 
+    batch_size = len(cuts) 
     if shuffle_spk_mapping:
-        batch_size = len(cuts) 
-        permuted_indices = torch.rand(batch_size, 4).argsort(dim=1)
+        permuted_indices = torch.rand(batch_size, num_speakers).argsort(dim=1)
         spk_mappings = torch.gather(torch.arange(num_speakers).repeat(batch_size, 1), 1, permuted_indices)
         str_pattern = pattern.replace("\\", '')
         left_str, right_str = str_pattern.split('d+')[0], str_pattern.split('d+')[1]
@@ -78,7 +80,7 @@ def shuffle_spk_mapping(cuts: list, num_speakers: int, shuffle_spk_mapping: bool
                     word_list.append(word)
             cuts[idx].text = ' '.join(word_list)
     else:
-        spk_mappings = torch.arange(num_speakers).unsqueeze(0).repeat(batch_size, 1)    
+        spk_mappings = torch.arange(num_speakers).unsqueeze(0).repeat(batch_size, 1)
     return cuts, spk_mappings 
 
 def find_segments_from_rttm(

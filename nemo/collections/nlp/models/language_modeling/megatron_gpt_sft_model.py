@@ -37,21 +37,11 @@ from nemo.collections.nlp.modules.common.text_generation_utils import generate, 
 from nemo.collections.nlp.parts.mixins.nlp_adapter_mixins import NLPAdapterModelMixin
 from nemo.collections.nlp.parts.utils_funcs import get_last_rank
 from nemo.utils import AppState, logging
-
-try:
-    from apex.transformer.pipeline_parallel.utils import (
-        _reconfigure_microbatch_calculator,
-        get_current_global_batch_size,
-        get_micro_batch_size,
-        get_num_microbatches,
-    )
-
-    HAVE_APEX = True
-except (ImportError, ModuleNotFoundError):
-    HAVE_APEX = False
+from nemo.utils.apex_utils import _reconfigure_microbatch_calculator, get_micro_batch_size
 
 try:
     from megatron.core import parallel_state
+    from megatron.core.num_microbatches_calculator import get_current_global_batch_size, get_num_microbatches
     from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 
     HAVE_MEGATRON_CORE = True
@@ -70,10 +60,6 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
     """
 
     def __init__(self, cfg: DictConfig, trainer: Trainer):
-        if not HAVE_APEX:
-            raise ImportError(
-                "Apex was not found. Please see the NeMo README for installation instructions: https://github.com/NVIDIA/NeMo#megatron-gpt."
-            )
         super().__init__(cfg, trainer=trainer)
         self.sep_id = cfg.get('sep_id', 49704)
         if hasattr(self.cfg.data, "validation_ds"):
@@ -94,9 +80,13 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
         if hasattr(self, '_nsys_profile_enabled'):
             self._nsys_profile_start_step = self.cfg.nsys_profile.get('start_step', 0)
             self._nsys_profile_end_step = self.cfg.nsys_profile.get('end_step', 0)
+        if hasattr(self, '_memory_profile_enabled'):
+            self._memory_profile_start_step = self.cfg.memory_profile.get('start_step', 0)
+            self._memory_profile_end_step = self.cfg.memory_profile.get('end_step', 0)
 
         self.virtual_tokens = 0
         self.init_global_step = 0
+        self.enforce_divisible_batch = True  # used for gradient accumulation
 
     def setup_metric(self, data_cfg):
         metric_name = "exact_string_match"
@@ -253,9 +243,11 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
 
         # TE requires that the first input dim is divisible by 8 and the second by 16 for fp8
         # When using sequence parallel, sequence will further be split by TP size
+        # When using context parallel, sequence is split by CP size as well
         pad_seq_length_to_mult = (
             8 * self.cfg.get('tensor_model_parallel_size', 1) if self.cfg.get('sequence_parallel', False) else 16
         )
+        pad_seq_length_to_mult *= self.cfg.get('context_parallel_size', 1)
 
         dataset_kwargs = {}
         for file_path, num_samples in zip(data_cfg.file_names, num_train_samples_per_dataset):
@@ -290,6 +282,8 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
                 pad_to_max_length=data_cfg.get('pad_to_max_length', False),
                 index_mapping_dir=data_cfg.get('index_mapping_dir', None),
                 prompt_template=data_cfg.get('prompt_template', None),
+                ceil_to_power_2=data_cfg.get('ceil_to_power_2', False),
+                get_attention_mask_from_fusion=data_cfg.get('get_attention_mask_from_fusion', False),
                 virtual_tokens=self.virtual_tokens,
                 tokens_to_generate=data_cfg.get(
                     'tokens_to_generate', 0
@@ -347,9 +341,9 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
             token_count_avg = sum(batch['token_count']) / len(batch['token_count'])
 
         # Pass only torch.Tensor to prevent errors when process get_iterator_k_split()
-        batch = {k: v for k, v in batch.items() if isinstance(v, torch.Tensor)}
+        batch = {k: v for k, v in batch.items() if isinstance(v, (torch.Tensor, list))}
         _, seq_length = batch['tokens'].shape
-        data_iter = get_iterator_k_split(batch, get_num_microbatches())
+        data_iter = get_iterator_k_split(batch, get_num_microbatches(), self.enforce_divisible_batch)
 
         if log_token_counts:
             self.log('seq_length_padded', seq_length, prog_bar=True, batch_size=1)
@@ -359,8 +353,11 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
         no_sync_func = None
         grad_sync_func = None
         param_sync_func = None
-        if not forward_only and self.with_distributed_adam:
-            no_sync_func = partial(self._optimizer.no_sync, greedy_grad_copy=self.megatron_amp_O2,)
+        if not forward_only and self.with_distributed_adam and not self.use_mcore_dist_optim:
+            no_sync_func = partial(
+                self._optimizer.no_sync,
+                greedy_grad_copy=self.megatron_amp_O2,
+            )
             grad_sync_func = self.reduce_overlap_gradients
             param_sync_func = self.sync_overlap_parameters
 
@@ -848,13 +845,19 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
         if hasattr(self, '_train_ds'):
             consumed_samples = self.compute_consumed_samples(0)
             self._train_dl = self.build_data_loader(
-                dataset=self._train_ds, data_cfg=self.cfg.data.train_ds, consumed_samples=consumed_samples,
+                dataset=self._train_ds,
+                data_cfg=self.cfg.data.train_ds,
+                consumed_samples=consumed_samples,
             )
 
     def setup_eval_dataloader(self, datasets, data_cfg):
         dataloaders = []
         for dataset in datasets:
-            eval_dl = self.build_data_loader(dataset=dataset, data_cfg=data_cfg, consumed_samples=0,)
+            eval_dl = self.build_data_loader(
+                dataset=dataset,
+                data_cfg=data_cfg,
+                consumed_samples=0,
+            )
             dataloaders.append(eval_dl)
         return dataloaders
 

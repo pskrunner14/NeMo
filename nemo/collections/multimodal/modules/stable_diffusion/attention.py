@@ -17,7 +17,6 @@ from inspect import isfunction
 
 import torch
 import torch.nn.functional as F
-from apex.contrib.group_norm import GroupNorm
 from einops import rearrange, repeat
 from torch import einsum, nn
 from torch._dynamo import disable
@@ -25,9 +24,13 @@ from torch._dynamo import disable
 if os.environ.get("USE_NATIVE_GROUP_NORM", "0") == "1":
     from nemo.gn_native import GroupNormNormlization as GroupNorm
 else:
-    from apex.contrib.group_norm import GroupNorm
+    try:
+        from apex.contrib.group_norm import GroupNorm
 
-from transformer_engine.pytorch.module import LayerNormLinear, LayerNormMLP
+        OPT_GROUP_NORM = True
+    except Exception:
+        print('Fused optimized group norm has not been installed.')
+        OPT_GROUP_NORM = False
 
 from nemo.collections.multimodal.modules.stable_diffusion.diffusionmodules.util import checkpoint
 from nemo.collections.nlp.modules.common.megatron.adapters.parallel_adapters import (
@@ -37,6 +40,14 @@ from nemo.collections.nlp.modules.common.megatron.adapters.parallel_adapters imp
 from nemo.core import adapter_mixins
 from nemo.utils import logging
 
+try:
+    from transformer_engine.pytorch.module import LayerNormLinear, LayerNormMLP
+
+    HAVE_TE = True
+
+except (ImportError, ModuleNotFoundError):
+    HAVE_TE = False
+
 
 def check_cuda():
     if not torch.cuda.is_available():
@@ -45,10 +56,9 @@ def check_cuda():
     dprops = torch.cuda.get_device_properties(cur_device)
 
     is_sm75 = dprops.major == 7 and dprops.minor == 5
-    is_sm8x = dprops.major == 8 and dprops.minor >= 0
-    is_sm90 = dprops.major == 9 and dprops.minor >= 0
+    is_sm8x_or_later = dprops.major >= 8
 
-    return is_sm8x or is_sm75 or is_sm90
+    return is_sm75 or is_sm8x_or_later
 
 
 try:
@@ -56,7 +66,6 @@ try:
     from flash_attn.modules.mha import FlashCrossAttention, FlashSelfAttention
 
     flash_attn_installed = check_cuda()
-    print("FlashAttention Installed")
 
     # Disable TorchDynamo on FlashAttention
     FlashSelfAttention.forward = disable(FlashSelfAttention.forward)
@@ -112,7 +121,11 @@ class FeedForward(nn.Module):
         if use_te:
             activation = 'gelu' if not glu else 'geglu'
             # TODO: more parameters to be confirmed, dropout, seq_length
-            self.net = LayerNormMLP(hidden_size=dim, ffn_hidden_size=inner_dim, activation=activation,)
+            self.net = LayerNormMLP(
+                hidden_size=dim,
+                ffn_hidden_size=inner_dim,
+                activation=activation,
+            )
         else:
             norm = nn.LayerNorm(dim)
             project_in = nn.Sequential(LinearWrapper(dim, inner_dim), nn.GELU()) if not glu else GEGLU(dim, inner_dim)
@@ -213,6 +226,10 @@ class LinearWrapper(nn.Linear, adapter_mixins.AdapterModuleMixin):
     def forward(self, x):
         mixed_x = super().forward(x)
         if self.is_adapter_available():
+            # return this output if lora is not enabled
+            cfg = self.get_adapter_cfg(AdapterName.PARALLEL_LINEAR_ADAPTER)
+            if not cfg['enabled']:
+                return mixed_x
             lora_linear_adapter = self.get_adapter_module(AdapterName.PARALLEL_LINEAR_ADAPTER)
             lora_mixed_x = lora_linear_adapter(x)
             # This value has the same meaning as the `--network_alpha` option in the kohya-ss trainer script.
@@ -254,7 +271,7 @@ class CrossAttention(nn.Module):
         self.query_dim = query_dim
         self.dim_head = dim_head
 
-        self.scale = dim_head ** -0.5
+        self.scale = dim_head**-0.5
         self.heads = heads
 
         self.to_k = LinearWrapper(context_dim, self.inner_dim, bias=False, lora_network_alpha=lora_network_alpha)

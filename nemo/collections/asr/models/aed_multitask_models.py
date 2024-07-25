@@ -1063,6 +1063,10 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
 
         text = [self.decoding.strip_special_tokens(t) for t in text]
         return text
+    
+    @property
+    def adapter_module_names(self) -> List[str]:
+        return ['', 'encoder', 'transf_encoder', 'transf_decoder']
 
 class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
     """
@@ -1450,11 +1454,7 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
             transf_log_probs = self.log_softmax(hidden_states=dec_states)
 
         return transf_log_probs, asr_encoded_len, enc_states, asr_enc_mask
-    @property
-    def adapter_module_names(self) -> List[str]:
-        return ['', 'encoder', 'transf_encoder', 'transf_decoder']
-
-
+    
 def parse_multitask_prompt(prompt: dict | None) -> list[dict]:
     if prompt is None or not prompt:
         return []

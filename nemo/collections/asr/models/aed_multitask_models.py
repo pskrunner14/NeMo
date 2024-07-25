@@ -56,6 +56,7 @@ from nemo.core.neural_types import (
     AudioSignal,
     ChannelType,
     LabelsType,
+    StringType,
     LengthsType,
     LogprobsType,
     MaskType,
@@ -111,6 +112,10 @@ class MultiTaskTranscriptionConfig(TranscribeConfig):
     target_lang: Optional[str] = None
     text_field: str = "answer"
     lang_field: str = "target_lang"
+
+    # Multispeaker configs
+    shuffle_spk_mapping: bool = False
+    spk_supervision_strategy: str = 'diar'
 
     _internal: Optional[MultiTaskTranscriptionInternalConfig] = field(
         default_factory=lambda: MultiTaskTranscriptionInternalConfig()
@@ -1062,6 +1067,7 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
             "sample_id": NeuralType(tuple('B'), LengthsType(), optional=True),
             "spk_targets": NeuralType(('B', 'T', 'D'), LabelsType(), optional=True),
             "spk_mappings": NeuralType(('B', 'D'), LabelsType(), optional=True),
+            "spk_supervision_strategy": NeuralType(elements_type=StringType(), optional=True),
         }
 
     def _setup_dataloader_from_config(self, config: Optional[Dict], inference: bool = False):
@@ -1080,6 +1086,39 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
                 inference=inference,
             ),
         )
+
+    def _transcribe_forward(self, batch: Any, trcfg: MultiTaskTranscriptionConfig):
+        """
+        Internal function to perform the model's custom forward pass to return outputs that are processed by
+        `_transcribe_output_processing()`.
+        This function is called by `transcribe()` and `transcribe_generator()` to perform the model's forward pass.
+
+        Args:
+            batch: A batch of input data from the data loader that is used to perform the model's forward pass.
+            trcfg: The transcription config dataclass. Subclasses can change this to a different dataclass if needed.
+
+        Returns:
+            The model's outputs that are processed by `_transcribe_output_processing()`.
+        """
+
+        spk_mappings = batch[-1] if trcfg.shuffle_spk_mapping else None
+
+        log_probs, encoded_len, enc_states, enc_mask = self.forward(
+            input_signal=batch[0],
+            input_signal_length=batch[1],
+            spk_targets=batch[-2],
+            spk_mappings=spk_mappings,
+            spk_supervision_strategy = trcfg.spk_supervision_strategy
+        )
+        decoder_input_ids = batch[-4].to(trcfg._internal.device)
+        output = dict(
+            log_probs=log_probs,
+            encoded_lengths=encoded_len,
+            encoder_states=enc_states,
+            encoder_mask=enc_mask,
+            decoder_input_ids=decoder_input_ids,
+        )
+        return output
 
     def _init_diar_model(self):
         """
@@ -1240,6 +1279,7 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
             transcript_length=transcript_len,
             spk_targets=spk_targets,
             spk_mappings=spk_mappings,
+            spk_supervision_strategy=self.cfg.train_ds.get("spk_supervision_strategy", self.cfg.spk_supervision_strategy)
         )
 
         audio_loss = self.loss(log_probs=transf_log_probs, labels=labels)
@@ -1263,6 +1303,7 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
             transcript_length=transcript_len,
             spk_targets=spk_targets,
             spk_mappings=spk_mappings,
+            spk_supervision_strategy=self.cfg.validation_ds.get("spk_supervision_strategy", "diar"),
         )
 
         transf_loss = self.loss(log_probs=transf_log_probs, labels=labels)
@@ -1412,6 +1453,7 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
         transcript_length=None,
         spk_targets=None,
         spk_mappings=None,
+        spk_supervision_strategy='diar'
     ):
         """
         Forward pass of the model.
@@ -1452,21 +1494,21 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
                 # May 23 2024 -> sortformer produces 1 or 2 frames less than FC, FIX!!!
 
             # Speaker supervision strategy settings
-            if self.cfg.spk_supervision_strategy == 'rttm':
+            if spk_supervision_strategy == 'rttm':
                 if spk_targets is not None:
                     diar_preds = spk_targets 
                 else:
                     raise ValueError("`spk_targets` is required for speaker supervision strategy 'rttm'")
-            elif self.cfg.spk_supervision_strategy == 'diar':
+            elif spk_supervision_strategy == 'diar':
                 if diar_preds is None:
                     raise ValueError("`diar_pred`is required for speaker supervision strategy 'diar'")
-            elif self.cfg.spk_supervision_strategy == 'mix':
+            elif spk_supervision_strategy == 'mix':
                 diar_preds = self._get_probablistic_mix(diar_preds=diar_preds, spk_targets=spk_targets, rttm_mix_prob=float(self.cfg.rttm_mix_prob))
             else:
-                raise ValueError(f"Invalid RTTM strategy {self.cfg.spk_supervision_strategy} is not supported.")
+                raise ValueError(f"Invalid RTTM strategy {spk_supervision_strategy} is not supported.")
             
             # Speaker mapping shuffling to equalize the speaker label's distributions
-            if self.cfg.shuffle_spk_mapping:
+            if self.cfg.shuffle_spk_mapping and spk_mappings is not None:
                 diar_preds = apply_spk_mapping(diar_preds, spk_mappings)
             
             if(diar_preds.shape[1]!=asr_enc_states.shape[1]):

@@ -78,6 +78,7 @@ model:
     num_sample_per_mel_frame: ${model.model_defaults.num_sample_per_mel_frame}
     num_mel_frame_per_asr_frame: ${model.model_defaults.num_mel_frame_per_asr_frame}
     shuffle_spk_mapping: ${model.shuffle_spk_mapping}
+    spk_supervision_strategy: ${model.spk_supervision_strategy}
 
   validation_ds:
     use_lhotse: true
@@ -93,6 +94,7 @@ model:
     num_sample_per_mel_frame: ${model.model_defaults.num_sample_per_mel_frame}
     num_mel_frame_per_asr_frame: ${model.model_defaults.num_mel_frame_per_asr_frame}
     shuffle_spk_mapping: False
+    spk_supervision_strategy: diar
 
   test_ds:
     use_lhotse: true
@@ -107,6 +109,8 @@ model:
     spk_tar_all_zero: ${model.model_defaults.spk_tar_all_zero}
     num_sample_per_mel_frame: ${model.model_defaults.num_sample_per_mel_frame}
     num_mel_frame_per_asr_frame: ${model.model_defaults.num_mel_frame_per_asr_frame}
+    shuffle_spk_mapping: False
+    spk_supervision_strategy: diar
 
   # recommend small vocab size of 128 or 256 when using 4x sub-sampling
   # you may find more detail on how to train a tokenizer at: /scripts/tokenizers/process_asr_text_tokenizer.py

@@ -78,7 +78,7 @@ def shuffle_spk_mapping(cuts: list, num_speakers: int, shuffle_spk_mapping: bool
                     word_list.append(f'{left_str}{new_spk}{right_str}')
                 else:
                     word_list.append(word)
-            cuts[idx].text = ' '.join(word_list)
+            cuts[idx].supervisions[0].text = ' '.join(word_list)
     else:
         spk_mappings = torch.arange(num_speakers).unsqueeze(0).repeat(batch_size, 1)
     return cuts, spk_mappings 
@@ -88,8 +88,8 @@ def find_segments_from_rttm(
         rttms, 
         start_after: float, 
         end_before: float, 
-        adjust_offset=True, 
-        tolerance=0.001):
+        adjust_offset: bool=True, 
+        tolerance: float=0.001):
     """ 
     Finds segments from the given rttm file.
     This function is designed to replace rttm

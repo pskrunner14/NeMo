@@ -78,7 +78,6 @@ class PromptedAudioToTextLhotseDataset(torch.utils.data.Dataset):
         else:
             prompt_tokens = None
             prompt_token_lens = None
-
         return audio, audio_lens, tokens, token_lens, prompt_tokens, prompt_token_lens
 
 class PromptedAudioToTextSpkLhotseDataset(torch.utils.data.Dataset):
@@ -127,7 +126,6 @@ class PromptedAudioToTextSpkLhotseDataset(torch.utils.data.Dataset):
                                                 )
         audio, audio_lens, cuts = self.load_audio(cuts)
         tokens, prompt_tokens = self.prompt_format_fn(cuts, self.tokenizer, inference=self.inference)
-
         tokens = [torch.as_tensor(t) for t in tokens]
         token_lens = torch.tensor([t.size(0) for t in tokens], dtype=torch.long)
         tokens = collate_vectors(tokens, padding_value=self.padding_value)

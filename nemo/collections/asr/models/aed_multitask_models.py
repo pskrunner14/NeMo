@@ -1271,7 +1271,7 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
         # During training prompt and prompt_len are null, ignore.
         signal, signal_len, transcript, transcript_len, prompt, prompt_len, spk_targets, spk_mappings = batch
         input_ids, labels = transcript[:, :-1], transcript[:, 1:]
-
+        
         transf_log_probs, encoded_len, enc_states, enc_mask = self.forward(
             input_signal=signal,
             input_signal_length=signal_len,
@@ -1295,7 +1295,6 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
         # During inference, dataloader passes pure prompt without transcript text.
         signal, signal_len, transcript, transcript_len, prompt, prompt_len, spk_targets, spk_mappings = batch
         input_ids, labels = transcript[:, :-1], transcript[:, 1:]
-
         transf_log_probs, encoded_len, enc_states, enc_mask = self.forward(
             input_signal=signal,
             input_signal_length=signal_len,

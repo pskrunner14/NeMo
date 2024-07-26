@@ -347,7 +347,7 @@ class EncDecEESDModel(ModelPT, ExportableEncDecModel, ASRAdapterModelMixin):
         else:
             permed_labels = labels
 
-        loss, masks = self.bce_loss(probs=probs, labels=labels.detach(), lengths=encoded_len)
+        loss, masks = self.bce_loss(probs=probs, labels=permed_labels.detach(), lengths=encoded_len)
         loss = loss.sum(dim=1) / encoded_len.unsqueeze(-1)  # average across time, (batch_size, spk_num)
         loss = loss.mean(dim=1)  # average across speakers, (batch_size)
         loss_value = loss.mean()
@@ -444,7 +444,7 @@ class EncDecEESDModel(ModelPT, ExportableEncDecModel, ASRAdapterModelMixin):
         else:
             permed_labels = labels
 
-        loss, masks = self.bce_loss(probs=probs, labels=labels.detach(), lengths=encoded_len)
+        loss, masks = self.bce_loss(probs=probs, labels=permed_labels.detach(), lengths=encoded_len)
         loss = loss.sum(dim=1) / encoded_len.unsqueeze(-1)  # average across time, (batch_size, spk_num)
         loss = loss.mean(dim=1)  # average across speakers, (batch_size)
         loss = loss.mean()  # average across batch, (1)

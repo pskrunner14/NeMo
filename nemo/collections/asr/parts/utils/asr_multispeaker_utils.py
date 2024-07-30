@@ -24,6 +24,9 @@ from lhotse.cut import MixedCut, MonoCut
 from lhotse.utils import compute_num_samples
 from lhotse import SupervisionSet
 
+from nemo.collections.asr.parts.utils.speaker_utils import convert_rttm_line, get_subsegments
+from nemo.collections.asr.data.audio_to_eesd_label import extract_seg_info_from_rttm, get_frame_targets_from_rttm
+
 def apply_spk_mapping(diar_preds: torch.Tensor, spk_mappings: torch.Tensor) -> torch.Tensor:
     """ 
     Applies a speaker mapping to diar predictions.
@@ -59,13 +62,11 @@ def shuffle_spk_mapping(cuts: list, num_speakers: int, shuffle_spk_mapping: bool
 
     Returns:
         cuts (list): The updated CutSet with shuffled speaker mappings.
-        spk_mappings (Tensor): 
-            If shuffle_speaker_mapping is True, shuffled speaker mappings in batch.
-            If shuffle_speaker_mapping is False, speaker mappings in batch is not permuted and returns torch.arange() values.
+        spk_mappings (Tensor): The shuffled speaker mappings in batch.
     """ 
-    batch_size = len(cuts) 
     if shuffle_spk_mapping:
-        permuted_indices = torch.rand(batch_size, num_speakers).argsort(dim=1)
+        batch_size = len(cuts) 
+        permuted_indices = torch.rand(batch_size, 4).argsort(dim=1)
         spk_mappings = torch.gather(torch.arange(num_speakers).repeat(batch_size, 1), 1, permuted_indices)
         str_pattern = pattern.replace("\\", '')
         left_str, right_str = str_pattern.split('d+')[0], str_pattern.split('d+')[1]
@@ -78,9 +79,9 @@ def shuffle_spk_mapping(cuts: list, num_speakers: int, shuffle_spk_mapping: bool
                     word_list.append(f'{left_str}{new_spk}{right_str}')
                 else:
                     word_list.append(word)
-            cuts[idx].supervisions[0].text = ' '.join(word_list)
+            cuts[idx].text = ' '.join(word_list)
     else:
-        spk_mappings = torch.arange(num_speakers).unsqueeze(0).repeat(batch_size, 1)
+        spk_mappings = torch.arange(num_speakers).unsqueeze(0).repeat(batch_size, 1)    
     return cuts, spk_mappings 
 
 def find_segments_from_rttm(
@@ -88,8 +89,8 @@ def find_segments_from_rttm(
         rttms, 
         start_after: float, 
         end_before: float, 
-        adjust_offset: bool=True, 
-        tolerance: float=0.001):
+        adjust_offset=True, 
+        tolerance=0.001):
     """ 
     Finds segments from the given rttm file.
     This function is designed to replace rttm
@@ -124,8 +125,10 @@ def speaker_to_target(
     num_speakers: int = 4, 
     num_sample_per_mel_frame: int = 160, 
     num_mel_frame_per_asr_frame: int = 8, 
+    soft_thres: int=0.5,
     spk_tar_all_zero: bool = False,
-    boundary_segments: bool = False
+    boundary_segments: bool = False,
+    soft_label: bool = False
     ):
     '''
     Get rttm samples corresponding to one cut, generate speaker mask numpy.ndarray with shape (num_speaker, hidden_length)
@@ -153,9 +156,10 @@ def speaker_to_target(
         raise ValueError(f"Unsupported cut type type{cut}: only MixedCut and MonoCut are supported")
     
     segments_total = []
+    
     for cut in cut_list:
         if boundary_segments: # segments with seg_start < total_end and seg_end > total_start are included
-            segments_iterator = find_segments_from_rttm(recording_id=cut.recording_id, rttms=rttms, start_after=cut.start, end_before=cut.end)
+            segments_iterator = find_segments_from_rttm(recording_id=cut.recording_id, rttms=rttms, start_after=cut.start, end_before=cut.end, tolerance=0.0)
         else: # segments with seg_start > total_start and seg_end < total_end are included
             segments_iterator = rttms.find(recording_id=cut.recording_id, start_after=cut.start, end_before=cut.end, adjust_offset=True)
         segments = [s for s in segments_iterator]
@@ -175,13 +179,22 @@ def speaker_to_target(
     if len(speaker_to_idx_map) > num_speakers:
         raise ValueError(f"Number of speakers {len(speaker_to_idx_map)} is larger than the maximum number of speakers {num_speakers}")
     # initialize mask matrices (num_speaker, encoder_hidden_len)
+    feat_per_sec = int(a_cut.sampling_rate / num_sample_per_mel_frame) # 100 by default
+    num_samples = get_hidden_length_from_sample_length(a_cut.num_samples, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
     if spk_tar_all_zero: 
-        mask = torch.zeros((num_speakers, get_hidden_length_from_sample_length(a_cut.num_samples, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)))
+        frame_mask = torch.zeros((num_samples, num_speakers))
     else:
-        mask = get_mask_from_segments(segments_total, a_cut, speaker_to_idx_map, num_speakers, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
+        frame_mask = get_mask_from_segments(segments_total, a_cut, speaker_to_idx_map, num_speakers, feat_per_sec)
+    soft_mask = get_soft_mask(frame_mask, num_samples, num_mel_frame_per_asr_frame)
+
+    if soft_label:
+        mask = soft_mask
+    else:
+        mask = (soft_mask > soft_thres).float()
+
     return mask
 
-def get_mask_from_segments(segments: list, a_cut, speaker_to_idx_map: torch.Tensor, num_speakers: int =4, num_sample_per_mel_frame: int=160, num_mel_frame_per_asr_frame:int=8):
+def get_mask_from_segments(segments: list, a_cut, speaker_to_idx_map: torch.Tensor, num_speakers: int =4, feat_per_sec: int=100):
     """ 
     Generate mask matrix from segments list.
     This function is needed for speaker diarization with ASR model trainings.
@@ -191,25 +204,52 @@ def get_mask_from_segments(segments: list, a_cut, speaker_to_idx_map: torch.Tens
         cut (MonoCut, MixedCut): Lhotse MonoCut or MixedCut instance.
         speaker_to_idx_map (dict): A dictionary mapping speaker names to indices.
         num_speakers (int): max number of speakers for all cuts ("mask" dim0), 4 by default
-        num_sample_per_mel_frame (int): number of sample per mel frame, sample_rate / 1000 * window_stride, 160 by default (10ms window stride)
-        num_mel_frame_per_asr_frame (int): encoder subsampling_factor, 8 by default
+        feat_per_sec (int): number of frames per second, 100 by default, 0.01s frame rate
     
     Returns:
         mask (Tensor): A numpy array of shape (num_speakers, encoder_hidden_len).
             Dimension: (num_speakers, num_frames)
     """
-    encoder_hidden_len = get_hidden_length_from_sample_length(a_cut.num_samples, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
-    mask = torch.zeros((num_speakers, encoder_hidden_len))
+    # get targets with 0.01s frame rate
+    num_samples = round(a_cut.duration * feat_per_sec) 
+    mask = torch.zeros((num_samples, num_speakers))
     for rttm_sup in segments:
         speaker_idx = speaker_to_idx_map[rttm_sup.speaker]
-        # only consider the first <num_speakers> speakers
-        stt = compute_num_samples(max(rttm_sup.start, 0), a_cut.sampling_rate)
-        ent = compute_num_samples(min(rttm_sup.end, a_cut.duration), a_cut.sampling_rate)
-        # map start time (st) and end time (et) to encoded hidden location
-        st_encoder_loc = 0 if stt == 0 else get_hidden_length_from_sample_length(stt, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
-        et_encoder_loc = get_hidden_length_from_sample_length(ent, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
-        mask[speaker_idx, st_encoder_loc:et_encoder_loc] = 1
-    return mask 
+        stt = max(rttm_sup.start, 0)
+        ent = min(rttm_sup.end, a_cut.duration)
+        stf = int(stt * feat_per_sec)
+        enf = int(ent * feat_per_sec)
+        
+        mask[stf:enf, speaker_idx] = 1.
+    
+    return mask
+
+def get_soft_mask(feat_level_target, num_samples, stride):
+    """
+    Get soft mask from feat_level_target with stride.
+    This function is needed for speaker diarization with ASR model trainings.
+    
+    Args:
+        feat_level_target (Tensor): A numpy array of shape (num_frames, num_speakers).
+            Dimension: (num_frames, num_speakers)
+        num_sample (int): The total number of samples.
+        stride (int): The stride for the mask.
+        """
+
+    num_speakers = feat_level_target.shape[1]
+    mask = torch.zeros(num_samples, num_speakers)
+
+    for index in range(num_samples):
+        if index == 0:
+            seg_stt_feat = 0
+        else:
+            seg_stt_feat = stride * index - 1 - int(stride / 2)
+        if index == num_samples - 1:
+            seg_end_feat = feat_level_target.shape[0]
+        else:
+            seg_end_feat = stride * index - 1 + int(stride / 2)
+        mask[index] = torch.mean(feat_level_target[seg_stt_feat:seg_end_feat+1, :], axis=0)
+    return mask
 
 def get_hidden_length_from_sample_length(
     num_samples: int, 

@@ -73,7 +73,4 @@ class LhotseSpeechToDiarizationLabelDataset(torch.utils.data.Dataset):
             target_lens_list.append([target_fr_len])
         target_lens = torch.tensor(target_lens_list)
 
-        if len(speaker_activities) > 4:
-            import ipdb; ipdb.set_trace()
-
         return audio, audio_lens, targets, target_lens

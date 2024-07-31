@@ -1406,11 +1406,11 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
         Generates a sinusoid position encoding matrix.
         
         Args:
-        - max_position (int): The maximum position to generate encodings for.
-        - embedding_dim (int): The dimension of the embeddings.
+            max_position (int): The maximum position to generate encodings for.
+            embedding_dim (int): The dimension of the embeddings.
         
         Returns:
-        - torch.Tensor: A tensor of shape (max_position, embedding_dim) containing the sinusoid position encodings.
+            position_encoding_tensor(torch.Tensor): A tensor of shape (max_position, embedding_dim) containing the sinusoid position encodings.
         """
         position = np.arange(max_position)[:, np.newaxis]
         div_term = np.exp(np.arange(0, embedding_dim, 2) * -(np.log(10000.0) / embedding_dim))
@@ -1432,6 +1432,9 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
         Args:
             diar_preds (Tensor): Tensor of shape [B, T, D] representing the diarization predictions.
             spk_targets (Tensor): Tensor of shape [B, T, D] representing the speaker targets.
+            rttm_mix_prob (float): Probability of mixing RTTM-based ground-truth speaker supervision against diarization predictions.
+                                    If rttm_mix_prob is 0.0, the diarization predictions are used for speaker supervision.
+                                    If rttm_mix_prob is 1.0, the RTTM-based ground-truth speaker supervisions are used.
             
         Returns:
             mix_prob (float): Tensor of shape [B, T, D] representing the probablistic mixture of speaker labels for each time step.

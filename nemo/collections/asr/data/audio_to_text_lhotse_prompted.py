@@ -118,7 +118,7 @@ class PromptedAudioToTextSpkLhotseDataset(torch.utils.data.Dataset):
         self.num_mel_frame_per_asr_frame = self.cfg.get('num_mel_frame_per_asr_frame', 8)
         self.spk_token_pattern= r'<\|spltoken\d+\|>'
      
-    def __getitem__(self, cuts: CutSet) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, cuts: CutSet) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         cuts, spk_mappings = shuffle_spk_mapping(cuts=cuts, 
                                                  num_speakers=self.num_speakers, 
                                                  shuffle_spk_mapping=self.shuffle_spk_mapping, 
@@ -138,7 +138,7 @@ class PromptedAudioToTextSpkLhotseDataset(torch.utils.data.Dataset):
             prompt_tokens = None
             prompt_token_lens = None
 
-        spk_targets = [torch.transpose(torch.as_tensor(speaker_to_target(_cut, self.num_speakers, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, self.spk_tar_all_zero), dtype=torch.float32), 0, 1) for _cut in cuts]
+        spk_targets = [torch.as_tensor(speaker_to_target(_cut, self.num_speakers, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, self.spk_tar_all_zero), dtype=torch.float32) for _cut in cuts]
         spk_targets = collate_matrices(spk_targets)
         return audio, audio_lens, tokens, token_lens, prompt_tokens, prompt_token_lens, spk_targets, spk_mappings
 

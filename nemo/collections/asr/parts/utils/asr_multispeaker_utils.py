@@ -64,8 +64,8 @@ def shuffle_spk_mapping(cuts: list, num_speakers: int, shuffle_spk_mapping: bool
         cuts (list): The updated CutSet with shuffled speaker mappings.
         spk_mappings (Tensor): The shuffled speaker mappings in batch.
     """ 
+    batch_size = len(cuts) 
     if shuffle_spk_mapping:
-        batch_size = len(cuts) 
         permuted_indices = torch.rand(batch_size, 4).argsort(dim=1)
         spk_mappings = torch.gather(torch.arange(num_speakers).repeat(batch_size, 1), 1, permuted_indices)
         str_pattern = pattern.replace("\\", '')

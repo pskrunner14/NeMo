@@ -128,7 +128,8 @@ def speaker_to_target(
     soft_thres: int=0.5,
     spk_tar_all_zero: bool = False,
     boundary_segments: bool = False,
-    soft_label: bool = False
+    soft_label: bool = False,
+    ignore_num_spk_mismatch: bool = True,
     ):
     '''
     Get rttm samples corresponding to one cut, generate speaker mask numpy.ndarray with shape (num_speaker, hidden_length)
@@ -141,6 +142,8 @@ def speaker_to_target(
         num_mel_frame_per_asr_frame (int): encoder subsampling_factor, 8 by default
         spk_tar_all_zero (Tensor): set to True gives all zero "mask"
         boundary_segments (bool): set to True to include segments containing the boundary of the cut, False by default for multi-speaker ASR training
+        soft_label (bool): set to True to use soft label that enables values in [0, 1] range, False by default and leads to binary labels.
+        ignore_num_spk_mismatch (bool): This is a temporary solution to handle speaker mismatch. Will be removed in the future.
     
     Returns:
         mask (Tensor): speaker mask with shape (num_speaker, hidden_lenght)
@@ -176,15 +179,16 @@ def speaker_to_target(
             spk: idx
             for idx, spk in enumerate(speaker_ats)
     }
-    if len(speaker_to_idx_map) > num_speakers:
+    if len(speaker_to_idx_map) > num_speakers and not ignore_num_spk_mismatch:  # raise error if number of speakers
         raise ValueError(f"Number of speakers {len(speaker_to_idx_map)} is larger than the maximum number of speakers {num_speakers}")
+        
     # initialize mask matrices (num_speaker, encoder_hidden_len)
     feat_per_sec = int(a_cut.sampling_rate / num_sample_per_mel_frame) # 100 by default
     num_samples = get_hidden_length_from_sample_length(a_cut.num_samples, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
     if spk_tar_all_zero: 
         frame_mask = torch.zeros((num_samples, num_speakers))
     else:
-        frame_mask = get_mask_from_segments(segments_total, a_cut, speaker_to_idx_map, num_speakers, feat_per_sec)
+        frame_mask = get_mask_from_segments(segments_total, a_cut, speaker_to_idx_map, num_speakers, feat_per_sec, ignore_num_spk_mismatch)
     soft_mask = get_soft_mask(frame_mask, num_samples, num_mel_frame_per_asr_frame)
 
     if soft_label:
@@ -194,7 +198,7 @@ def speaker_to_target(
 
     return mask
 
-def get_mask_from_segments(segments: list, a_cut, speaker_to_idx_map: torch.Tensor, num_speakers: int =4, feat_per_sec: int=100):
+def get_mask_from_segments(segments: list, a_cut, speaker_to_idx_map: torch.Tensor, num_speakers: int =4, feat_per_sec: int=100, ignore_num_spk_mismatch: bool = False):
     """ 
     Generate mask matrix from segments list.
     This function is needed for speaker diarization with ASR model trainings.
@@ -205,6 +209,7 @@ def get_mask_from_segments(segments: list, a_cut, speaker_to_idx_map: torch.Tens
         speaker_to_idx_map (dict): A dictionary mapping speaker names to indices.
         num_speakers (int): max number of speakers for all cuts ("mask" dim0), 4 by default
         feat_per_sec (int): number of frames per second, 100 by default, 0.01s frame rate
+        ignore_num_spk_mismatch (bool): This is a temporary solution to handle speaker mismatch. Will be removed in the future.
     
     Returns:
         mask (Tensor): A numpy array of shape (num_speakers, encoder_hidden_len).
@@ -215,13 +220,16 @@ def get_mask_from_segments(segments: list, a_cut, speaker_to_idx_map: torch.Tens
     mask = torch.zeros((num_samples, num_speakers))
     for rttm_sup in segments:
         speaker_idx = speaker_to_idx_map[rttm_sup.speaker]
+        if speaker_idx >= num_speakers:
+            if ignore_num_spk_mismatch:
+                continue
+            else:
+                raise ValueError(f"Speaker Index {speaker_idx} exceeds the max index: {num_speakers-1}")
         stt = max(rttm_sup.start, 0)
         ent = min(rttm_sup.end, a_cut.duration)
         stf = int(stt * feat_per_sec)
         enf = int(ent * feat_per_sec)
-        
-        mask[stf:enf, speaker_idx] = 1.
-    
+        mask[stf:enf, speaker_idx] = 1.0
     return mask
 
 def get_soft_mask(feat_level_target, num_samples, stride):

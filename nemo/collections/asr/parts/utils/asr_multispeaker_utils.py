@@ -24,9 +24,6 @@ from lhotse.cut import MixedCut, MonoCut
 from lhotse.utils import compute_num_samples
 from lhotse import SupervisionSet
 
-from nemo.collections.asr.parts.utils.speaker_utils import convert_rttm_line, get_subsegments
-from nemo.collections.asr.data.audio_to_eesd_label import extract_seg_info_from_rttm, get_frame_targets_from_rttm
-
 def apply_spk_mapping(diar_preds: torch.Tensor, spk_mappings: torch.Tensor) -> torch.Tensor:
     """ 
     Applies a speaker mapping to diar predictions.
@@ -62,11 +59,13 @@ def shuffle_spk_mapping(cuts: list, num_speakers: int, shuffle_spk_mapping: bool
 
     Returns:
         cuts (list): The updated CutSet with shuffled speaker mappings.
-        spk_mappings (Tensor): The shuffled speaker mappings in batch.
+        spk_mappings (Tensor): 
+            If shuffle_speaker_mapping is True, shuffled speaker mappings in batch.
+            If shuffle_speaker_mapping is False, speaker mappings in batch is not permuted and returns torch.arange() values.
     """ 
     batch_size = len(cuts) 
     if shuffle_spk_mapping:
-        permuted_indices = torch.rand(batch_size, 4).argsort(dim=1)
+        permuted_indices = torch.rand(batch_size, num_speakers).argsort(dim=1)
         spk_mappings = torch.gather(torch.arange(num_speakers).repeat(batch_size, 1), 1, permuted_indices)
         str_pattern = pattern.replace("\\", '')
         left_str, right_str = str_pattern.split('d+')[0], str_pattern.split('d+')[1]
@@ -79,9 +78,9 @@ def shuffle_spk_mapping(cuts: list, num_speakers: int, shuffle_spk_mapping: bool
                     word_list.append(f'{left_str}{new_spk}{right_str}')
                 else:
                     word_list.append(word)
-            cuts[idx].text = ' '.join(word_list)
+            cuts[idx].supervisions[0].text = ' '.join(word_list)
     else:
-        spk_mappings = torch.arange(num_speakers).unsqueeze(0).repeat(batch_size, 1)    
+        spk_mappings = torch.arange(num_speakers).unsqueeze(0).repeat(batch_size, 1)
     return cuts, spk_mappings 
 
 def find_segments_from_rttm(
@@ -89,8 +88,8 @@ def find_segments_from_rttm(
         rttms, 
         start_after: float, 
         end_before: float, 
-        adjust_offset=True, 
-        tolerance=0.001):
+        adjust_offset: bool=True, 
+        tolerance: float=0.001):
     """ 
     Finds segments from the given rttm file.
     This function is designed to replace rttm
@@ -125,10 +124,10 @@ def speaker_to_target(
     num_speakers: int = 4, 
     num_sample_per_mel_frame: int = 160, 
     num_mel_frame_per_asr_frame: int = 8, 
-    soft_thres: int=0.5,
     spk_tar_all_zero: bool = False,
     boundary_segments: bool = False,
-    soft_label: bool = False
+    soft_label: bool = False,
+    soft_thres: int=0.5
     ):
     '''
     Get rttm samples corresponding to one cut, generate speaker mask numpy.ndarray with shape (num_speaker, hidden_length)
@@ -156,7 +155,6 @@ def speaker_to_target(
         raise ValueError(f"Unsupported cut type type{cut}: only MixedCut and MonoCut are supported")
     
     segments_total = []
-    
     for cut in cut_list:
         if boundary_segments: # segments with seg_start < total_end and seg_end > total_start are included
             segments_iterator = find_segments_from_rttm(recording_id=cut.recording_id, rttms=rttms, start_after=cut.start, end_before=cut.end, tolerance=0.0)

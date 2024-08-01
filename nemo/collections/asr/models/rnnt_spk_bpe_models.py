@@ -92,6 +92,17 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
                 if cfg.diar_kernel_type == 'sinusoidal':
                     self.diar_kernel_type = cfg.diar_kernel_type
                     self.diar_kernel = self.get_sinusoid_position_encoding(self.num_speakers, cfg.model_defaults.enc_hidden)
+                elif cfg.diar_kernel_type == 'metacat':
+                    self.diar_kernel_type = cfg.diar_kernel_type
+                    # projection layer
+                    proj_in_size = 4 * cfg.model_defaults.enc_hidden
+                    proj_out_size = cfg.model_defaults.enc_hidden
+                    self.joint_proj = torch.nn.Sequential(
+                        torch.nn.Linear(proj_in_size, proj_out_size*2),
+                        torch.nn.ReLU(),
+                        torch.nn.Linear(proj_out_size*2, proj_out_size)
+                    )
+                    self.diar_kernel = self.joint_proj
 
         else:
             self.diar = False
@@ -167,7 +178,7 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
             'spk_tar_all_zero': self.cfg.test_ds.get('spk_tar_all_zero',False),
             'num_sample_per_mel_frame': self.cfg.test_ds.get('num_sample_per_mel_frame',160),
             'num_mel_frame_per_asr_frame': self.cfg.test_ds.get('num_mel_frame_per_asr_frame',8),
-            'shuffle_speaker_mapping': self.cfg.test_ds.get('shuffle_speaker_mapping',False)
+            'shuffle_spk_mapping': self.cfg.test_ds.get('shuffle_spk_mapping',False)
         }
 
         if config.get("augmentor"):
@@ -311,6 +322,10 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
                 if self.kernel_norm == 'l2':
                     speaker_infusion_asr = torch.nn.functional.normalize(speaker_infusion_asr, p=2, dim=-1)
                 encoded = speaker_infusion_asr + encoded
+            elif self.diar_kernel_type == 'metacat':
+                concat_enc_states = encoded.unsqueeze(2) * diar_preds.unsqueeze(3)
+                concat_enc_states = concat_enc_states.flatten(2,3)
+                encoded = self.joint_proj(concat_enc_states)
             else:
                 concat_enc_states = torch.cat([encoded, diar_preds], dim=-1)
                 encoded = self.joint_proj(concat_enc_states)
@@ -459,6 +474,10 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
                 if self.kernel_norm == 'l2':
                     speaker_infusion_asr = torch.nn.functional.normalize(speaker_infusion_asr, p=2, dim=-1)
                 encoded = speaker_infusion_asr + encoded
+            elif self.diar_kernel_type == 'metacat':
+                concat_enc_states = encoded.unsqueeze(2) * diar_preds.unsqueeze(3)
+                concat_enc_states = concat_enc_states.flatten(2,3)
+                encoded = self.joint_proj(concat_enc_states)
             else:
                 concat_enc_states = torch.cat([encoded, diar_preds], dim=-1)
                 encoded = self.joint_proj(concat_enc_states)

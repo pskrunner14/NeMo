@@ -58,51 +58,41 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
             # Initialize the speaker branch
             self._init_diar_model()
 
-            if 'num_speaker' in cfg.model_defaults:
-                self.num_speakers = cfg.model_defaults.num_speakers
-            else:
-                self.num_speakers = 4
+            self.num_speakers = cfg.model_defaults.get('num_speakers', 4)
             
             # layer normalization, ln, l2, or None
-            if 'norm' in cfg:
-                if cfg.norm == 'ln':
-                    self.asr_norm = torch.nn.LayerNorm(cfg.model_defaults.enc_hidden)
-                    self.diar_norm = torch.nn.LayerNorm(4)
-                self.norm = cfg.norm
-            else:
-                self.norm = None
+            self.norm = cfg.get('norm', None)
 
-            if 'kernel_norm' in cfg:
-                self.kernel_norm = cfg.kernel_norm
-            else:
-                self.kernel_norm = None
+            if cfg.norm == 'ln':
+                self.asr_norm = torch.nn.LayerNorm(cfg.model_defaults.enc_hidden)
+                self.diar_norm = torch.nn.LayerNorm(4)
+
+            self.kernel_norm = cfg.get('kernel_norm',None)
 
             # projection layer
-            proj_in_size = 4 + cfg.model_defaults.enc_hidden
+            self.diar_kernel_type = cfg.get('diar_kernel_type', None)
+
+            proj_in_size = self.num_speakers + cfg.model_defaults.enc_hidden
             proj_out_size = cfg.model_defaults.enc_hidden
             self.joint_proj = torch.nn.Sequential(
                 torch.nn.Linear(proj_in_size, proj_out_size*2),
                 torch.nn.ReLU(),
                 torch.nn.Linear(proj_out_size*2, proj_out_size)
             )
-            self.diar_kernel_type = 'projection'
             self.diar_kernal = self.joint_proj
 
-            if 'diar_kernel_type' in cfg:
-                if cfg.diar_kernel_type == 'sinusoidal':
-                    self.diar_kernel_type = cfg.diar_kernel_type
-                    self.diar_kernel = self.get_sinusoid_position_encoding(self.num_speakers, cfg.model_defaults.enc_hidden)
-                elif cfg.diar_kernel_type == 'metacat':
-                    self.diar_kernel_type = cfg.diar_kernel_type
-                    # projection layer
-                    proj_in_size = 4 * cfg.model_defaults.enc_hidden
-                    proj_out_size = cfg.model_defaults.enc_hidden
-                    self.joint_proj = torch.nn.Sequential(
-                        torch.nn.Linear(proj_in_size, proj_out_size*2),
-                        torch.nn.ReLU(),
-                        torch.nn.Linear(proj_out_size*2, proj_out_size)
-                    )
-                    self.diar_kernel = self.joint_proj
+            if self.diar_kernel_type == 'sinusoidal':
+                self.diar_kernel = self.get_sinusoid_position_encoding(self.num_speakers, cfg.model_defaults.enc_hidden)
+            elif self.diar_kernel_type == 'metacat':
+                # projection layer
+                proj_in_size = self.num_speakers * cfg.model_defaults.enc_hidden
+                proj_out_size = cfg.model_defaults.enc_hidden
+                self.joint_proj = torch.nn.Sequential(
+                    torch.nn.Linear(proj_in_size, proj_out_size*2),
+                    torch.nn.ReLU(),
+                    torch.nn.Linear(proj_out_size*2, proj_out_size)
+                )
+                self.diar_kernel = self.joint_proj
 
         else:
             self.diar = False
@@ -261,12 +251,8 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
         
         return position_encoding_tensor
 
-    # training_step include speaker information
-    # PTL-specific methods
-    def training_step(self, batch, batch_nb):
-        # Reset access registry
-        if AccessMixin.is_access_enabled(self.model_guid):
-            AccessMixin.reset_registry(self)
+
+    def train_val_forward(self, batch, batch_nb):
 
         signal, signal_len, transcript, transcript_len, spk_targets, spk_mappings = batch
 
@@ -279,20 +265,19 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
         encoded = torch.transpose(encoded, 1, 2) # B * D * T -> B * T * D
         
         if self.diar == True:
-            with torch.set_grad_enabled(not self.cfg.freeze_diar):
-                diar_preds, _preds, attn_score_stack, total_memory_list, encoder_states_list = self.forward_diar(signal, signal_len)
-                # pred shape = B * T (-1 or -2) * D 
-                # May 23 2024 -> sortformer produces 1 or 2 frames less than FC, FIX!!!
-
             if self.cfg.spk_supervision_strategy == 'rttm':
                 if spk_targets is not None:
                     diar_preds = spk_targets 
                 else:
                     raise ValueError("`spk_targets` is required for speaker supervision strategy 'rttm'")
             elif self.cfg.spk_supervision_strategy == 'diar':
+                with torch.set_grad_enabled(not self.cfg.freeze_diar):
+                    diar_preds, _preds, attn_score_stack, total_memory_list, encoder_states_list = self.forward_diar(signal, signal_len)
                 if diar_preds is None:
                     raise ValueError("`diar_pred`is required for speaker supervision strategy 'diar'")
             elif self.cfg.spk_supervision_strategy == 'mix':
+                with torch.set_grad_enabled(not self.cfg.freeze_diar):
+                    diar_preds, _preds, attn_score_stack, total_memory_list, encoder_states_list = self.forward_diar(signal, signal_len)
                 diar_preds = self._get_probablistic_mix(diar_preds=diar_preds, spk_targets=spk_targets, rttm_mix_prob=float(self.cfg.rttm_mix_prob))
             else:
                 raise ValueError(f"Invalid RTTM strategy {self.cfg.spk_supervision_strategy} is not supported.")
@@ -333,6 +318,17 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
             encoded = encoded
         
         encoded = torch.transpose(encoded, 1, 2) # B * T * D -> B * D * T
+        return encoded, encoded_len, transcript, transcript_len
+
+
+    # training_step include speaker information
+    # PTL-specific methods
+    def training_step(self, batch, batch_nb):
+        # Reset access registry
+        if AccessMixin.is_access_enabled(self.model_guid):
+            AccessMixin.reset_registry(self)
+
+        encoded, encoded_len, transcript, transcript_len = self.train_val_forward(batch, batch_nb)
  
         # During training, loss must be computed, so decoder forward is necessary
         decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
@@ -421,70 +417,7 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
 
     def validation_pass(self, batch, batch_idx, dataloader_idx=0):
 
-        signal, signal_len, transcript, transcript_len, spk_targets, spk_mappings = batch
-        # forward() only performs encoder forward
-        if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
-            encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
-        else:
-            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
-
-        encoded = torch.transpose(encoded, 1, 2)
-
-        if self.diar == True:
-            with torch.set_grad_enabled(not self.cfg.freeze_diar):
-                diar_preds, _preds, attn_score_stack, total_memory_list, encoder_states_list = self.forward_diar(signal, signal_len)
-                # pred shape = B * T (-1 or -2) * D 
-                # May 23 2024 -> sortformer produces 1 or 2 frames less than FC, FIX!!!
-
-            if self.cfg.spk_supervision_strategy == 'rttm':
-                if spk_targets is not None:
-                    diar_preds = spk_targets 
-                else:
-                    raise ValueError("`spk_targets` is required for speaker supervision strategy 'rttm'")
-            elif self.cfg.spk_supervision_strategy == 'diar':
-                if diar_preds is None:
-                    raise ValueError("`diar_pred`is required for speaker supervision strategy 'diar'")
-            elif self.cfg.spk_supervision_strategy == 'mix':
-                diar_preds = self._get_probablistic_mix(diar_preds=diar_preds, spk_targets=spk_targets, rttm_mix_prob=float(self.cfg.rttm_mix_prob))
-            else:
-                raise ValueError(f"Invalid RTTM strategy {self.cfg.spk_supervision_strategy} is not supported.")
-        
-            # # Speaker mapping shuffling to equalize the speaker label's distributions
-            if self.cfg.shuffle_spk_mapping:
-                diar_preds = apply_spk_mapping(diar_preds, spk_mappings)
-
-            if(diar_preds.shape[1]!=encoded.shape[1]):
-            # KD duct-tape solution for extending the speaker predictions 
-                asr_frame_count = encoded.shape[1]
-                diar_preds = self.fix_diar_output(diar_preds, asr_frame_count)
-
-            # Normalize the features
-            if self.norm == 'ln':
-                diar_preds = self.diar_norm(diar_preds)
-                encoded = self.asr_norm(encoded)
-            elif self.norm == 'l2':
-                diar_preds = torch.nn.functional.normalize(diar_preds, p=2, dim=-1)
-                encoded = torch.nn.functional.normalize(encoded, p=2, dim=-1)
-            
-            if diar_preds.shape[1] > encoded.shape[1]:
-                diar_preds = diar_preds[:, :encoded.shape[1], :]
-
-            if self.diar_kernel_type == 'sinusoidal':
-                speaker_infusion_asr = torch.matmul(diar_preds, self.diar_kernel.to(diar_preds.device))
-                if self.kernel_norm == 'l2':
-                    speaker_infusion_asr = torch.nn.functional.normalize(speaker_infusion_asr, p=2, dim=-1)
-                encoded = speaker_infusion_asr + encoded
-            elif self.diar_kernel_type == 'metacat':
-                concat_enc_states = encoded.unsqueeze(2) * diar_preds.unsqueeze(3)
-                concat_enc_states = concat_enc_states.flatten(2,3)
-                encoded = self.joint_proj(concat_enc_states)
-            else:
-                concat_enc_states = torch.cat([encoded, diar_preds], dim=-1)
-                encoded = self.joint_proj(concat_enc_states)
-        else:
-            encoded = encoded
-        
-        encoded = torch.transpose(encoded, 1, 2) # B * T * D -> B * D * T
+        encoded, encoded_len, transcript, transcript_len = self.train_val_forward(batch, batch_idx)
 
         tensorboard_logs = {}
 

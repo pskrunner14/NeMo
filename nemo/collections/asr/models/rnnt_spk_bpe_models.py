@@ -23,9 +23,19 @@ from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
 from pytorch_lightning import Trainer
 
 from nemo.collections.asr.data.audio_to_text_lhotse_speaker import LhotseSpeechToTextSpkBpeDataset
+
+from nemo.collections.asr.data.audio_to_text_lhotse_target_speaker import LhotseSpeechToTextTgtSpkBpeDataset
+
 from nemo.core.classes.mixins import AccessMixin
 from nemo.collections.asr.data.audio_to_text_dali import AudioToCharDALIDataset, DALIOutputs
 from nemo.collections.asr.parts.utils.asr_multispeaker_utils import apply_spk_mapping
+
+from nemo.collections.asr.parts.mixins import (
+    ASRModuleMixin,
+    ASRTranscriptionMixin,
+    TranscribeConfig,
+    TranscriptionReturnType,
+)
 
 from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
 from nemo.collections.asr.models.eesd_models import SortformerEncLabelModel
@@ -50,7 +60,6 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
         return results
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
-
         super().__init__(cfg=cfg, trainer=trainer)
         
         if 'diar_model_path' in self.cfg:
@@ -168,7 +177,8 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
             'spk_tar_all_zero': self.cfg.test_ds.get('spk_tar_all_zero',False),
             'num_sample_per_mel_frame': self.cfg.test_ds.get('num_sample_per_mel_frame',160),
             'num_mel_frame_per_asr_frame': self.cfg.test_ds.get('num_mel_frame_per_asr_frame',8),
-            'shuffle_spk_mapping': self.cfg.test_ds.get('shuffle_spk_mapping',False)
+            'shuffle_spk_mapping': self.cfg.test_ds.get('shuffle_spk_mapping',False),
+            'inference_mode': self.cfg.test_ds.get('inference_mode', True)
         }
 
         if config.get("augmentor"):
@@ -476,3 +486,34 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
         self.log('global_step', torch.tensor(self.trainer.global_step, dtype=torch.float32))
 
         return tensorboard_logs
+
+    def _transcribe_forward(self, batch, trcfg:TranscribeConfig):
+        #modify config 
+        self.cfg.spk_supervision_strategy = 'diar'
+        #forward pass
+        encoded, encoded_len, _, _ = self.train_val_forward(batch, 0)
+        output = dict(encoded=encoded, encoded_len=encoded_len)
+        return output
+    
+    def _transcribe_output_processing(self, outputs,trcfg:TranscribeConfig):
+        encoded = outputs.pop('encoded')
+        encoded_len = outputs.pop('encoded_len')
+        best_hyp, all_hyp = self.decoding.rnnt_decoder_predictions_tensor(
+            encoded,
+            encoded_len,
+            return_hypotheses=True
+        )
+        # cleanup memory
+        del encoded, encoded_len
+
+        hypotheses = []
+        all_hypotheses = []
+
+        hypotheses += best_hyp
+        if all_hyp is not None:
+            all_hypotheses += all_hyp
+        else:
+            all_hypotheses += best_hyp
+
+        return (hypotheses, all_hypotheses)
+

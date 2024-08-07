@@ -66,13 +66,18 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
         self.num_mel_frame_per_asr_frame = self.cfg.get('num_mel_frame_per_asr_frame', 8)
         self.shuffle_spk_mapping = self.cfg.get('shuffle_spk_mapping', True)
         self.spk_token_pattern= r'<\|spltoken\d+\|>' 
+        self.inference_mode = self.cfg.get('inference_mode', False)
 
     def __getitem__(self, cuts) -> Tuple[torch.Tensor, ...]:
         cuts, spk_mappings = shuffle_spk_mapping(cuts=cuts, num_speakers=self.num_speakers, shuffle_spk_mapping=self.shuffle_spk_mapping, pattern=self.spk_token_pattern)
-        spk_targets = [torch.as_tensor(speaker_to_target(cut, self.num_speakers, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, self.spk_tar_all_zero), dtype=torch.float32) for cut in cuts]
+        if self.inference_mode:
+            spk_targets = [torch.transpose(torch.zeros(self.num_speakers, get_hidden_length_from_sample_length(cut.num_samples, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame)), 0, 1) for cut in cuts]
+        else:                    
+            spk_targets = [torch.as_tensor(speaker_to_target(cut, self.num_speakers, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, self.spk_tar_all_zero), dtype=torch.float32) for cut in cuts]
+        spk_targets = collate_matrices(spk_targets)
         audio, audio_lens, cuts = self.load_audio(cuts)
         tokens = [torch.as_tensor(self.tokenizer(c.supervisions[0].text, c.supervisions[0].language)) for c in cuts]
         token_lens = torch.tensor([t.size(0) for t in tokens], dtype=torch.long)
         tokens = collate_vectors(tokens, padding_value=0)
-        spk_targets = collate_matrices(spk_targets)
+
         return audio, audio_lens, tokens, token_lens, spk_targets, spk_mappings

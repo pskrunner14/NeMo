@@ -24,8 +24,6 @@ from pytorch_lightning import Trainer
 
 from nemo.collections.asr.data.audio_to_text_lhotse_speaker import LhotseSpeechToTextSpkBpeDataset
 
-from nemo.collections.asr.data.audio_to_text_lhotse_target_speaker import LhotseSpeechToTextTgtSpkBpeDataset
-
 from nemo.core.classes.mixins import AccessMixin
 from nemo.collections.asr.data.audio_to_text_dali import AudioToCharDALIDataset, DALIOutputs
 from nemo.collections.asr.parts.utils.asr_multispeaker_utils import apply_spk_mapping
@@ -61,14 +59,14 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
         super().__init__(cfg=cfg, trainer=trainer)
-        
+
         if 'diar_model_path' in self.cfg:
             self.diar = True
             # Initialize the speaker branch
             self._init_diar_model()
 
             self.num_speakers = cfg.model_defaults.get('num_speakers', 4)
-            
+
             # layer normalization, ln, l2, or None
             self.norm = cfg.get('norm', None)
 
@@ -186,7 +184,7 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
 
         temporary_datalayer = self._setup_dataloader_from_config(config=DictConfig(dl_config))
         return temporary_datalayer
-    
+
     def forward_diar(
         self,
         input_signal=None,
@@ -202,7 +200,7 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
         asr_frame_count
     ):
         """
-        Duct-tapeß solution for extending the speaker predictions 
+        Duct-tapeß solution for extending the speaker predictions
         """
         # Extract the first and last embeddings along the second dimension
         # first_emb = diar_pred[:, 0, :].unsqueeze(1)
@@ -221,44 +219,44 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
         extended_diar_preds = torch.cat((diar_pred, last_repeats), dim=1)
 
         return extended_diar_preds
-    
+
     def _get_probablistic_mix(self, diar_preds, spk_targets, rttm_mix_prob:float=0.0):
-        """ 
+        """
         Sample a probablistic mixture of speaker labels for each time step then apply it to the diarization predictions and the speaker targets.
-        
+
         Args:
             diar_preds (Tensor): Tensor of shape [B, T, D] representing the diarization predictions.
             spk_targets (Tensor): Tensor of shape [B, T, D] representing the speaker targets.
-            
+
         Returns:
             mix_prob (float): Tensor of shape [B, T, D] representing the probablistic mixture of speaker labels for each time step.
         """
         batch_probs_raw = torch.distributions.categorical.Categorical(probs=torch.tensor([(1-rttm_mix_prob), rttm_mix_prob]).repeat(diar_preds.shape[0],1)).sample()
         batch_probs = (batch_probs_raw.view(diar_preds.shape[0], 1, 1).repeat(1, diar_preds.shape[1], diar_preds.shape[2])).to(diar_preds.device)
         batch_diar_preds = (1 - batch_probs) * diar_preds + batch_probs * spk_targets
-        return batch_diar_preds 
+        return batch_diar_preds
 
     def get_sinusoid_position_encoding(self, max_position, embedding_dim):
         """
         Generates a sinusoid position encoding matrix.
-        
+
         Args:
         - max_position (int): The maximum position to generate encodings for.
         - embedding_dim (int): The dimension of the embeddings.
-        
+
         Returns:
         - torch.Tensor: A tensor of shape (max_position, embedding_dim) containing the sinusoid position encodings.
         """
         position = np.arange(max_position)[:, np.newaxis]
         div_term = np.exp(np.arange(0, embedding_dim, 2) * -(np.log(10000.0) / embedding_dim))
-        
+
         position_encoding = np.zeros((max_position, embedding_dim))
         position_encoding[:, 0::2] = np.sin(position * div_term)
         position_encoding[:, 1::2] = np.cos(position * div_term)
-        
+
         # Convert the numpy array to a PyTorch tensor
         position_encoding_tensor = torch.tensor(position_encoding, dtype=torch.float32)
-        
+
         return position_encoding_tensor
 
 
@@ -273,11 +271,11 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
             encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
 
         encoded = torch.transpose(encoded, 1, 2) # B * D * T -> B * T * D
-        
+
         if self.diar == True:
             if self.cfg.spk_supervision_strategy == 'rttm':
                 if spk_targets is not None:
-                    diar_preds = spk_targets 
+                    diar_preds = spk_targets
                 else:
                     raise ValueError("`spk_targets` is required for speaker supervision strategy 'rttm'")
             elif self.cfg.spk_supervision_strategy == 'diar':
@@ -291,13 +289,13 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
                 diar_preds = self._get_probablistic_mix(diar_preds=diar_preds, spk_targets=spk_targets, rttm_mix_prob=float(self.cfg.rttm_mix_prob))
             else:
                 raise ValueError(f"Invalid RTTM strategy {self.cfg.spk_supervision_strategy} is not supported.")
-        
+
             # Speaker mapping shuffling to equalize the speaker label's distributions
             if self.cfg.shuffle_spk_mapping:
                 diar_preds = apply_spk_mapping(diar_preds, spk_mappings)
 
             if(diar_preds.shape[1]!=encoded.shape[1]):
-            # KD duct-tape solution for extending the speaker predictions 
+            # KD duct-tape solution for extending the speaker predictions
                 asr_frame_count = encoded.shape[1]
                 diar_preds = self.fix_diar_output(diar_preds, asr_frame_count)
 
@@ -308,7 +306,7 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
             elif self.norm == 'l2':
                 diar_preds = torch.nn.functional.normalize(diar_preds, p=2, dim=-1)
                 encoded = torch.nn.functional.normalize(encoded, p=2, dim=-1)
-            
+
             if diar_preds.shape[1] > encoded.shape[1]:
                 diar_preds = diar_preds[:, :encoded.shape[1], :]
 
@@ -326,7 +324,7 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
                 encoded = self.joint_proj(concat_enc_states)
         else:
             encoded = encoded
-        
+
         encoded = torch.transpose(encoded, 1, 2) # B * T * D -> B * D * T
         return encoded, encoded_len, transcript, transcript_len
 
@@ -339,7 +337,7 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
             AccessMixin.reset_registry(self)
 
         encoded, encoded_len, transcript, transcript_len = self.train_val_forward(batch, batch_nb)
- 
+
         # During training, loss must be computed, so decoder forward is necessary
         decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
 
@@ -423,7 +421,7 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
             self._optim_normalize_txu = [encoded_len.max(), transcript_len.max()]
 
         return {'loss': loss_value}
-    
+
 
     def validation_pass(self, batch, batch_idx, dataloader_idx=0):
 
@@ -488,13 +486,13 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
         return tensorboard_logs
 
     def _transcribe_forward(self, batch, trcfg:TranscribeConfig):
-        #modify config 
+        #modify config
         self.cfg.spk_supervision_strategy = 'diar'
         #forward pass
         encoded, encoded_len, _, _ = self.train_val_forward(batch, 0)
         output = dict(encoded=encoded, encoded_len=encoded_len)
         return output
-    
+
     def _transcribe_output_processing(self, outputs,trcfg:TranscribeConfig):
         encoded = outputs.pop('encoded')
         encoded_len = outputs.pop('encoded_len')

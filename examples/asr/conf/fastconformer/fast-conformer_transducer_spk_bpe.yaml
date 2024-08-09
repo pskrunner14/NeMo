@@ -52,6 +52,7 @@ model:
   spk_supervision_strategy: "rttm" # Options: "rttm", "diar" and "mix"
   rttm_mix_prob: 0.5 # The sampling probability when mixing RTTMs
   shuffle_spk_mapping: True # Shuffle the speaker mapping in both transcript and RTTM/diar_preds
+  binarize_diar_preds_threshold: null
 
   model_defaults:
     enc_hidden: ${model.encoder.d_model}

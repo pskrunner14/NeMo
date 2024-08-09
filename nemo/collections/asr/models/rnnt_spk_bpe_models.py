@@ -101,6 +101,9 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
                 )
                 self.diar_kernel = self.joint_proj
 
+            #binarize diar_pred
+            self.binarize_diar_preds_threshold = cfg.get('binarize_diar_preds_threshold', None)
+
         else:
             self.diar = False
 
@@ -281,11 +284,15 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
             elif self.cfg.spk_supervision_strategy == 'diar':
                 with torch.set_grad_enabled(not self.cfg.freeze_diar):
                     diar_preds, _preds, attn_score_stack, total_memory_list, encoder_states_list = self.forward_diar(signal, signal_len)
+                    if self.binarize_diar_preds_threshold:
+                        diar_preds = torch.where(diar_preds > self.binarize_diar_preds_threshold, torch.tensor(1), torch.tensor(0)).to(encoded.device)
                 if diar_preds is None:
                     raise ValueError("`diar_pred`is required for speaker supervision strategy 'diar'")
             elif self.cfg.spk_supervision_strategy == 'mix':
                 with torch.set_grad_enabled(not self.cfg.freeze_diar):
                     diar_preds, _preds, attn_score_stack, total_memory_list, encoder_states_list = self.forward_diar(signal, signal_len)
+                    if self.binarize_diar_preds_threshold:
+                        diar_preds = torch.where(diar_preds > self.binarize_diar_preds_threshold, torch.tensor(1), torch.tensor(0)).to(encoded.device)
                 diar_preds = self._get_probablistic_mix(diar_preds=diar_preds, spk_targets=spk_targets, rttm_mix_prob=float(self.cfg.rttm_mix_prob))
             else:
                 raise ValueError(f"Invalid RTTM strategy {self.cfg.spk_supervision_strategy} is not supported.")

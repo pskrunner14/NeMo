@@ -24,7 +24,12 @@ from pytorch_lightning import Trainer
 
 from nemo.collections.asr.data.audio_to_text_lhotse_speaker import LhotseSpeechToTextSpkBpeDataset
 
+import nemo.collections.asr.models as asr_models
 from nemo.core.classes.mixins import AccessMixin
+from nemo.collections.asr.parts.mixins.asr_adapter_mixins import ASRAdapterModelMixin
+from nemo.collections.asr.parts.mixins.streaming import StreamingEncoder
+from nemo.collections.asr.parts.utils import asr_module_utils
+from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 from nemo.collections.asr.data.audio_to_text_dali import AudioToCharDALIDataset, DALIOutputs
 from nemo.collections.asr.parts.utils.asr_multispeaker_utils import apply_spk_mapping
 
@@ -113,6 +118,7 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
         """
 
         model_path = self.cfg.diar_model_path
+        model_path = '/home/jinhanw/workdir/scripts/dataloader/pipeline/checkpoints/sortformer/im303a-ft7_epoch6-19.nemo'
 
         if model_path.endswith('.nemo'):
             pretrained_diar_model = SortformerEncLabelModel.restore_from(model_path, map_location="cpu")
@@ -192,8 +198,9 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
         self,
         input_signal=None,
         input_signal_length=None,
+        is_raw_waveform_input=True,
     ):
-        preds, _preds, attn_score_stack, total_memory_list, encoder_states_list = self.diarization_model.forward(audio_signal=input_signal, audio_signal_length=input_signal_length)
+        preds, _preds, attn_score_stack, total_memory_list, encoder_states_list = self.diarization_model.forward(audio_signal=input_signal, audio_signal_length=input_signal_length, is_raw_waveform_input=is_raw_waveform_input)
 
         return preds, _preds, attn_score_stack, total_memory_list, encoder_states_list
 
@@ -207,21 +214,26 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
         """
         # Extract the first and last embeddings along the second dimension
         # first_emb = diar_pred[:, 0, :].unsqueeze(1)
-        last_emb = diar_pred[:, -1, :].unsqueeze(1)
+        if diar_pred.shape[1] < asr_frame_count:
+            last_emb = diar_pred[:, -1, :].unsqueeze(1)
 
-        #number of repeatitions needed
-        additional_frames = asr_frame_count - diar_pred.shape[1]
+            #number of repeatitions needed
+            additional_frames = asr_frame_count - diar_pred.shape[1]
 
-        # Create tensors of repeated first and last embeddings
-        # first_repeats = first_emb.repeat(1, additional_frames // 2, 1)
-        # last_repeats = last_emb.repeat(1, (additional_frames + 1) // 2, 1)
-        last_repeats = last_emb.repeat(1, additional_frames, 1)
+            # Create tensors of repeated first and last embeddings
+            # first_repeats = first_emb.repeat(1, additional_frames // 2, 1)
+            # last_repeats = last_emb.repeat(1, (additional_frames + 1) // 2, 1)
+            last_repeats = last_emb.repeat(1, additional_frames, 1)
 
-        # Concatenate the repeated tensors with the original embeddings
-        # extended_diar_preds = torch.cat((first_repeats, diar_pred, last_repeats), dim=1)
-        extended_diar_preds = torch.cat((diar_pred, last_repeats), dim=1)
+            # Concatenate the repeated tensors with the original embeddings
+            # extended_diar_preds = torch.cat((first_repeats, diar_pred, last_repeats), dim=1)
+            extended_diar_preds = torch.cat((diar_pred, last_repeats), dim=1)
 
-        return extended_diar_preds
+            return extended_diar_preds
+        else:
+            # temporary solution if diar_pred longer than encoded
+            return diar_pred[:, :asr_frame_count, :]
+
     
     def _get_probablistic_mix(self, diar_preds, spk_targets, rttm_mix_prob:float=0.0):
         """ 
@@ -274,7 +286,7 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
             encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
 
         encoded = torch.transpose(encoded, 1, 2) # B * D * T -> B * T * D
-        
+
         if self.diar == True:
             if self.cfg.spk_supervision_strategy == 'rttm':
                 if spk_targets is not None:
@@ -344,7 +356,7 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
             AccessMixin.reset_registry(self)
 
         encoded, encoded_len, transcript, transcript_len = self.train_val_forward(batch, batch_nb)
- 
+
         # During training, loss must be computed, so decoder forward is necessary
         decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
 
@@ -491,6 +503,356 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
         self.log('global_step', torch.tensor(self.trainer.global_step, dtype=torch.float32))
 
         return tensorboard_logs
+
+    def conformer_stream_step(
+        self,
+        audio_signal: torch.Tensor,
+        processed_signal: torch.Tensor,
+        spk_targets: torch.Tensor,
+        global_mapping: dict,
+        text_idx: int,
+        token_idx: int,
+        raw_texts: str,
+        prev_spk: str,
+        audio_signal_lengths: torch.Tensor = None,
+        processed_signal_length: torch.Tensor = None,
+        cache_last_channel: torch.Tensor = None,
+        cache_last_time: torch.Tensor = None,
+        cache_last_channel_len: torch.Tensor = None,
+        keep_all_outputs: bool = True,
+        previous_hypotheses: List[Hypothesis] = None,
+        previous_pred_out: torch.Tensor = None,
+        drop_extra_pre_encoded: int = None,
+        return_transcription: bool = True,
+        return_log_probs: bool = False,
+    ):
+        """
+        For detailed usage, please refer to ASRModuleMixin.conformer_stream_step
+        """
+        if not isinstance(self, asr_models.EncDecRNNTModel) and not isinstance(self, asr_models.EncDecCTCModel):
+            raise NotImplementedError(f"stream_step does not support {type(self)}!")
+
+        if not isinstance(self.encoder, StreamingEncoder):
+            raise NotImplementedError(f"Encoder of this model does not support streaming!")
+
+        if isinstance(self, asr_models.EncDecRNNTModel) and return_transcription is False:
+            logging.info(
+                "return_transcription can not be False for Transducer models as decoder returns the transcriptions too."
+            )
+
+        if not isinstance(self, asr_models.EncDecCTCModel) and return_log_probs is True:
+            logging.info("return_log_probs can only be True for CTC models.")
+        (
+            encoded,
+            encoded_len,
+            cache_last_channel_next,
+            cache_last_time_next,
+            cache_last_channel_next_len,
+        ) = self.encoder.cache_aware_stream_step(
+            processed_signal=processed_signal,
+            processed_signal_length=processed_signal_length,
+            cache_last_channel=cache_last_channel,
+            cache_last_time=cache_last_time,
+            cache_last_channel_len=cache_last_channel_len,
+            keep_all_outputs=keep_all_outputs,
+            drop_extra_pre_encoded=drop_extra_pre_encoded,
+        )
+        encoded = torch.transpose(encoded, 1, 2) # B * D * T -> B * T * D
+
+        if self.diar == True:
+            if self.cfg.spk_supervision_strategy == 'rttm':
+                if spk_targets is not None:
+                    diar_preds = spk_targets 
+                else:
+                    raise ValueError("`spk_targets` is required for speaker supervision strategy 'rttm'")
+            elif self.cfg.spk_supervision_strategy == 'diar':
+                with torch.set_grad_enabled(not self.cfg.freeze_diar):
+                    diar_preds, _preds, attn_score_stack, total_memory_list, encoder_states_list = self.forward_diar(audio_signal, audio_signal_lengths)
+                    if self.binarize_diar_preds_threshold:
+                        diar_preds = torch.where(diar_preds > self.binarize_diar_preds_threshold, torch.tensor(1), torch.tensor(0)).to(encoded.device)
+                    if diar_preds is None:
+                        raise ValueError("`diar_pred`is required for speaker supervision strategy 'diar'")
+            elif self.cfg.spk_supervision_strategy == 'mix':
+                with torch.set_grad_enabled(not self.cfg.freeze_diar):
+                    diar_preds, _preds, attn_score_stack, total_memory_list, encoder_states_list = self.forward_diar(audio_signal, audio_signal_lengths)
+                    if self.binarize_diar_preds_threshold:
+                        diar_preds = torch.where(diar_preds > self.binarize_diar_preds_threshold, torch.tensor(1), torch.tensor(0)).to(encoded.device)
+                    diar_preds = self.fix_diar_output(diar_preds, spk_targets.shape[1])
+                diar_preds = self._get_probablistic_mix(diar_preds=diar_preds, spk_targets=spk_targets, rttm_mix_prob=float(self.cfg.rttm_mix_prob))
+            else:
+                raise ValueError(f"Invalid RTTM strategy {self.cfg.spk_supervision_strategy} is not supported.")
+        
+            # Speaker mapping shuffling to equalize the speaker label's distributions
+            if self.cfg.shuffle_spk_mapping:
+                diar_preds = apply_spk_mapping(diar_preds, spk_mappings)
+
+            if(diar_preds.shape[1]!=encoded.shape[1]):
+            # KD duct-tape solution for extending the speaker predictions 
+                asr_frame_count = encoded.shape[1]
+                diar_preds = self.fix_diar_output(diar_preds, asr_frame_count)
+
+            # Normalize the features
+            if self.norm == 'ln':
+                diar_preds = self.diar_norm(diar_preds)
+                encoded = self.asr_norm(encoded)
+            elif self.norm == 'l2':
+                diar_preds = torch.nn.functional.normalize(diar_preds, p=2, dim=-1)
+                encoded = torch.nn.functional.normalize(encoded, p=2, dim=-1)
+            
+            if diar_preds.shape[1] > encoded.shape[1]:
+                diar_preds = diar_preds[:, :encoded.shape[1], :]
+
+            if self.diar_kernel_type == 'sinusoidal':
+                speaker_infusion_asr = torch.matmul(diar_preds, self.diar_kernel.to(diar_preds.device))
+                if self.kernel_norm == 'l2':
+                    speaker_infusion_asr = torch.nn.functional.normalize(speaker_infusion_asr, p=2, dim=-1)
+                encoded = speaker_infusion_asr + encoded
+            elif self.diar_kernel_type == 'metacat':
+                # import pdb; pdb.set_trace()
+                concat_enc_states = encoded.unsqueeze(2) * diar_preds.unsqueeze(3)
+                concat_enc_states = concat_enc_states.flatten(2,3)
+                encoded = self.joint_proj(concat_enc_states)
+            else:
+                concat_enc_states = torch.cat([encoded, diar_preds], dim=-1)
+                encoded = self.joint_proj(concat_enc_states)
+        else:
+            encoded = encoded
+        
+        encoded = torch.transpose(encoded, 1, 2) # B * T * 
+        if isinstance(self, asr_models.EncDecCTCModel) or (
+            isinstance(self, asr_models.EncDecHybridRNNTCTCModel) and self.cur_decoder == "ctc"
+        ):
+            if hasattr(self, "ctc_decoder"):
+                decoding = self.ctc_decoding
+                decoder = self.ctc_decoder
+            else:
+                decoding = self.decoding
+                decoder = self.decoder
+            log_probs = decoder(encoder_output=encoded)
+            predictions_tensor = log_probs.argmax(dim=-1, keepdim=False)
+
+            # Concatenate the previous predictions with the current one to have the full predictions.
+            # We drop the extra predictions for each sample by using the lengths returned by the encoder (encoded_len)
+            # Then create a list of the predictions for the batch. The predictions can have different lengths because of the paddings.
+            greedy_predictions = []
+            if return_transcription:
+                all_hyp_or_transcribed_texts = []
+            else:
+                all_hyp_or_transcribed_texts = None
+            for preds_idx, preds in enumerate(predictions_tensor):
+                if encoded_len is None:
+                    preds_cur = predictions_tensor[preds_idx]
+                else:
+                    preds_cur = predictions_tensor[preds_idx, : encoded_len[preds_idx]]
+                if previous_pred_out is not None:
+                    greedy_predictions_concat = torch.cat((previous_pred_out[preds_idx], preds_cur), dim=-1)
+                    encoded_len[preds_idx] += len(previous_pred_out[preds_idx])
+                else:
+                    greedy_predictions_concat = preds_cur
+                greedy_predictions.append(greedy_predictions_concat)
+
+                # TODO: make decoding more efficient by avoiding the decoding process from the beginning
+                if return_transcription:
+                    decoded_out = decoding.ctc_decoder_predictions_tensor(
+                        decoder_outputs=greedy_predictions_concat.unsqueeze(0),
+                        decoder_lengths=encoded_len[preds_idx : preds_idx + 1],
+                        return_hypotheses=False,
+                    )
+                    all_hyp_or_transcribed_texts.append(decoded_out[0][0])
+            best_hyp = None
+        else:
+            best_hyp, all_hyp_or_transcribed_texts = self.decoding.rnnt_decoder_predictions_tensor(
+                encoder_output=encoded,
+                encoded_lengths=encoded_len,
+                return_hypotheses=True,
+                partial_hypotheses=previous_hypotheses,
+                # partial_hypotheses=None,
+            )
+            greedy_predictions = [hyp.y_sequence for hyp in best_hyp]
+            if all_hyp_or_transcribed_texts is None:
+                all_hyp_or_transcribed_texts = best_hyp
+
+        '''
+        spk mapping recovery from global rttm mapping
+        '''
+
+        # processing_text = all_hyp_or_transcribed_texts[0].text[text_idx:]
+        # elements = processing_text.split()
+        # output = []
+        # for element in elements:
+        #     if element == '<|spltoken0|>' and 0 in global_mapping.keys():
+        #         element = f'<|spltoken{global_mapping[0]}|>'
+        #     elif element == '<|spltoken1|>' and 1 in global_mapping.keys():
+        #         element = f'<|spltoken{global_mapping[1]}|>'
+        #     elif element == '<|spltoken2|>' and 2 in global_mapping.keys():
+        #         element = f'<|spltoken{global_mapping[2]}|>'
+        #     elif element == '<|spltoken3|>' and 3 in global_mapping.keys():
+        #         element = f'<|spltoken{global_mapping[3]}|>'
+        #     output.append(element)
+        # if not raw_texts:
+        #     raw_texts = ' '.join(output)
+        # else:
+        #     raw_texts = raw_texts +  ' ' + ' '.join(output)
+
+        # merged_output = []
+        # prev_spk = 'kkkk'
+        # for i in range(len(output)):
+        #     element = output[i]
+        #     if element.find('spltoken') != -1:
+        #         if element == prev_spk:
+        #             continue
+        #         else:
+        #             prev_spk = element
+        #     merged_output.append(element)
+        # print(' '.join(merged_output))
+
+        # import pdb; pdb.set_trace()
+        # kkkkk = raw_texts.split()
+        # kkkkk_sub = []
+        # prev_spk = 'kkkkk'
+        # for i in range(len(kkkkk)):
+        #     element = kkkkk[i]
+        #     if element.find('spltoken') != -1:
+        #         if element == prev_spk:
+        #             continue
+        #         else:
+        #             prev_spk = element
+        #     kkkkk_sub.append(element)
+        # print(' '.join(kkkkk_sub))
+        # import pdb; pdb.set_trace()             
+
+        '''
+        spk mapping recovery from alignment
+        '''
+
+        # assert len(all_hyp_or_transcribed_texts[0].y_sequence[token_idx:]) == len(all_hyp_or_transcribed_texts[0].timestep)
+
+        # #get all speaker token in y_sequence
+        # spk_token_idx = []
+        # for i in range(len(all_hyp_or_transcribed_texts[0].y_sequence[token_idx:])):
+        #     if all_hyp_or_transcribed_texts[0].y_sequence[token_idx + i] in [1, 2, 3, 4]:
+        #         spk_token_idx.append(i)
+
+        # processing_text = all_hyp_or_transcribed_texts[0].text[text_idx:]
+        # processing_time_step = all_hyp_or_transcribed_texts[0].timestep
+
+        # spk_token_elements = []
+
+        # for element in processing_text.split():
+        #     if element.find('<|spltoken') != -1:
+        #         spk_token_elements.append(element)
+        # assert len(spk_token_idx) == len(spk_token_elements)
+        # new_spk_token = []
+        # for i in range(len(spk_token_idx)):
+        #     spk_time_step = processing_time_step[spk_token_idx[i]]
+        #     spk_tensor_hidden = spk_targets[0,spk_time_step, :]
+        #     local_spk_token = torch.argmax(spk_tensor_hidden)# 0, 1, 2, 3
+        #     try:
+        #         new_spk_token.append(f'<|spltoken{global_mapping[int(local_spk_token.cpu().numpy())]}|>')
+        #     except:
+        #         new_spk_token.append(f'<|spltoken0|>')
+
+        # output = []
+        # j = 0
+        # for element in processing_text.split():
+        #     if element.find('<|spltoken') != -1:
+        #         output.append(new_spk_token[j])
+        #         j += 1
+        #     else:
+        #         output.append(element)
+        # if not raw_texts:
+        #     raw_texts = ' '.join(output)
+        # else:
+        #     raw_texts = raw_texts + ' ' + ' '.join(output)
+
+        '''
+        spk mapping recovery from alignment oracle
+        '''
+        assert len(all_hyp_or_transcribed_texts[0].y_sequence[token_idx:]) == len(all_hyp_or_transcribed_texts[0].timestep)
+
+        #get all speaker token in y_sequence
+        spk_token_idx = []
+        for i in range(len(all_hyp_or_transcribed_texts[0].y_sequence[token_idx:])):
+            if all_hyp_or_transcribed_texts[0].y_sequence[token_idx + i] in [1, 2, 3, 4]:
+                spk_token_idx.append(i)
+
+        processing_text = all_hyp_or_transcribed_texts[0].text[text_idx:]
+        processing_time_step = all_hyp_or_transcribed_texts[0].timestep
+        new_spk_token = []
+        for i in range(len(spk_token_idx)):
+            spk_time_step = processing_time_step[spk_token_idx[i]]
+            spk_time_step_next = processing_time_step[spk_token_idx[i+1]] if i < len(spk_token_idx) - 1 else spk_targets.shape[1]
+            spk_tensor_hidden = spk_targets[0,spk_time_step:spk_time_step_next+1,:]
+            #get the most probable spk_token
+
+
+            # #not considering overlap, always local spk0
+            # local_spk_token = torch.argmax(torch.sum(spk_tensor_hidden, dim = 0))# 0, 1, 2, 3
+            # try:
+            #     new_spk_token.append(f'<|spltoken{global_mapping[int(local_spk_token.cpu().numpy())]}|>')
+            # except:
+            #     #because too long rttm segments
+            #     import pdb; pdb.set_trace()
+            #     new_spk_token.append(f'<|spltoken0|>')
+
+            #if overlapped spk targets, use preceeding speaker
+            spk_tensor_hidden_sum = torch.sum(spk_tensor_hidden, dim = 0)
+            max_value = torch.max(spk_tensor_hidden_sum)
+            local_spk_token = (spk_tensor_hidden_sum == max_value).nonzero(as_tuple=True)[0]
+            assign_new_speaker = False
+
+            if len(local_spk_token) > 1:
+                k = processing_time_step[spk_token_idx[i]] - 1
+                assign_new_speaker = True
+                # import pdb; pdb.set_trace()
+                while k >= 0 and len(local_spk_token)>1:
+                    max_value = torch.max(spk_targets[0,k,:])
+                    local_spk_token = (spk_targets[0,k,:] == max_value).nonzero(as_tuple=True)[0]
+                    k -= 1
+                if k>=0:
+                    assign_new_speaker = False
+                else:
+                    assigned_spk = prev_spk
+            if not assign_new_speaker:
+                new_spk_token.append(f'<|spltoken{global_mapping[int(local_spk_token.cpu().numpy())]}|>')
+            else:
+                # import pdb; pdb.set_trace()
+                new_spk_token.append(assigned_spk)
+            prev_spk = new_spk_token[-1]
+
+        output = []
+        j = 0
+        for element in processing_text.split():
+            if element.find('<|spltoken') != -1:
+                output.append(new_spk_token[j])
+                j += 1
+            else:
+                output.append(element)
+        if not raw_texts:
+            raw_texts = ' '.join(output)
+        else:
+            raw_texts = raw_texts + ' ' + ' '.join(output)
+            
+        if len(new_spk_token) == 0:
+            new_spk_token.append(prev_spk)
+        # import pdb; pdb.set_trace()
+        result = [
+            greedy_predictions,
+            all_hyp_or_transcribed_texts,
+            raw_texts,
+            cache_last_channel_next,
+            cache_last_time_next,
+            cache_last_channel_next_len,
+            best_hyp,
+            len(all_hyp_or_transcribed_texts[0].text),
+            len(all_hyp_or_transcribed_texts[0].y_sequence),
+            new_spk_token[-1],
+        ]
+        if return_log_probs:
+            result.append(log_probs)
+            result.append(encoded_len)
+
+        return tuple(result)
 
     def _transcribe_forward(self, batch, trcfg:TranscribeConfig):
         #modify config 

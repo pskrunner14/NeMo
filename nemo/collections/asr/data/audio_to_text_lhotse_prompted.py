@@ -23,8 +23,8 @@ from lhotse.dataset.collation import collate_vectors, collate_matrices
 from lhotse.utils import compute_num_samples
 from lhotse import SupervisionSet
 from nemo.collections.asr.parts.utils.asr_multispeaker_utils import (
-    speaker_to_target, 
-    get_hidden_length_from_sample_length, 
+    speaker_to_target,
+    get_hidden_length_from_sample_length,
     get_mask_from_segments,
     shuffle_spk_mapping
 )
@@ -110,18 +110,18 @@ class PromptedAudioToTextSpkLhotseDataset(torch.utils.data.Dataset):
         self.padding_value = self.tokenizer._tokenizer.pad_id
         self.prompt_format_fn = prompt_format_fn
         self.inference = inference
-        
+
         self.spk_tar_all_zero = self.cfg.get('spk_tar_all_zero',False)
         self.shuffle_spk_mapping = self.cfg.get('shuffle_spk_mapping', False)
         self.num_speakers = self.cfg.get('num_speakers', 4)
         self.num_sample_per_mel_frame = self.cfg.get('num_sample_per_mel_frame', 160)
         self.num_mel_frame_per_asr_frame = self.cfg.get('num_mel_frame_per_asr_frame', 8)
         self.spk_token_pattern= r'<\|spltoken\d+\|>'
-     
+
     def __getitem__(self, cuts: CutSet) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        cuts, spk_mappings = shuffle_spk_mapping(cuts=cuts, 
-                                                 num_speakers=self.num_speakers, 
-                                                 shuffle_spk_mapping=self.shuffle_spk_mapping, 
+        cuts, spk_mappings = shuffle_spk_mapping(cuts=cuts,
+                                                 num_speakers=self.num_speakers,
+                                                 shuffle_spk_mapping=self.shuffle_spk_mapping,
                                                  pattern=self.spk_token_pattern
                                                 )
         audio, audio_lens, cuts = self.load_audio(cuts)
@@ -218,6 +218,72 @@ def canary(cuts: CutSet, tokenizer: TokenizerWrapper, inference: bool = False) -
         # Actual tokenization. If a cut has multiple supervisions, we'll stitch their tokenized texts together.
         texts = [sup.text for sup in cut.supervisions]
         langs = [sup.language for sup in cut.supervisions]
+        taskname = cut.custom['taskname']
+        pnc = cut.custom['pnc']
+        source_lang = cut.custom['source_lang']
+        target_lang = cut.custom['target_lang']
+
+        tokens.append(canary_prompt(tokenizer, texts, langs, source_lang, target_lang, taskname, pnc))
+        if inference:
+            prompts.append(canary_prompt(tokenizer, None, None, source_lang, target_lang, taskname, pnc))
+    return tokens, prompts
+
+
+@registered_prompt_format_fn
+def mscanary(cuts: CutSet, tokenizer: TokenizerWrapper, inference: bool = False) -> Sequence[Sequence[int]]:
+    """
+    Prepend and append control tokens to the token sequence as per Canary format.
+
+    We use the following special tokens:
+    * <|startoftranscript|>
+    * <|transcribe|>
+    * <|translate|>
+    * <|nopnc|>
+    * <|pnc|>
+    * <|endoftext|>
+    * <|LANG|> - for each supported language.
+    * <|nospeech|>
+
+    The prompt format syntax is as follows:
+
+        <|startoftranscript|> [ <|nospeech|> | <|LANG|> [ <|transcribe|> | <|translate|> ] <|LANG|> [ <|pnc|> | <|nopnc|> ] TEXT <|endoftext|> ]
+
+    Where expression ``[ a | b ]`` denotes expression ``a`` or expression ``b``, and can be nested.
+    Note that ``<|LANG|>`` appears twice: the first occurrence is for the "source" language
+    (i.e., spoken language in the recording) and the second occurrence is for the "target" language
+    (i.e., the language in which we are going to output the text).
+    """
+    assert isinstance(
+        tokenizer._tokenizer, CanaryTokenizer
+    ), "To use 'canary' prompt format, you must use the CanaryTokenizer."
+    tokenizer = tokenizer._tokenizer
+
+    tokens, prompts = [], []
+    for cut in cuts:
+        if isinstance(cut, MixedCut):
+            if isinstance(cut.tracks[-1].cut, MonoCut):
+                texts = [sup.text for track in cut.tracks for sup in track.cut.supervisions]
+                langs = [sup.language for track in cut.tracks for sup in track.cut.supervisions]
+                cut = cut._first_non_padding_cut
+            else:
+                cut = cut._first_non_padding_cut
+                texts = [sup.text for sup in cut.supervisions]
+                langs = [sup.language for sup in cut.supervisions]
+        else:
+            texts = [sup.text for sup in cut.supervisions]
+            langs = [sup.language for sup in cut.supervisions]
+        assert isinstance(cut, MonoCut), "Expected MonoCut."
+        
+        # first, validate the utterance
+        
+        missing_keys = [k for k in ("source_lang", "target_lang", "taskname", "pnc") if k not in cut.custom]
+        if missing_keys:
+            raise RuntimeError(
+                f"We found cut with ID {cut.id} that is missing the following keys: {missing_keys}"
+                f"Please ensure that every utterance in the input manifests contains these keys."
+            )
+        # Actual tokenization. If a cut has multiple supervisions, we'll stitch their tokenized texts together.
+        
         taskname = cut.custom['taskname']
         pnc = cut.custom['pnc']
         source_lang = cut.custom['source_lang']

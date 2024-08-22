@@ -36,6 +36,7 @@ from lhotse.utils import fastcopy, fix_random_seed
 from omegaconf import DictConfig, OmegaConf
 
 from nemo.collections.common.data.lhotse.cutset import read_cutset_from_config
+from nemo.collections.asr.parts.utils.asr_multispeaker_utils import ConcatenationMeetingSimulator
 from nemo.utils import logging
 
 
@@ -122,6 +123,17 @@ class LhotseDataLoadingConfig:
     # Note that this will not allow actual dataloading; it's only for manifest iteration as Lhotse objects.
     missing_sampling_rate_ok: bool = False
 
+    # 6. Cut simulation for multi-speaker ASR
+    # a. Concatentaion of cuts
+    concat_simulation: bool = False
+    including_real_data: bool = False
+    intra_session_concat_prob: float = 1.0
+    ms_data_type: str = "msasr"
+    concat_min_duration: float = 30.0
+    concat_max_duration: float = 40.0
+    max_num_speakers: int = 4
+    num_meetings: int = 100000
+    skip_long_segments: bool = False
 
 def get_lhotse_dataloader_from_config(
     config: DictConfig, global_rank: int, world_size: int, dataset: torch.utils.data.Dataset, tokenizer=None,
@@ -159,6 +171,20 @@ def get_lhotse_dataloader_from_config(
 
     # 1. Load a manifest as a Lhotse CutSet.
     cuts, is_tarred = read_cutset_from_config(config)
+    if config.concat_simulation:
+        simulator = ConcatenationMeetingSimulator(
+            intra_session_concat_prob=config.intra_session_concat_prob,
+            data_type=config.ms_data_type,
+            min_duration=config.concat_min_duration,
+            max_duration=config.concat_max_duration,
+            max_num_speakers=config.max_num_speakers,
+            skip_long_segments=config.skip_long_segments,
+        )
+        simulated_cuts = simulator.simulate(cuts, num_meetings=config.num_meetings, num_jobs=1)
+        if config.including_real_data:
+            cuts = CutSet.from_cuts(cuts + simulated_cuts)
+        else:
+            cuts = simulated_cuts
 
     # Apply channel selector
     if config.channel_selector is not None:
@@ -214,11 +240,9 @@ def get_lhotse_dataloader_from_config(
             hop=config.cut_into_windows_hop,
             keep_excessive_supervisions=config.keep_excessive_supervisions,
         )
-
     # Duration filtering, same as native NeMo dataloaders.
     # We can filter after the augmentations because they are applied only when calling load_audio().
     cuts = cuts.filter(DurationFilter(config.min_duration, config.max_duration))
-
     if config.use_multimodal_sampling:
         constraint = MultimodalSamplingConstraint(
             token_equivalent_duration=config.token_equivalent_duration,
@@ -440,7 +464,7 @@ def _merge_supervisions(cuts: CutSet) -> CutSet:
 
 def _flatten_alt_text(cut) -> list:
     ans = [cut]
-    if not isinstance(cut, Cut) or cut.custom is None or cut.custom.get("alt_text") is None:
+    if not isinstance(cut, Cut) or not hasattr(cut, 'custom') or cut.custom.get("alt_text") is None:
         return ans
     cut = cut.move_to_memory(audio_format="wav")  # performs I/O once and holds audio in memory from now on
     # Popping to ease eyesight on debug.

@@ -11,13 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Callable, Sequence
+from dataclasses import dataclass
+from typing import Callable, Union
 
-import omegaconf
 import torch.utils.data
 from pathlib import Path
 from lhotse import CutSet
-from lhotse.cut import MixedCut, MonoCut
 from lhotse.dataset import AudioSamples
 from lhotse.dataset.collation import collate_vectors, collate_matrices
 from lhotse.utils import compute_num_samples
@@ -30,6 +29,29 @@ from nemo.collections.asr.parts.utils.asr_multispeaker_utils import (
 )
 from nemo.collections.asr.data.audio_to_text_lhotse import TokenizerWrapper
 from nemo.collections.common.tokenizers import CanaryTokenizer, TokenizerSpec
+from lhotse.dataset.collation import collate_vectors
+
+from nemo.collections.common.tokenizers import TokenizerSpec
+
+
+@dataclass
+class PromptedAudioToTextMiniBatch:
+    audio: torch.Tensor
+    audio_lens: torch.Tensor
+    transcript: torch.Tensor
+    transcript_lens: torch.Tensor
+    prompt: torch.Tensor
+    prompt_lens: torch.Tensor
+    prompted_transcript: torch.Tensor
+    prompted_transcript_lens: torch.Tensor
+
+    def get_decoder_inputs_outputs(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns the inputs and outputs of transformer decoder for training.
+        The input is ``prompted_transcript`` (minus last token),
+        and the output is ``prompted_transcript`` (minus first token).
+        """
+        return self.prompted_transcript[:, :-1], self.prompted_transcript[:, 1:]
 
 
 class PromptedAudioToTextLhotseDataset(torch.utils.data.Dataset):
@@ -52,21 +74,45 @@ class PromptedAudioToTextLhotseDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         tokenizer: TokenizerSpec,
-        prompt_format_fn: Callable[[CutSet, TokenizerWrapper, bool], Sequence[Sequence[int]]],
-        inference: bool = False,
+        prompt_format_fn: Callable[
+            [CutSet, TokenizerSpec], tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]
+        ],
     ):
         super().__init__()
-        self.tokenizer = TokenizerWrapper(tokenizer)
+        self.tokenizer = tokenizer
         self.load_audio = AudioSamples(fault_tolerant=True)
-        self.padding_value = self.tokenizer._tokenizer.pad_id
+        self.padding_value = self.tokenizer.pad
         self.prompt_format_fn = prompt_format_fn
-        self.inference = inference
 
-    def __getitem__(self, cuts: CutSet) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, cuts: CutSet) -> PromptedAudioToTextMiniBatch:
         audio, audio_lens, cuts = self.load_audio(cuts)
 
-        tokens, prompt_tokens = self.prompt_format_fn(cuts, self.tokenizer, inference=self.inference)
+        # Fast-path: the tokenization and prompt formatting was already done before sampling.
+        attrs = ("tokenized_prompt", "tokenized_transcript", "tokenized_prompted_transcript")
+        pre_formatted = all(hasattr(c, a) for c in cuts for a in attrs)
+        if pre_formatted:
+            prompts_with_answers, prompts, answers = zip(
+                *((c.tokenized_prompted_transcript, c.tokenized_prompt, c.tokenized_transcript) for c in cuts)
+            )
+        else:
+            prompts_with_answers, prompts, answers = self.prompt_format_fn(cuts, self.tokenizer)
 
+        transcript, transcript_lens = self._collate_tokens(answers)
+        prompts_with_answers, prompts_with_answers_lens = self._collate_tokens(prompts_with_answers)
+        prompts, prompt_lens = self._collate_tokens(prompts)
+
+        return PromptedAudioToTextMiniBatch(
+            audio=audio,
+            audio_lens=audio_lens,
+            transcript=transcript,
+            transcript_lens=transcript_lens,
+            prompt=prompts,
+            prompt_lens=prompt_lens,
+            prompted_transcript=prompts_with_answers,
+            prompted_transcript_lens=prompts_with_answers_lens,
+        )
+
+    def _collate_tokens(self, tokens: list[Union[list[int], torch.Tensor]]) -> tuple[torch.Tensor, torch.Tensor]:
         tokens = [torch.as_tensor(t) for t in tokens]
         token_lens = torch.tensor([t.size(0) for t in tokens], dtype=torch.long)
         tokens = collate_vectors(tokens, padding_value=self.padding_value)
@@ -309,7 +355,6 @@ def canary_prompt(
     if tokens is not None:
         prompted_tokens.append(tokenizer.eos_id)
     return prompted_tokens
-
 
 class ProbablyIncorrectLanguageKeyError(RuntimeError):
     pass

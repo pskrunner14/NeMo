@@ -27,16 +27,10 @@ from torch.utils.data import DataLoader
 
 from nemo.collections.asr.data.audio_to_text_lhotse_prompted import (
     PromptedAudioToTextLhotseDataset,
-    PromptedAudioToTextSpkLhotseDataset,
-    get_prompt_format_fn,
     PromptedAudioToTextMiniBatch,
 )
 from nemo.collections.asr.metrics import BLEU, WER
-from nemo.collections.asr.metrics.der import concat_perm_word_error_rate as cpWER
 from nemo.collections.asr.models.asr_model import ASRModel, ExportableEncDecModel
-from nemo.collections.asr.models.label_models import EncDecSpeakerLabelModel
-# from nemo.collections.asr.models import SortformerEncLabelModel
-from nemo.collections.asr.models.eesd_models import SortformerEncLabelModel
 from nemo.collections.asr.parts.mixins import ASRBPEMixin, ASRModuleMixin, ASRTranscriptionMixin
 from nemo.collections.asr.parts.mixins.transcription import (
     GenericTranscriptionType,
@@ -49,9 +43,7 @@ from nemo.collections.asr.parts.submodules.token_classifier import TokenClassifi
 from nemo.collections.asr.parts.utils import manifest_utils
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 from nemo.collections.common import tokenizers
-from nemo.collections.asr.parts.utils.asr_multispeaker_utils import apply_spk_mapping
-# from nemo.collections.common.data.lhotse.dataloader import get_lhotse_dataloader_from_config
-from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
+from nemo.collections.common.data.lhotse.dataloader import get_lhotse_dataloader_from_config
 from nemo.collections.common.metrics import GlobalAverageLossMetric
 from nemo.collections.common.parts import transformer_weights_init
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
@@ -62,7 +54,6 @@ from nemo.core.neural_types import (
     AudioSignal,
     ChannelType,
     LabelsType,
-    StringType,
     LengthsType,
     LogprobsType,
     MaskType,
@@ -71,7 +62,7 @@ from nemo.core.neural_types import (
 )
 from nemo.utils import logging, model_utils
 
-__all__ = ['EncDecMultiTaskModel', 'MSEncDecMultiTaskModel']
+__all__ = ['EncDecMultiTaskModel']
 
 
 def lens_to_mask(lens, max_length):
@@ -112,18 +103,10 @@ class MultiTaskTranscriptionConfig(TranscribeConfig):
     """
     Configuration for Multi Task Transcription
     """
-    task: Optional[str] = None
-    pnc: Optional[bool] = None
-    source_lang: Optional[str] = None
-    target_lang: Optional[str] = None
 
     prompt: list[dict[str, dict[str, str]]] | None = None
     text_field: str = "answer"
     lang_field: str = "target_lang"
-
-    # Multispeaker configs
-    shuffle_spk_mapping: bool = False
-    spk_supervision_strategy: str = 'diar'
 
     _internal: Optional[MultiTaskTranscriptionInternalConfig] = field(
         default_factory=lambda: MultiTaskTranscriptionInternalConfig()
@@ -988,6 +971,7 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
             'drop_last': False,
             'text_field': config.get('text_field', 'answer'),
             'lang_field': config.get('lang_field', 'target_lang'),
+            'channel_selector': config.get('channel_selector', None),
         }
 
         temporary_datalayer = self._setup_dataloader_from_config(config=DictConfig(dl_config))
@@ -1079,6 +1063,114 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
         )[0]
 
         return text
+
+    @property
+    def adapter_module_names(self) -> List[str]:
+        return ['', 'encoder', 'transf_encoder', 'transf_decoder']
+
+    @property
+    def oomptimizer_schema(self) -> dict:
+        """
+        Return a typing schema for optimal batch size calibration for various
+        sequence lengths using OOMptimizer.
+        """
+        return {
+            "cls": PromptedAudioToTextMiniBatch,
+            "inputs": [
+                {"name": "audio", "type": NeuralType(("B", "T"), AudioSignal()), "seq_length": "input"},
+                {"name": "audio_lens", "type": NeuralType(("B",), LengthsType()), "seq_length": "input"},
+                {
+                    "name": "prompted_transcript",
+                    "type": NeuralType(("B", "T"), LabelsType()),
+                    "seq_length": "output",
+                    "vocab_size": self.tokenizer.vocab_size,
+                },
+                {
+                    "name": "prompted_transcript_lens",
+                    "type": NeuralType(("B",), LengthsType()),
+                    "seq_length": "output",
+                },
+                {"name": "transcript", "type": "dummy"},
+                {"name": "transcript_lens", "type": "dummy"},
+                {"name": "prompt", "type": "dummy"},
+                {"name": "prompt_lens", "type": "dummy"},
+            ],
+        }
+
+
+def parse_multitask_prompt(prompt: dict | None) -> list[dict]:
+    if prompt is None or not prompt:
+        return []
+
+    # Case 1.
+    # Multi-turn prompting format. This format conforms to PromptFormatter API and needs no further modification.
+    # This format allows to condition the model on chat history, system+user prompts, etc.
+    # Example:
+    # model.transcribe(
+    #     audio,
+    #     turns=[
+    #         dict(
+    #             role="user",
+    #             slots=dict(
+    #                 source_lang='en', target_lang='de', task='asr', pnc=True, context='translate this text'
+    #             ),
+    #         ),
+    #         dict(
+    #             role="assistant",
+    #             slots=dict(message="Calculating the translation of given text. Do you want to proceed?"),
+    #         ),
+    #         dict(
+    #             role="user",
+    #             slots=dict(
+    #                 source_lang='en', target_lang='de', task='asr', pnc=True, context='Yes, please proceed.'
+    #             ),
+    #         ),
+    #     ],
+    # )
+    if 'turns' in prompt:
+        assert (
+            len(prompt) == 1
+            and isinstance(prompt["turns"], list)
+            and all(isinstance(t, dict) and "role" in t and "slots" in t for t in prompt["turns"])
+        ), (
+            f"When providing a multi-turn prompt through 'turns', no other keys are allowed "
+            f"and the value under prompt['turns'] must be a list of dicts with roles and slot values "
+            f"(we received {prompt=})"
+        )
+        return prompt["turns"]
+
+    values_are_dicts = any(isinstance(v, dict) for k, v in prompt.items() if k != "slots")
+    assert not values_are_dicts, (
+        f"We don't support dict values for prompt keys other than 'slots'. " f"We received {prompt=}"
+    )
+
+    # Case 2.
+    # Single-turn prompting format with explicitly provided role and slot names and values.
+    # We create a 1-item multi-turn prompt from this input.
+    # Example:
+    # model.transcribe(
+    #     audio,
+    #     role="user",
+    #     slots=dict(source_lang='en', target_lang='de', task='asr', pnc=True, context='translate this text'),
+    # )
+    if "role" in prompt and "slots" in prompt:
+        assert isinstance(prompt["slots"], dict), (
+            f"When providing a single-turn prompt through 'role', 'slots' must also be provided "
+            f"(we received {prompt=})."
+        )
+        return [prompt]
+
+    # Case 3.
+    # Legacy prompting format for Canary-1B preserved for backward compatibility.
+    # Extra fields are converted to a single-turn prompt with role "user" (unless overridden with 'role').
+    # Example:
+    # model.transcribe(
+    #     audio, pnc=True, source_lang='en', target_lang='de', task='asr', context='translate this text'
+    # )
+    role = prompt.pop("role", "user")
+    return [dict(role=role, slots=prompt)]
+
+
 
 class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
     """
@@ -1699,76 +1791,3 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
                 {"name": "prompt_lens", "type": "dummy"},
             ],
         }
-
-
-def parse_multitask_prompt(prompt: dict | None) -> list[dict]:
-    if prompt is None or not prompt:
-        return []
-
-    # Case 1.
-    # Multi-turn prompting format. This format conforms to PromptFormatter API and needs no further modification.
-    # This format allows to condition the model on chat history, system+user prompts, etc.
-    # Example:
-    # model.transcribe(
-    #     audio,
-    #     turns=[
-    #         dict(
-    #             role="user",
-    #             slots=dict(
-    #                 source_lang='en', target_lang='de', task='asr', pnc=True, context='translate this text'
-    #             ),
-    #         ),
-    #         dict(
-    #             role="assistant",
-    #             slots=dict(message="Calculating the translation of given text. Do you want to proceed?"),
-    #         ),
-    #         dict(
-    #             role="user",
-    #             slots=dict(
-    #                 source_lang='en', target_lang='de', task='asr', pnc=True, context='Yes, please proceed.'
-    #             ),
-    #         ),
-    #     ],
-    # )
-    if 'turns' in prompt:
-        assert (
-            len(prompt) == 1
-            and isinstance(prompt["turns"], list)
-            and all(isinstance(t, dict) and "role" in t and "slots" in t for t in prompt["turns"])
-        ), (
-            f"When providing a multi-turn prompt through 'turns', no other keys are allowed "
-            f"and the value under prompt['turns'] must be a list of dicts with roles and slot values "
-            f"(we received {prompt=})"
-        )
-        return prompt["turns"]
-
-    values_are_dicts = any(isinstance(v, dict) for k, v in prompt.items() if k != "slots")
-    assert not values_are_dicts, (
-        f"We don't support dict values for prompt keys other than 'slots'. " f"We received {prompt=}"
-    )
-
-    # Case 2.
-    # Single-turn prompting format with explicitly provided role and slot names and values.
-    # We create a 1-item multi-turn prompt from this input.
-    # Example:
-    # model.transcribe(
-    #     audio,
-    #     role="user",
-    #     slots=dict(source_lang='en', target_lang='de', task='asr', pnc=True, context='translate this text'),
-    # )
-    if "role" in prompt and "slots" in prompt:
-        assert isinstance(prompt["slots"], dict), (
-            f"When providing a single-turn prompt through 'role', 'slots' must also be provided "
-            f"(we received {prompt=})."
-        )
-        return [prompt]
-
-    # Case 3.
-    # Legacy prompting format for Canary-1B preserved for backward compatibility.
-    # Extra fields are converted to a single-turn prompt with role "user" (unless overridden with 'role').
-    # Example:
-    # model.transcribe(
-    #     audio, pnc=True, source_lang='en', target_lang='de', task='asr', context='translate this text'
-    # )
-    role = prompt.pop("role", "user")
-    return [dict(role=role, slots=prompt)]

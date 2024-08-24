@@ -28,6 +28,7 @@ from torch.utils.data import DataLoader
 from nemo.collections.asr.data.audio_to_text_lhotse_prompted import (
     PromptedAudioToTextLhotseDataset,
     PromptedAudioToTextMiniBatch,
+    PromptedAudioToTextSpkLhotseDataset,
 )
 from nemo.collections.asr.metrics import BLEU, WER
 from nemo.collections.asr.models.asr_model import ASRModel, ExportableEncDecModel
@@ -39,6 +40,7 @@ from nemo.collections.asr.parts.mixins.transcription import (
 )
 from nemo.collections.asr.parts.preprocessing.segment import ChannelSelectorType
 from nemo.collections.asr.parts.submodules.multitask_decoding import MultiTaskDecoding, MultiTaskDecodingConfig
+from nemo.collections.asr.models.eesd_models import SortformerEncLabelModel
 from nemo.collections.asr.parts.submodules.token_classifier import TokenClassifier
 from nemo.collections.asr.parts.utils import manifest_utils
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
@@ -58,6 +60,7 @@ from nemo.core.neural_types import (
     LogprobsType,
     MaskType,
     NeuralType,
+    StringType,
     SpectrogramType,
 )
 from nemo.utils import logging, model_utils
@@ -1455,39 +1458,46 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
             return torch.tensor([0.0])
 
         # During training prompt and prompt_len are null, ignore.
-        signal, signal_len, transcript, transcript_len, prompt, prompt_len, spk_targets, spk_mappings = batch
-        input_ids, labels = transcript[:, :-1], transcript[:, 1:]
+        input_ids, labels = batch.get_decoder_inputs_outputs()
         
         transf_log_probs, encoded_len, enc_states, enc_mask = self.forward(
-            input_signal=signal,
-            input_signal_length=signal_len,
+            input_signal=batch.audio,
+            input_signal_length=batch.audio_lens,
             transcript=input_ids,
-            transcript_length=transcript_len,
-            spk_targets=spk_targets,
-            spk_mappings=spk_mappings,
-            spk_supervision_strategy=self.cfg.train_ds.get("spk_supervision_strategy", self.cfg.spk_supervision_strategy)
-        )
+            transcript_length=batch.prompted_transcript_lens,
+            spk_targets=batch.spk_targets,
+            spk_mappings=batch.spk_mappings,
+            spk_supervision_strategy=self.cfg.train_ds.get("spk_supervision_strategy", self.cfg.spk_supervision_strategy) 
+            ) 
 
         audio_loss = self.loss(log_probs=transf_log_probs, labels=labels)
 
+        num_frames = batch.audio_lens.sum()
+        num_tokens = batch.prompted_transcript_lens.sum()
+        tot_frames = batch.audio.numel()
+        tot_tokens = batch.prompted_transcript.numel()
         tensorboard_logs = {
             'train_loss': audio_loss,
             'learning_rate': self._optimizer.param_groups[0]['lr'],
+            'batch_size': batch.audio.shape[0],
+            'num_frames': num_frames,
+            'num_tokens': num_tokens,
+            'input_to_padding_ratio': num_frames / tot_frames,
+            'output_to_padding_ratio': num_tokens / tot_tokens,
         }
 
         return {'loss': audio_loss, 'log': tensorboard_logs}
 
     def validation_pass(self, batch, batch_idx, dataloader_idx=0, eval_mode="val"):
         # During inference, dataloader passes pure prompt without transcript text.
-        signal, signal_len, transcript, transcript_len, prompt, prompt_len, spk_targets, spk_mappings = batch
-        input_ids, labels = transcript[:, :-1], transcript[:, 1:]
+        input_ids, labels = batch.get_decoder_inputs_outputs()
         transf_log_probs, encoded_len, enc_states, enc_mask = self.forward(
-            input_signal=signal,
-            input_signal_length=signal_len,
+            input_signal=batch.audio,
+            input_signal_length=batch.audio_lens,
             transcript=input_ids,
-            transcript_length=transcript_len,
-            spk_targets=spk_targets,
-            spk_mappings=spk_mappings,
+            transcript_length=batch.prompted_transcript_lens,
+            spk_targets=batch.spk_targets,
+            spk_mappings=batch.spk_mappings,
             spk_supervision_strategy=self.cfg.validation_ds.get("spk_supervision_strategy", "diar"),
         )
 
@@ -1500,10 +1510,10 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
         self.wer.update(
             predictions=enc_states,
             predictions_lengths=encoded_len,
-            targets=transcript,
-            targets_lengths=transcript_len,
+            targets=batch.transcript,
+            targets_lengths=batch.transcript_lens,
             predictions_mask=enc_mask,
-            input_ids=prompt,
+            input_ids=batch.prompt,
         )
         wer, wer_num, wer_denom = self.wer.compute()
         output_dict.update({"val_wer": wer, "val_wer_num": wer_num, "val_wer_denom": wer_denom})
@@ -1512,10 +1522,10 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
         self.bleu.update(
             predictions=enc_states,
             predictions_lengths=encoded_len,
-            targets=transcript,
-            targets_lengths=transcript_len,
+            targets=batch.transcript,
+            targets_lengths=batch.transcript_lens,
             predictions_mask=enc_mask,
-            input_ids=prompt,
+            input_ids=batch.prompt,
         )
         bleu_metrics = self.bleu.compute(prefix=f"{eval_mode}_")
         output_dict.update(bleu_metrics)

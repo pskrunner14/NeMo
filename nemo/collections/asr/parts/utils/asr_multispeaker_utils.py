@@ -27,6 +27,7 @@ from typing import Dict, Optional, Tuple, List
 
 import numpy as np
 from tqdm import tqdm
+from scipy.stats import norm
 
 import torch.utils.data
 from lhotse.cut import CutSet, MixedCut, MonoCut, MixTrack
@@ -353,20 +354,22 @@ class ConcatenationMeetingSimulator():
         for i, cut in tqdm(enumerate(cuts), desc="Reading segments", ncols=100, total=len(cuts)):
             if cut.duration > self.skip_duration:
                 continue
-            cut.dataset_id = f"{os.path.basename(os.path.dirname(os.path.dirname(cut.rttm_filepath)))}"
+            if not hasattr(cut, 'dataset_id') or cut.dataset_id is None:
+                continue
             if cut.dataset_id not in self.data2num_spk2cut_ids:
                 self.data2num_spk2cut_ids[cut.dataset_id] = defaultdict(list)
             if cut.recording_id not in self.sess2num_spk2cut_ids:
                 self.sess2num_spk2cut_ids[cut.recording_id] = defaultdict(list)
             
             speakers = cut.global_speaker_ids
-            speaker_tokens = set(re.findall(r'<\|spltoken\d+\|>', cut.text))
-            if len(speakers) != len(speaker_tokens): 
-                # Lhotse automatically fixes the max duration of the cut, 
-                # resulting in the mismatch of the number of speakers 
-                # and speaker tokens for the last segment
-                # TODO: need to fix the issue in Lhotse that automatically fixes the max duration
-                continue
+            if self.data_type == "msasr":
+                speaker_tokens = set(re.findall(r'<\|spltoken\d+\|>', cut.text))
+                if len(speakers) != len(speaker_tokens): 
+                    # Lhotse automatically fixes the max duration of the cut, 
+                    # resulting in the mismatch of the number of speakers 
+                    # and speaker tokens for the last segment
+                    # TODO: need to fix the issue in Lhotse that automatically fixes the max duration
+                    continue
             for spk in speakers:
                 self.spk2cut_ids[spk].append(cut.id)
             self.sess2spks[cut.recording_id] = self.sess2spks[cut.recording_id].union(speakers)
@@ -387,26 +390,27 @@ class ConcatenationMeetingSimulator():
         }        
             
     def _create_mixture(self, n_speakers: int, is_intra_session_concat=False) -> MixedCut:
+
+        db_norm = norm.rvs(-32.05957708631966, 5.66648411405886) # mean and std from Fisher data
         
         if is_intra_session_concat:
             # intra-dataset and intra-session concatenation
-            tracks, num_speakers = self.get_intra_session_tracks(n_speakers)
+            tracks, num_speakers = self.get_intra_session_tracks(n_speakers, db_norm=db_norm)
 
         else: 
             # intra-dataset but inter-session concatenation
-            tracks, num_speakers = self.get_inter_session_tracks(n_speakers)
+            tracks, num_speakers = self.get_inter_session_tracks(n_speakers, db_norm=db_norm)
 
         cut = MixedCut(id=str(uuid4()), tracks=tracks)
         if self.data_type == "msasr":
             cut = self.reorder_spk_mapping(cut)
 
-        # import ipdb; ipdb.set_trace()
         assert self.min_duration <= cut.duration <= self.max_duration, f"Total duration {cut.duration} is not within the range of min {self.min_duration} and max {self.max_duration}"
         assert n_speakers == num_speakers, f"Total number of speakers {cut.num_speakers} is not equal to the number of speakers {n_speakers}"
 
         return cut
     
-    def get_intra_session_tracks(self, n_speakers: int=4) -> List[MixTrack]:
+    def get_intra_session_tracks(self, n_speakers: int=4, db_norm: float=-25) -> List[MixTrack]:
         """
         Get the tracks for the MixedCut object.
         """
@@ -417,7 +421,7 @@ class ConcatenationMeetingSimulator():
         tracks = []
         while True:
             cut = self.id2cut[random.choice(self.sess2cut_ids[session_id])]
-            tracks.append(MixTrack(cut=deepcopy(cut.normalize_loudness(target=-25.0, mix_first=False)), type=type(cut), offset=total_duration))
+            tracks.append(MixTrack(cut=deepcopy(cut.normalize_loudness(target=db_norm, mix_first=False)), type=type(cut), offset=total_duration))
             total_spk_set = total_spk_set.union(cut.global_speaker_ids)
             total_duration += cut.duration
 
@@ -438,13 +442,16 @@ class ConcatenationMeetingSimulator():
             
         return tracks, len(total_spk_set)
 
-    def get_inter_session_tracks(self, n_speakers: int=4) -> List[MixTrack]:
+    def get_inter_session_tracks(self, n_speakers: int=4, db_norm: float=-25) -> List[MixTrack]:
         """
         Get the tracks for the MixedCut object.
         """
         sample_cut = self.id2cut[random.choice(self.cut_ids)]
         dataset_id = sample_cut.dataset_id
         n_spk_list = [n_spk for n_spk, cut_ids in self.data2num_spk2cut_ids[dataset_id].items() if len(cut_ids) > 0]
+        sum_spk_list = [i + j for i in n_spk_list for j in n_spk_list]
+        if min(sum_spk_list) > n_speakers:
+            raise ValueError(f"Cannot generate {n_speakers}-speaker inter session samples by concatenating two samples since the dataset {dataset_id} only have {','.join(n_spk_list)} speakers.")
 
         n_spk_left = n_speakers
         total_duration = 0.0
@@ -463,7 +470,7 @@ class ConcatenationMeetingSimulator():
                 if not spks.intersection(total_spk_set):
                     break
 
-            tracks.append(MixTrack(cut=deepcopy(cut.normalize_loudness(target=-25.0, mix_first=False)), type=type(cut), offset=total_duration))
+            tracks.append(MixTrack(cut=deepcopy(cut.normalize_loudness(target=db_norm, mix_first=False)), type=type(cut), offset=total_duration))
             total_duration += cut.duration
             n_spk_left -= n_spk
             total_spk_set = total_spk_set.union(spks)
@@ -471,7 +478,7 @@ class ConcatenationMeetingSimulator():
             # break condition
             
             if total_duration >= self.min_duration:
-                if total_duration > self.max_duration: # exceed the maximum duration, starting over
+                if total_duration > self.max_duration or len(total_spk_set) < n_speakers: # exceed the maximum duration, starting over
                     total_duration = 0.0
                     n_spk_left = n_speakers
                     total_spk_set = set()
@@ -479,24 +486,11 @@ class ConcatenationMeetingSimulator():
                 if len(total_spk_set) == n_speakers: # meet the number of speakers and duration, break
                     break
             else:
-                if len(total_spk_set) == n_speakers: # meet the number of speakers, but not the duration, will try to find the segments that only contains those speakers
+                if len(total_spk_set) == n_speakers: # meet the number of speakers, but not the duration, starting over --- TODO: will try to find the segments that only contains those speakers
                     total_duration = 0.0
                     n_spk_left = n_speakers
                     total_spk_set = set()
                     tracks = []
-                    # cut_ids_list = [set(self.spk2cut_ids[spk]) for spk in total_spk_set]
-                    # # get the common cut ids that containing one of them, two of them, ..., all of them 
-                    # common_cut_ids = []
-                    # if len(common_cut_ids) > 0:
-                    #     cut = self.id2cut[random.choice(list(common_cut_ids))]
-                    #     tracks.append(MixTrack(cut=deepcopy(cut.normalize_loudness(target=-25.0, mix_first=False)), type=type(cut), offset=total_duration))
-                    #     total_duration += cut.duration
-                    #     break
-                    # else:
-                    #     total_duration = 0.0
-                    #     n_spk_left = n_speakers
-                    #     total_spk_set = set()
-                    #     tracks = []
                     
         return tracks, len(total_spk_set)
     
@@ -544,9 +538,9 @@ class ConcatenationMeetingSimulator():
         ...
         n speaker samples: nx
         """
-        total_spk = sum(range(1, self.max_num_speakers + 1))
+        total_spk = sum(range(2, self.max_num_speakers + 1))
         num_speakers2num_meetings = {}
-        for i in range(1, self.max_num_speakers + 1):
+        for i in range(2, self.max_num_speakers + 1):
             num_speakers2num_meetings[i] = round(num_meetings * i / total_spk) - len(self.num_spk2cut_ids[i])
             if num_speakers2num_meetings[i] < 0:
                 logging.warning(f"""
@@ -557,7 +551,7 @@ class ConcatenationMeetingSimulator():
         return num_speakers2num_meetings
         
     
-    #@dill_enabled(True)
+    @dill_enabled(True)
     def simulate(self, 
         cuts: CutSet,
         num_meetings: int = 10000,
@@ -567,7 +561,7 @@ class ConcatenationMeetingSimulator():
         random.seed(seed)
 
         self.fit(cuts)
-        mixtures = []
+        
 
         num_speakers2num_meetings = self.balance_speaker_distribution(num_meetings)
         logging.warn(f"Will be generating {(','.join([str(i) for i in num_speakers2num_meetings.values()]))} samples for {(','.join([str(i) for i in num_speakers2num_meetings.keys()]))} speakers.")
@@ -576,6 +570,7 @@ class ConcatenationMeetingSimulator():
 
         # Step 1: intra-session
         num_intra_meetings = 0
+        intra_mixtures = []
         logging.info(f"Simulating intra-session concatentation samples.")
         for n_spk, n_mt in num_speakers2num_meetings.items():
             if n_mt <= 0:
@@ -587,23 +582,31 @@ class ConcatenationMeetingSimulator():
                 continue
 
             for i in tqdm(range(n_intra_mt), desc=f"Simulating {n_spk}-speaker intra-session mixtures", ncols=128):
-                mixtures.append(self._create_mixture(n_speakers=n_spk, is_intra_session_concat=True))
+                intra_mixtures.append(self._create_mixture(n_speakers=n_spk, is_intra_session_concat=True))
             num_speakers2num_meetings[n_spk] -= n_intra_mt
             num_intra_meetings += n_intra_mt
         logging.info(f"Finished simulating intra-session concatentation samples. Total number of intra-session concatentation samples: {num_intra_meetings}")
     
         # Steo 2: inter-session
         logging.info(f"Simulating inter-session concatentation samples.")
+        n_spks = self.num_spk2cut_ids.keys()
+        valid_sim_n_spks = [i+j for i in n_spks for j in n_spks]
+
         num_inter_meetings = 0
+        inter_mixtures = []
         for n_spk, n_mt in num_speakers2num_meetings.items():
             if n_mt <= 0:
                 logging.warning(f"No inter-session concatentation samples for {n_spk} speakers. Will skip generating inter-session concatentation samples.")
                 continue
+            if n_spk not in valid_sim_n_spks:
+                logging.warning(f"Cannot generate {n_spk}-speaker inter-session samples by concatenating two samples since we only have samples for {','.join([str(i) for i in n_spks])} speakers.")
+                continue
             
             for i in tqdm(range(n_mt), desc=f"Simulating {n_spk}-speaker inter-session mixtures", ncols=128):
-                mixtures.append(self._create_mixture(n_speakers=n_spk, is_intra_session_concat=False))
+                inter_mixtures.append(self._create_mixture(n_speakers=n_spk, is_intra_session_concat=False))
             num_inter_meetings += n_mt
         logging.info(f"Finished simulating inter-session concatentation samples. Total number of inter-session concatentation samples: {num_inter_meetings}")
+
 
         # Multi-processing gets slower, TODO
         # else:
@@ -620,4 +623,4 @@ class ConcatenationMeetingSimulator():
         #     tp.shutdown()
         #     pbar.close()
 
-        return CutSet.from_cuts(mixtures)
+        return CutSet.from_cuts(intra_mixtures + inter_mixtures)

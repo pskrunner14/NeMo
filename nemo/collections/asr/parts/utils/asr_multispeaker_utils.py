@@ -14,15 +14,25 @@
 
 import os
 import re
+import copy
 import math
+import random
+import logging
+import itertools
 from copy import deepcopy
+import concurrent.futures
+from cytoolz import groupby
+from collections import defaultdict
 from typing import Dict, Optional, Tuple, List
 
+import numpy as np
+from tqdm import tqdm
+from scipy.stats import norm
+
 import torch.utils.data
-from lhotse import CutSet
-from lhotse.cut import MixedCut, MonoCut
-from lhotse.utils import compute_num_samples
-from lhotse import SupervisionSet
+from lhotse.cut import CutSet, MixedCut, MonoCut, MixTrack
+from lhotse import SupervisionSet, dill_enabled
+from lhotse.utils import uuid4
 
 def apply_spk_mapping(diar_preds: torch.Tensor, spk_mappings: torch.Tensor) -> torch.Tensor:
     """ 
@@ -148,23 +158,32 @@ def speaker_to_target(
         mask (Tensor): speaker mask with shape (num_speaker, hidden_lenght)
     '''
     # get cut-related segments from rttms
-    rttms = SupervisionSet.from_rttm(a_cut.rttm_filepath)
-    basename = os.path.basename(a_cut.rttm_filepath).replace('.rttm', '')
+    # basename = os.path.basename(a_cut.rttm_filepath).replace('.rttm', '')
     if isinstance(a_cut, MixedCut):
-        cut_list = [track.cut for track in a_cut.tracks] 
+        cut_list = [track.cut for track in a_cut.tracks if isinstance(track.cut, MonoCut)] 
     elif isinstance(a_cut, MonoCut):
         cut_list = [a_cut]
     else:
-        raise ValueError(f"Unsupported cut type type{cut}: only MixedCut and MonoCut are supported")
+        raise ValueError(f"Unsupported cut type type{a_cut}: only MixedCut and MonoCut are supported")
     
     segments_total = []
-    for cut in cut_list:
+    duration = 0.0
+    for i, cut in enumerate(cut_list):
+        rttms = SupervisionSet.from_rttm(cut.rttm_filepath)
         if boundary_segments: # segments with seg_start < total_end and seg_end > total_start are included
             segments_iterator = find_segments_from_rttm(recording_id=cut.recording_id, rttms=rttms, start_after=cut.start, end_before=cut.end, tolerance=0.0)
         else: # segments with seg_start > total_start and seg_end < total_end are included
             segments_iterator = rttms.find(recording_id=cut.recording_id, start_after=cut.start, end_before=cut.end, adjust_offset=True)
-        segments = [s for s in segments_iterator]
-        segments_total.extend(segments)
+
+        for seg in segments_iterator:
+            if seg.start < 0:
+                seg.duration += seg.start
+                seg.start = 0
+            if seg.end > cut.duration:
+                seg.duration -= seg.end - cut.duration
+            seg.start += duration
+            segments_total.append(seg)
+        duration += cut.duration
     
     # apply arrival time sorting to the existing segments
     segments_total.sort(key = lambda rttm_sup: rttm_sup.start)
@@ -280,3 +299,328 @@ def get_hidden_length_from_sample_length(
     mel_frame_count = math.ceil((num_samples + 1) / num_sample_per_mel_frame)
     hidden_length = math.ceil(mel_frame_count / num_mel_frame_per_asr_frame)
     return int(hidden_length)
+
+class ConcatenationMeetingSimulator():
+    """
+    This simulator concatenates the segments from different/same sessions to create a
+    multi-speaker meeting. 
+    """
+
+    def __init__(
+        self,
+        intra_session_concat_prob: float = 1.0,
+        data_type: str = "msasr",
+        min_duration: float = 30.0,
+        max_duration: float = 40.0,
+        max_num_speakers: int = 4,
+        skip_long_segments: bool = True,
+    ):
+        """
+        :param intra_session_concat_prob: the probability of concatenating segments from the same
+            session. [Default: 1]
+        :param data_type: the type of data to simulate. Either 'msasr' or 'diar'. If 'msasr',
+            the transcripts are included in the simulation,and the boundary segments are 
+            not included. [Default: 'msasr']
+        :param max_duration: the maximum duration of the simulated meeting. [Default: 40.0]
+        """
+        super().__init__()
+        self.intra_session_concat_prob = intra_session_concat_prob
+        if data_type not in ["msasr", "diar"]:
+            raise ValueError("data_type must be either 'msasr' or 'diar', but got {data_type}")
+        self.data_type = data_type
+        self.including_boundary_segments = data_type == "diar"
+        self.min_duration = min_duration
+        self.max_duration = max_duration
+        self.max_num_speakers = max_num_speakers
+        if skip_long_segments:
+            self.skip_duration = max_duration / 2
+        else:
+            self.skip_duration = max_duration
+
+    def fit(self, cuts) -> CutSet:
+        """
+        Read the manifest file and return a CutSet object. 
+        Each line in the manifest file should be a JSON object representing a segment.
+        """
+
+        self.id2cut = {}
+        self.sess2cut_ids = defaultdict(list)
+        self.sess2spks = defaultdict(set)
+        self.data2sess_ids = defaultdict(list)
+        self.spk2cut_ids = defaultdict(list)
+        self.data2num_spk2cut_ids = {}
+        self.sess2num_spk2cut_ids = {}
+        self.num_spk2cut_ids = {i+1:[] for i in range(self.max_num_speakers)}
+        for i, cut in tqdm(enumerate(cuts), desc="Reading segments", ncols=100, total=len(cuts)):
+            if cut.duration > self.skip_duration:
+                continue
+            if not hasattr(cut, 'dataset_id') or cut.dataset_id is None:
+                continue
+            if cut.dataset_id not in self.data2num_spk2cut_ids:
+                self.data2num_spk2cut_ids[cut.dataset_id] = defaultdict(list)
+            if cut.recording_id not in self.sess2num_spk2cut_ids:
+                self.sess2num_spk2cut_ids[cut.recording_id] = defaultdict(list)
+            
+            speakers = cut.global_speaker_ids
+            if self.data_type == "msasr":
+                speaker_tokens = set(re.findall(r'<\|spltoken\d+\|>', cut.text))
+                if len(speakers) != len(speaker_tokens): 
+                    # Lhotse automatically fixes the max duration of the cut, 
+                    # resulting in the mismatch of the number of speakers 
+                    # and speaker tokens for the last segment
+                    # TODO: need to fix the issue in Lhotse that automatically fixes the max duration
+                    continue
+            for spk in speakers:
+                self.spk2cut_ids[spk].append(cut.id)
+            self.sess2spks[cut.recording_id] = self.sess2spks[cut.recording_id].union(speakers)
+            
+            self.id2cut[cut.id] = cut
+            self.sess2cut_ids[cut.recording_id].append(cut.id)
+            self.data2num_spk2cut_ids[cut.dataset_id][len(speakers)].append(cut.id)
+            self.sess2num_spk2cut_ids[cut.recording_id][len(speakers)].append(cut.id)
+            self.num_spk2cut_ids[len(speakers)].append(cut.id)
+            if cut.recording_id not in self.data2sess_ids[cut.dataset_id]:
+                self.data2sess_ids[cut.dataset_id].append(cut.recording_id)
+                
+        self.cut_ids = list(self.id2cut.keys())
+        self.num_spk2sess_ids = groupby(lambda x: len(self.sess2spks[x]), self.sess2spks.keys())
+        
+        self.data2global_speaker = {
+            dataset_id: True for dataset_id in self.data2sess_ids.keys()
+        }        
+            
+    def _create_mixture(self, n_speakers: int, is_intra_session_concat=False) -> MixedCut:
+
+        db_norm = norm.rvs(-32.05957708631966, 5.66648411405886) # mean and std from Fisher data
+        
+        if is_intra_session_concat:
+            # intra-dataset and intra-session concatenation
+            tracks, num_speakers = self.get_intra_session_tracks(n_speakers, db_norm=db_norm)
+
+        else: 
+            # intra-dataset but inter-session concatenation
+            tracks, num_speakers = self.get_inter_session_tracks(n_speakers, db_norm=db_norm)
+
+        cut = MixedCut(id=str(uuid4()), tracks=tracks)
+        if self.data_type == "msasr":
+            cut = self.reorder_spk_mapping(cut)
+
+        assert self.min_duration <= cut.duration <= self.max_duration, f"Total duration {cut.duration} is not within the range of min {self.min_duration} and max {self.max_duration}"
+        assert n_speakers == num_speakers, f"Total number of speakers {cut.num_speakers} is not equal to the number of speakers {n_speakers}"
+
+        return cut
+    
+    def get_intra_session_tracks(self, n_speakers: int=4, db_norm: float=-25) -> List[MixTrack]:
+        """
+        Get the tracks for the MixedCut object.
+        """
+        session_id = random.choice(self.num_spk2sess_ids[n_speakers])
+        
+        total_duration = 0.0
+        total_spk_set = set()
+        tracks = []
+        while True:
+            cut = self.id2cut[random.choice(self.sess2cut_ids[session_id])]
+            tracks.append(MixTrack(cut=deepcopy(cut.normalize_loudness(target=db_norm, mix_first=False)), type=type(cut), offset=total_duration))
+            total_spk_set = total_spk_set.union(cut.global_speaker_ids)
+            total_duration += cut.duration
+
+            # break condition
+            if total_duration >= self.min_duration:
+                if total_duration > self.max_duration: # exceed the maximum duration, starting over
+                    total_duration = 0.0
+                    total_spk_set = set()
+                    tracks = []
+                    session_id = random.choice(self.num_spk2sess_ids[n_speakers])
+                if len(total_spk_set) == n_speakers: # meet the number of speakers and duration, break
+                    break
+                else:
+                    total_duration = 0.0
+                    total_spk_set = set()
+                    tracks = []
+                    session_id = random.choice(self.num_spk2sess_ids[n_speakers])
+            
+        return tracks, len(total_spk_set)
+
+    def get_inter_session_tracks(self, n_speakers: int=4, db_norm: float=-25) -> List[MixTrack]:
+        """
+        Get the tracks for the MixedCut object.
+        """
+        sample_cut = self.id2cut[random.choice(self.cut_ids)]
+        dataset_id = sample_cut.dataset_id
+        n_spk_list = [n_spk for n_spk, cut_ids in self.data2num_spk2cut_ids[dataset_id].items() if len(cut_ids) > 0]
+        sum_spk_list = [i + j for i in n_spk_list for j in n_spk_list]
+        if min(sum_spk_list) > n_speakers:
+            raise ValueError(f"Cannot generate {n_speakers}-speaker inter session samples by concatenating two samples since the dataset {dataset_id} only have {','.join(n_spk_list)} speakers.")
+
+        n_spk_left = n_speakers
+        total_duration = 0.0
+        total_spk_set = set()
+        tracks = []
+        num_spk2cut_ids = self.data2num_spk2cut_ids[dataset_id]
+        while True:
+            if n_spk_left == n_speakers:
+                n_spk = random.choice([n_spk for n_spk in n_spk_list if n_spk < n_spk_left])
+            else:
+                n_spk = random.choice([n_spk for n_spk in n_spk_list if n_spk <= n_spk_left])
+
+            while True:
+                cut = self.id2cut[random.choice(num_spk2cut_ids[n_spk])]
+                spks = set(cut.global_speaker_ids)
+                if not spks.intersection(total_spk_set):
+                    break
+
+            tracks.append(MixTrack(cut=deepcopy(cut.normalize_loudness(target=db_norm, mix_first=False)), type=type(cut), offset=total_duration))
+            total_duration += cut.duration
+            n_spk_left -= n_spk
+            total_spk_set = total_spk_set.union(spks)
+
+            # break condition
+            
+            if total_duration >= self.min_duration:
+                if total_duration > self.max_duration or len(total_spk_set) < n_speakers: # exceed the maximum duration, starting over
+                    total_duration = 0.0
+                    n_spk_left = n_speakers
+                    total_spk_set = set()
+                    tracks = []
+                if len(total_spk_set) == n_speakers: # meet the number of speakers and duration, break
+                    break
+            else:
+                if len(total_spk_set) == n_speakers: # meet the number of speakers, but not the duration, starting over --- TODO: will try to find the segments that only contains those speakers
+                    total_duration = 0.0
+                    n_spk_left = n_speakers
+                    total_spk_set = set()
+                    tracks = []
+                    
+        return tracks, len(total_spk_set)
+    
+    def reorder_spk_mapping(self, cut: MixedCut, pattern=r'<\|spltoken\d+\|>') -> str:
+        """
+        Concatenate the texts of the input cuts.
+        
+        """
+        global_spk_mapping = {}
+        str_pattern = pattern.replace("\\", '')
+        left_str, right_str = str_pattern.split('d+')
+        for i, track in enumerate(cut.tracks):
+            local_inverse_spk_mapping = {}
+            local_spk_mapping = {}
+            for speaker in track.cut.global_speaker_ids:
+                if speaker not in global_spk_mapping:
+                    global_spk_mapping[speaker] = len(global_spk_mapping)
+                if speaker not in local_spk_mapping:
+                    local_spk_mapping[speaker] = len(local_spk_mapping)
+                    local_inverse_spk_mapping[len(local_inverse_spk_mapping)] = speaker
+                    
+            if i != 0:
+                text = ''
+                for word in track.cut.text.split(): 
+                    if len(re.findall(pattern, word)) > 0:
+                        local_spk_idx = int(word.replace(left_str,'').replace(right_str, ''))
+                        spk = local_inverse_spk_mapping[local_spk_idx]
+                        global_spk_idx = global_spk_mapping[spk]
+                        text += f' {left_str}{global_spk_idx}{right_str}'
+                    else:
+                        text += ' ' + word
+                track.cut.supervisions[0].text = text
+                # TODO: need to check the last speaker of last track and the first speaker of the current track 
+                # if they are the same, we need to remove the the speaker token from the current track for segment-level
+                # Do not need to remove the speaker token for word-level
+            
+        return cut
+    
+    def balance_speaker_distribution(self, num_meetings: int) -> Dict[int, int]:
+        """
+        Balance the speaker distribution for the simulated meetings.
+        For each number of speakers, calculate the number of meetings needed to balance the distribution.
+        1 speaker samples: 1x
+        2 speaker samples: 2x
+        ...
+        n speaker samples: nx
+        """
+        total_spk = sum(range(2, self.max_num_speakers + 1))
+        num_speakers2num_meetings = {}
+        for i in range(2, self.max_num_speakers + 1):
+            num_speakers2num_meetings[i] = round(num_meetings * i / total_spk) - len(self.num_spk2cut_ids[i])
+            if num_speakers2num_meetings[i] < 0:
+                logging.warning(f"""
+                                Number of real samples for {i} speakers exceeds the expected total number of simulated samples. The total number for all number of speakers is {num_meetings}.
+                                We can have at most {num_meetings * i / total_spk} samples, but got {len(self.num_spk2cut_ids[i])} samples for {i} speakers.""")
+                num_speakers2num_meetings[i] = 0
+
+        return num_speakers2num_meetings
+        
+    
+    @dill_enabled(True)
+    def simulate(self, 
+        cuts: CutSet,
+        num_meetings: int = 10000,
+        seed: int = 0,
+        num_jobs: int = 1,
+    ) -> CutSet:
+        random.seed(seed)
+
+        self.fit(cuts)
+        
+
+        num_speakers2num_meetings = self.balance_speaker_distribution(num_meetings)
+        logging.warn(f"Will be generating {(','.join([str(i) for i in num_speakers2num_meetings.values()]))} samples for {(','.join([str(i) for i in num_speakers2num_meetings.keys()]))} speakers.")
+        num_speakers2num_meetings[1] = 0 # skip 1-speaker samples
+        logging.warn(f'But 1-speaker samples will be skipped. Will be generating {sum(num_speakers2num_meetings.values()) - num_speakers2num_meetings[1]} samples in total.')
+
+        # Step 1: intra-session
+        num_intra_meetings = 0
+        intra_mixtures = []
+        logging.info(f"Simulating intra-session concatentation samples.")
+        for n_spk, n_mt in num_speakers2num_meetings.items():
+            if n_mt <= 0:
+                logging.warning(f"No intra-session concatentation samples for {n_spk} speakers. Will skip generating intra-session concatentation samples.")
+                continue
+            n_intra_mt = int(n_mt * self.intra_session_concat_prob)
+            if n_spk not in self.num_spk2sess_ids: # no sessions with n_spk speakers
+                logging.warning(f"No sessions with {n_spk} speakers. Will skip generating {n_intra_mt} intra-session concatentation samples.")
+                continue
+
+            for i in tqdm(range(n_intra_mt), desc=f"Simulating {n_spk}-speaker intra-session mixtures", ncols=128):
+                intra_mixtures.append(self._create_mixture(n_speakers=n_spk, is_intra_session_concat=True))
+            num_speakers2num_meetings[n_spk] -= n_intra_mt
+            num_intra_meetings += n_intra_mt
+        logging.info(f"Finished simulating intra-session concatentation samples. Total number of intra-session concatentation samples: {num_intra_meetings}")
+    
+        # Steo 2: inter-session
+        logging.info(f"Simulating inter-session concatentation samples.")
+        n_spks = self.num_spk2cut_ids.keys()
+        valid_sim_n_spks = [i+j for i in n_spks for j in n_spks]
+
+        num_inter_meetings = 0
+        inter_mixtures = []
+        for n_spk, n_mt in num_speakers2num_meetings.items():
+            if n_mt <= 0:
+                logging.warning(f"No inter-session concatentation samples for {n_spk} speakers. Will skip generating inter-session concatentation samples.")
+                continue
+            if n_spk not in valid_sim_n_spks:
+                logging.warning(f"Cannot generate {n_spk}-speaker inter-session samples by concatenating two samples since we only have samples for {','.join([str(i) for i in n_spks])} speakers.")
+                continue
+            
+            for i in tqdm(range(n_mt), desc=f"Simulating {n_spk}-speaker inter-session mixtures", ncols=128):
+                inter_mixtures.append(self._create_mixture(n_speakers=n_spk, is_intra_session_concat=False))
+            num_inter_meetings += n_mt
+        logging.info(f"Finished simulating inter-session concatentation samples. Total number of inter-session concatentation samples: {num_inter_meetings}")
+
+
+        # Multi-processing gets slower, TODO
+        # else:
+        #     futures = []
+        #     for n_spk, n_mt in num_speakers2num_meetings.items():
+        #         tp = concurrent.futures.ProcessPoolExecutor(max_workers=num_jobs)
+        #         futures.extend([tp.submit(self._create_mixture, n_spk) for _ in range(n_mt)])
+        #     pbar = tqdm(total=num_meetings, desc=f"Simulating mixtures", unit="line", ncols=128) 
+        #     count = 0
+        #     for f in concurrent.futures.as_completed(futures):
+        #         count += 1
+        #         pbar.update()
+        #         mixtures.append(f.result())
+        #     tp.shutdown()
+        #     pbar.close()
+
+        return CutSet.from_cuts(intra_mixtures + inter_mixtures)

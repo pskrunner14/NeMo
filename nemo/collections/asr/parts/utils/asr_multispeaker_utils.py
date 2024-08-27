@@ -313,6 +313,7 @@ class ConcatenationMeetingSimulator():
         min_duration: float = 30.0,
         max_duration: float = 40.0,
         max_num_speakers: int = 4,
+        speaker_count_distribution: List[int] = [0, 2, 3, 4],
         skip_long_segments: bool = True,
     ):
         """
@@ -332,6 +333,9 @@ class ConcatenationMeetingSimulator():
         self.min_duration = min_duration
         self.max_duration = max_duration
         self.max_num_speakers = max_num_speakers
+        self.speaker_count_distribution = speaker_count_distribution
+        assert len(speaker_count_distribution) == max_num_speakers, f"Length of speaker_count_distribution {len(speaker_count_distribution)} must be equal to max_num_speakers {max_num_speakers}"
+
         if skip_long_segments:
             self.skip_duration = max_duration / 2
         else:
@@ -449,9 +453,10 @@ class ConcatenationMeetingSimulator():
         sample_cut = self.id2cut[random.choice(self.cut_ids)]
         dataset_id = sample_cut.dataset_id
         n_spk_list = [n_spk for n_spk, cut_ids in self.data2num_spk2cut_ids[dataset_id].items() if len(cut_ids) > 0]
-        sum_spk_list = [i + j for i in n_spk_list for j in n_spk_list]
+        sum_spk_list = set([i + j for i in n_spk_list for j in n_spk_list])
+
         if min(sum_spk_list) > n_speakers:
-            raise ValueError(f"Cannot generate {n_speakers}-speaker inter session samples by concatenating two samples since the dataset {dataset_id} only have {','.join(n_spk_list)} speakers.")
+            raise ValueError(f"Cannot generate {n_speakers}-speaker inter session samples by concatenating two samples since the dataset {dataset_id} only have {','.join([str(i) for i in n_spk_list])} speakers.")
 
         n_spk_left = n_speakers
         total_duration = 0.0
@@ -519,34 +524,32 @@ class ConcatenationMeetingSimulator():
                         local_spk_idx = int(word.replace(left_str,'').replace(right_str, ''))
                         spk = local_inverse_spk_mapping[local_spk_idx]
                         global_spk_idx = global_spk_mapping[spk]
-                        text += f' {left_str}{global_spk_idx}{right_str}'
+                        text += f'{left_str}{global_spk_idx}{right_str}'
                     else:
                         text += ' ' + word
                 track.cut.supervisions[0].text = text
+                cut.supervisions[i].text = text
+            else:
+                cut.supervisions[0].text = track.cut.text
                 # TODO: need to check the last speaker of last track and the first speaker of the current track 
                 # if they are the same, we need to remove the the speaker token from the current track for segment-level
                 # Do not need to remove the speaker token for word-level
             
         return cut
     
-    def balance_speaker_distribution(self, num_meetings: int) -> Dict[int, int]:
+    def apply_speaker_distribution(self, num_meetings: int, speaker_count_distribution) -> Dict[int, int]:
         """
         Balance the speaker distribution for the simulated meetings.
+        Args:
+            num_meetings: The total number of simulated meetings.
+            speaker_count_distribution: The speaker count distribution for the simulated meetings.
         For each number of speakers, calculate the number of meetings needed to balance the distribution.
-        1 speaker samples: 1x
-        2 speaker samples: 2x
-        ...
-        n speaker samples: nx
         """
-        total_spk = sum(range(2, self.max_num_speakers + 1))
+
+        total_spk = sum(speaker_count_distribution)
         num_speakers2num_meetings = {}
-        for i in range(2, self.max_num_speakers + 1):
-            num_speakers2num_meetings[i] = round(num_meetings * i / total_spk) - len(self.num_spk2cut_ids[i])
-            if num_speakers2num_meetings[i] < 0:
-                logging.warning(f"""
-                                Number of real samples for {i} speakers exceeds the expected total number of simulated samples. The total number for all number of speakers is {num_meetings}.
-                                We can have at most {num_meetings * i / total_spk} samples, but got {len(self.num_spk2cut_ids[i])} samples for {i} speakers.""")
-                num_speakers2num_meetings[i] = 0
+        for i_spk in range(self.max_num_speakers):
+            num_speakers2num_meetings[i_spk+1] = round(num_meetings * speaker_count_distribution[i_spk] / total_spk)
 
         return num_speakers2num_meetings
         
@@ -563,43 +566,60 @@ class ConcatenationMeetingSimulator():
         self.fit(cuts)
         
 
-        num_speakers2num_meetings = self.balance_speaker_distribution(num_meetings)
-        logging.warn(f"Will be generating {(','.join([str(i) for i in num_speakers2num_meetings.values()]))} samples for {(','.join([str(i) for i in num_speakers2num_meetings.keys()]))} speakers.")
+        num_speakers2num_meetings = self.apply_speaker_distribution(num_meetings, self.speaker_count_distribution)
+        logging.warn(f"Will be generating {(','.join([str(i) for i in num_speakers2num_meetings.values()]))} samples for {(','.join([str(i) for i in num_speakers2num_meetings.keys()]))} speakers given speaker count distribution of {str(self.speaker_count_distribution)}.")
         num_speakers2num_meetings[1] = 0 # skip 1-speaker samples
         logging.warn(f'But 1-speaker samples will be skipped. Will be generating {sum(num_speakers2num_meetings.values()) - num_speakers2num_meetings[1]} samples in total.')
 
+        # Step 0: Calculate the number of intra-session and inter-session concatentation samples
+        n_spks = [k for k, v in self.num_spk2cut_ids.items() if len(v) > 0]
+        valid_sim_n_spks = set([i+j for i in n_spks for j in n_spks]) # valid number of speakers for inter-session samples
+        n_spk2n_intra_mt, n_spk2n_inter_mt = {i+1:0 for i in range(self.max_num_speakers)}, {i+1:0 for i in range(self.max_num_speakers)}
+        for n_spk, n_mt in num_speakers2num_meetings.items():
+            logging.warn(f"=="*16 + f"{n_spk}-speaker" + "=="*16)
+            if n_mt <= 0:
+                logging.warning(f"No intra-session concatentation samples for {n_spk} speakers. Will skip simulation for {n_spk} speakers.")
+                continue
+            n_intra_mt = int(n_mt * self.intra_session_concat_prob)
+            n_inter_mt = n_mt - n_intra_mt
+            if n_spk in self.num_spk2sess_ids:
+                logging.warn(f"Will be genrating {n_intra_mt} {n_spk}-speaker intra-session concatentation samples.")
+                n_spk2n_intra_mt[n_spk] = n_intra_mt
+            else:
+                logging.warning(f"Cannot generate {n_intra_mt} {n_spk}-speaker intra-session samples by concatenating two samples from the same session since we only have samples for {','.join([str(i) for i in n_spks])} speakers.")
+                n_spk2n_intra_mt[n_spk] = 0
+                n_inter_mt = n_mt
+            if n_spk in valid_sim_n_spks:
+                logging.warn(f"Will be genrating {n_inter_mt} {n_spk}-speaker inter-session concatentation samples.")
+                n_spk2n_inter_mt[n_spk] = n_inter_mt
+            else:
+                logging.warning(f"Cannot generate {n_inter_mt} {n_spk}-speaker inter-session samples by concatenating two samples from different sessions since we only have samples for {','.join([str(i) for i in n_spks])} speakers.")
+                if n_spk2n_intra_mt[n_spk] != 0:
+                    n_spk2n_intra_mt[n_spk] = n_mt
+                    logging.warn(f"Will be genrating {n_spk2n_intra_mt[n_spk]} {n_spk}-speaker intra-session concatentation samples instead.")
+                else:
+                    logging.warning(f"No samples for {n_spk} speakers. Will skip simulation for {n_spk} speakers.")
+        logging.warn(f"""Will be generating {','.join([str(i) for i in n_spk2n_intra_mt.values()])} intra-session concatentation samples and {','.join([str(i) for i in n_spk2n_inter_mt.values()])} inter-session concatentation samples for {','.join([str(i+1) for i in range(self.max_num_speakers)])} speakers.""")
         # Step 1: intra-session
         num_intra_meetings = 0
         intra_mixtures = []
         logging.info(f"Simulating intra-session concatentation samples.")
-        for n_spk, n_mt in num_speakers2num_meetings.items():
+        for n_spk, n_mt in n_spk2n_intra_mt.items():
             if n_mt <= 0:
-                logging.warning(f"No intra-session concatentation samples for {n_spk} speakers. Will skip generating intra-session concatentation samples.")
-                continue
-            n_intra_mt = int(n_mt * self.intra_session_concat_prob)
-            if n_spk not in self.num_spk2sess_ids: # no sessions with n_spk speakers
-                logging.warning(f"No sessions with {n_spk} speakers. Will skip generating {n_intra_mt} intra-session concatentation samples.")
                 continue
 
-            for i in tqdm(range(n_intra_mt), desc=f"Simulating {n_spk}-speaker intra-session mixtures", ncols=128):
+            for i in tqdm(range(n_mt), desc=f"Simulating {n_spk}-speaker intra-session mixtures", ncols=128):
                 intra_mixtures.append(self._create_mixture(n_speakers=n_spk, is_intra_session_concat=True))
-            num_speakers2num_meetings[n_spk] -= n_intra_mt
-            num_intra_meetings += n_intra_mt
+            num_intra_meetings += n_mt
         logging.info(f"Finished simulating intra-session concatentation samples. Total number of intra-session concatentation samples: {num_intra_meetings}")
     
         # Steo 2: inter-session
         logging.info(f"Simulating inter-session concatentation samples.")
-        n_spks = self.num_spk2cut_ids.keys()
-        valid_sim_n_spks = [i+j for i in n_spks for j in n_spks]
-
+        
         num_inter_meetings = 0
         inter_mixtures = []
-        for n_spk, n_mt in num_speakers2num_meetings.items():
+        for n_spk, n_mt in n_spk2n_inter_mt.items():
             if n_mt <= 0:
-                logging.warning(f"No inter-session concatentation samples for {n_spk} speakers. Will skip generating inter-session concatentation samples.")
-                continue
-            if n_spk not in valid_sim_n_spks:
-                logging.warning(f"Cannot generate {n_spk}-speaker inter-session samples by concatenating two samples since we only have samples for {','.join([str(i) for i in n_spks])} speakers.")
                 continue
             
             for i in tqdm(range(n_mt), desc=f"Simulating {n_spk}-speaker inter-session mixtures", ncols=128):

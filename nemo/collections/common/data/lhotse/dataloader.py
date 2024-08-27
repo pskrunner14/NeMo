@@ -158,6 +158,7 @@ class LhotseDataLoadingConfig:
     concat_max_duration: float = 40.0
     max_num_speakers: int = 4
     num_meetings: int = 100000
+    speaker_count_distribution: tuple[int] = (0, 2, 2, 2)
     skip_long_segments: bool = False
 
 def get_lhotse_dataloader_from_config(
@@ -205,6 +206,7 @@ def get_lhotse_dataloader_from_config(
             min_duration=config.concat_min_duration,
             max_duration=config.concat_max_duration,
             max_num_speakers=config.max_num_speakers,
+            speaker_count_distribution=config.speaker_count_distribution,
             skip_long_segments=config.skip_long_segments,
         )
         simulated_cuts = simulator.simulate(cuts, num_meetings=config.num_meetings, num_jobs=1)

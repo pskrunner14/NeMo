@@ -212,7 +212,7 @@ def get_lhotse_dataloader_from_config(
         )
 
         simulated_cuts = simulator.simulate(cuts, num_meetings=config.num_meetings, num_jobs=1, seed=global_rank*world_size+local_rank+seed)
-        print(simulated_cuts[0])
+        
         if config.including_real_data:
             cuts = CutSet.from_cuts(cuts + simulated_cuts)
         else:

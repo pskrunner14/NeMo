@@ -105,6 +105,16 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
                     torch.nn.Linear(proj_out_size*2, proj_out_size)
                 )
                 self.diar_kernel = self.joint_proj
+            elif self.diar_kernel_type == 'metacat_residule':
+                # projection layer
+                proj_in_size = cfg.model_defaults.enc_hidden
+                proj_out_size = cfg.model_defaults.enc_hidden
+                self.joint_proj = torch.nn.Sequential(
+                    torch.nn.Linear(proj_in_size, proj_out_size*2),
+                    torch.nn.ReLU(),
+                    torch.nn.Linear(proj_out_size*2, proj_out_size)
+                )
+                self.diar_kernel = self.joint_proj
 
             #binarize diar_pred
             self.binarize_diar_preds_threshold = cfg.get('binarize_diar_preds_threshold', None)
@@ -118,7 +128,7 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
         """
 
         model_path = self.cfg.diar_model_path
-        model_path = '/home/jinhanw/workdir/scripts/dataloader/pipeline/checkpoints/sortformer/im303a-ft7_epoch6-19.nemo'
+        # model_path = '/home/jinhanw/workdir/scripts/dataloader/pipeline/checkpoints/sortformer/im303a-ft7_epoch6-19.nemo'
 
         if model_path.endswith('.nemo'):
             pretrained_diar_model = SortformerEncLabelModel.restore_from(model_path, map_location="cpu")
@@ -338,6 +348,12 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
                 concat_enc_states = encoded.unsqueeze(2) * diar_preds.unsqueeze(3)
                 concat_enc_states = concat_enc_states.flatten(2,3)
                 encoded = self.joint_proj(concat_enc_states)
+            elif self.diar_kernel_type == 'metacat_residule':
+                import pdb; pdb.set_trace()
+                #only pick speaker 0
+                concat_enc_states = encoded.unsqueeze(2) * diar_preds[:,:,:1].unsqueeze(3)
+                concat_enc_states = concat_enc_states.flatten(2,3)
+                encoded += self.joint_proj(concat_enc_states)
             else:
                 concat_enc_states = torch.cat([encoded, diar_preds], dim=-1)
                 encoded = self.joint_proj(concat_enc_states)

@@ -94,7 +94,7 @@ import nemo.collections.asr as nemo_asr
 from nemo.collections.asr.metrics.wer import word_error_rate
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 from nemo.collections.asr.parts.utils.streaming_utils import CacheAwareStreamingAudioBuffer
-from nemo.collections.asr.parts.utils.streaming_spk_utils import CacheAwareStreamingAudioSpkBuffer
+from nemo.collections.asr.parts.utils.streaming_spk_utils import CacheAwareStreamingAudioSpkBuffer, CacheAwareStreamingAudioTgtSpkBuffer
 from nemo.utils import logging, model_utils
 
 from nemo.collections.asr.models import ASRModel
@@ -306,6 +306,196 @@ def perform_streaming(
     return final_streaming_tran, final_offline_tran
 
 
+def perform_streaming_tgt(
+    asr_model, audio_info, streaming_buffer, rttm_left, rttm_right, compare_vs_offline=False, debug_mode=False, pad_and_drop_preencoded=False
+):
+    batch_size = len(streaming_buffer.streams_length)
+    if compare_vs_offline:
+        # would pass the whole audio at once through the model like offline mode in order to compare the results with the stremaing mode
+        # the output of the model in the offline and streaming mode should be exactly the same
+        with torch.inference_mode():
+            with autocast():
+                processed_signal, processed_signal_length = streaming_buffer.get_all_audios()
+                with torch.no_grad():
+                    (
+                        pred_out_offline,
+                        transcribed_texts,
+                        cache_last_channel_next,
+                        cache_last_time_next,
+                        cache_last_channel_len,
+                        best_hyp,
+                    ) = asr_model.conformer_stream_step(
+                        processed_signal=processed_signal,
+                        processed_signal_length=processed_signal_length,
+                        return_transcription=True,
+                    )
+        final_offline_tran = extract_transcriptions(transcribed_texts)
+        logging.info(f" Final offline transcriptions:   {final_offline_tran}")
+    else:
+        final_offline_tran = None
+
+    cache_last_channel, cache_last_time, cache_last_channel_len = asr_model.encoder.get_initial_cache_state(
+        batch_size=batch_size
+    )
+
+
+    previous_hypotheses = None
+    streaming_buffer_iter = iter(streaming_buffer)
+    pred_out_stream = None
+
+    rttms = SupervisionSet.from_rttm(audio_info['rttm_filepath'])
+    #get speaker_mapping
+    spk_id_mapping = {}
+    idx = 0
+    for i in range(len(rttms)):
+        if rttms[i].start >= audio_info['offset']:
+            if rttms[i].speaker not in spk_id_mapping:
+                spk_id_mapping[rttms[i].speaker] = idx
+                idx += 1
+    target_spk = audio_info['query_speaker_id']
+
+    text_idx = 0
+    token_idx = 0
+    raw_texts = ''
+    prev_spk = ''
+    global_mapping = {}
+
+    for step_num, (chunk_audio, chunk_lengths, chunk_raw_audio, chunk_lengths_raw_audio, start_sample, end_sample) in enumerate(streaming_buffer_iter):
+        if step_num == 0:
+
+            query_duration = audio_info['query_duration']
+            separater_duration = 1
+            query_num_sample = int(16000 * query_duration)
+            separater_num_sample = int(separater_duration * 16000)
+            mask_prepend = np.zeros((4, int(np.ceil(np.ceil((query_num_sample + separater_num_sample + 1) / 160) / 8))))
+            mask_prepend[0,:query_num_sample] = 1
+            residule = chunk_raw_audio.shape[1] - query_num_sample - separater_num_sample
+        
+            if residule > 0:
+                cut_rec = Recording.from_file(audio_info['audio_filepath'])
+                cut_sups = [SupervisionSegment(id=cut_rec.id, recording_id = cut_rec.id, start = audio_info['offset'], duration = audio_info['duration'])]
+                cut = MonoCut(id = cut_rec.id, start = audio_info['offset'], duration = residule / 16000, channel = 0, recording = cut_rec, supervisions = cut_sups)
+        else:
+
+            cut_rec = Recording.from_file(audio_info['audio_filepath'])
+            cut_sups = [SupervisionSegment(id=cut_rec.id, recording_id = cut_rec.id, start = audio_info['offset'], duration = audio_info['duration'])]
+            cut = MonoCut(id = cut_rec.id, start = (start_sample - query_num_sample - separater_num_sample)  / 16000, duration = (end_sample - start_sample) / 16000, channel = 0, recording = cut_rec, supervisions = cut_sups)
+
+        
+        segments_iterator = rttms.find(recording_id=cut.recording_id, start_after=cut.start-rttm_left, end_before=cut.end+rttm_right, adjust_offset=True)
+
+
+        segments = [s for s in segments_iterator]
+        new_segments = []
+
+        for segment in segments:
+            if segment.end > rttm_left:
+                new_segments.append(segment)
+        segments = new_segments
+        #generate speaker id according to arrival time
+        segments.sort(key = lambda rttm_sup: rttm_sup.start)
+        seen = set()
+        seen_add = seen.add
+        speaker_lst = [target_spk] + [s.speaker for s in segments]
+        speaker_ats = [s for s in speaker_lst if not (s in seen or seen_add(s))]
+        speaker_to_idx_map = {
+                spk: idx
+                for idx, spk in enumerate(speaker_ats)
+        }
+        #initialize mask matrices (num_speaker, encoder_hidden)
+        mask = np.zeros((4, int(np.ceil(np.ceil((cut.num_samples + 1 + 16000*(rttm_left+rttm_right)) / 160) / 8))))
+
+        for rttm_sup in segments:
+            speaker_idx = speaker_to_idx_map[rttm_sup.speaker]
+            #only consider the first <num_speakers> speakers
+            if speaker_idx < 4:
+                st = (
+                            compute_num_samples(rttm_sup.start, cut.sampling_rate)
+                            if rttm_sup.start > 0
+                            else 0
+                        )
+                et = (
+                            compute_num_samples(rttm_sup.end, cut.sampling_rate)
+                            if rttm_sup.end < cut.duration + rttm_left + rttm_right
+                            else compute_num_samples(cut.duration, cut.sampling_rate)
+                        )         
+                mask[speaker_idx, int(np.ceil(np.ceil((st + 1) / 160) / 8)):int(np.ceil(np.ceil((et + 1) / 160) / 8))] = 1
+        #cutoff mask first 1 sec and last 1 sec
+        left_hidden_len = int(np.ceil(np.ceil((16000*rttm_left + 1) / 160) / 8))
+        right_hidden_len = int(np.ceil(np.ceil((16000*rttm_right + 1) / 160) / 8))
+        mask = mask[:,left_hidden_len-1 : -right_hidden_len+1]
+        #rematch spk_id_mapping and speaker_to_idx_map: important
+        if step_num == 0:
+            mask = np.concatenate([mask_prepend,mask], axis = 1)
+
+        for key, value in speaker_to_idx_map.items():
+            global_mapping[value] = spk_id_mapping[key]
+
+
+        mask = torch.tensor(mask, dtype=torch.float32).unsqueeze(0)
+        mask = torch.transpose(mask, 1, 2)
+        print(f'Step {step_num}')
+        with torch.inference_mode():
+            with autocast():
+                # keep_all_outputs needs to be True for the last step of streaming when model is trained with att_context_style=regular
+                # otherwise the last outputs would get dropped
+                with torch.no_grad():
+                    (
+                        pred_out_stream,
+                        transcribed_texts,
+                        raw_texts,
+                        cache_last_channel,
+                        cache_last_time,
+                        cache_last_channel_len,
+                        previous_hypotheses,
+                        text_idx,
+                        token_idx,
+                        prev_spk,
+                    ) = asr_model.conformer_stream_step(
+                        audio_signal=chunk_raw_audio,
+                        audio_signal_lengths=chunk_lengths_raw_audio,
+                        processed_signal=chunk_audio,
+                        processed_signal_length=chunk_lengths,
+                        spk_targets=mask.to(chunk_raw_audio.device),
+                        global_mapping=global_mapping,
+                        raw_texts = raw_texts,
+                        text_idx = text_idx,
+                        token_idx = token_idx,
+                        prev_spk = prev_spk,
+                        cache_last_channel=cache_last_channel,
+                        cache_last_time=cache_last_time,
+                        cache_last_channel_len=cache_last_channel_len,
+                        keep_all_outputs=streaming_buffer.is_buffer_empty(),
+                        previous_hypotheses=previous_hypotheses,
+                        previous_pred_out=pred_out_stream,
+                        drop_extra_pre_encoded=calc_drop_extra_pre_encoded(
+                            asr_model, step_num, pad_and_drop_preencoded
+                        ),
+                        return_transcription=True,
+                    )
+        if debug_mode:
+            logging.info(f"Streaming transcriptions: {extract_transcriptions(transcribed_texts)}")
+    final_streaming_tran = extract_transcriptions(transcribed_texts)
+    # final_streaming_tran = [raw_texts]
+    logging.info(f"Final streaming transcriptions: {final_streaming_tran}")
+
+    if compare_vs_offline:
+        # calculates and report the differences between the predictions of the model in offline mode vs streaming mode
+        # Normally they should be exactly the same predictions for streaming models
+        pred_out_stream_cat = torch.cat(pred_out_stream)
+        pred_out_offline_cat = torch.cat(pred_out_offline)
+        if pred_out_stream_cat.size() == pred_out_offline_cat.size():
+            diff_num = torch.sum(pred_out_stream_cat != pred_out_offline_cat).cpu().numpy()
+            logging.info(
+                f"Found {diff_num} differences in the outputs of the model in streaming mode vs offline mode."
+            )
+        else:
+            logging.info(
+                f"The shape of the outputs of the model in streaming mode ({pred_out_stream_cat.size()}) is different from offline mode ({pred_out_offline_cat.size()})."
+            )
+    return final_streaming_tran, final_offline_tran
+
+
 def main():
     parser = ArgumentParser()
     parser.add_argument(
@@ -416,6 +606,31 @@ def main():
         default=False,
     )
 
+    parser.add_argument(
+        "--pos_emb_max_len",
+        default=5000,
+        type=int,
+    )
+
+    parser.add_argument(
+        "--initial_chunk",
+        default=105,
+        type=int,
+    )
+
+    parser.add_argument(
+        "--initial_shift",
+        default=105,
+        type=int,
+    )
+
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="multi",
+        help="set either multi or tgt, default multi",
+    )
+
     args = parser.parse_args()
 
     if (args.audio_file is None and args.manifest_file is None) or (
@@ -443,6 +658,8 @@ def main():
                     orig_config.spk_supervision_strategy = 'diar'
             if args.preserve_alignments:
                 OmegaConf.update(orig_config.decoding, 'preserve_alignments', True)
+            if args.pos_emb_max_len:
+                orig_config.encoder.pos_emb_max_len = args.pos_emb_max_len
 
             orig_config.diar_model_path = args.diar_model_path
             new_config = orig_config
@@ -548,35 +765,74 @@ def main():
         logging.info(f"Loaded {len(samples)} from the manifest at {args.manifest_file}.")
 
         start_time = time.time()
-        for sample_idx, sample in enumerate(samples):
 
-            streaming_buffer= CacheAwareStreamingAudioSpkBuffer(
-        model=asr_model,
-        online_normalization=online_normalization,
-        pad_and_drop_preencoded=args.pad_and_drop_preencoded,
-    )
-            processed_signal, processed_signal_length, stream_id = streaming_buffer.append_audio_file(
-                sample['audio_filepath'], stream_id=-1
-            )
-            if "text" in sample:
-                all_refs_text.append(sample["text"])
-            logging.info(f'Added this sample to the buffer: {sample["audio_filepath"]}')
-            if (sample_idx + 1) % args.batch_size == 0 or sample_idx == len(samples) - 1:
-                logging.info(f"Starting to stream samples {sample_idx - len(streaming_buffer) + 1} to {sample_idx}...")
-                streaming_tran, offline_tran = perform_streaming(
-                    asr_model=asr_model,
-                    audio_info=sample,
-                    streaming_buffer=streaming_buffer,
-                    rttm_left=args.rttm_left,
-                    rttm_right=args.rttm_right,
-                    compare_vs_offline=args.compare_vs_offline,
-                    debug_mode=args.debug_mode,
-                    pad_and_drop_preencoded=args. pad_and_drop_preencoded,
+        if args.mode == 'multi':
+
+            for sample_idx, sample in enumerate(samples):
+
+                streaming_buffer= CacheAwareStreamingAudioSpkBuffer(
+                                                    model=asr_model,
+                                                    online_normalization=online_normalization,
+                                                    pad_and_drop_preencoded=args.pad_and_drop_preencoded,
+                                                )
+                processed_signal, processed_signal_length, stream_id = streaming_buffer.append_audio_file(
+                    sample['audio_filepath'], stream_id=-1
                 )
-                all_streaming_tran.extend(streaming_tran)
-                if args.compare_vs_offline:
-                    all_offline_tran.extend(offline_tran)
-                streaming_buffer.reset_buffer()
+                if "text" in sample:
+                    all_refs_text.append(sample["text"])
+                logging.info(f'Added this sample to the buffer: {sample["audio_filepath"]}')
+                if (sample_idx + 1) % args.batch_size == 0 or sample_idx == len(samples) - 1:
+                    logging.info(f"Starting to stream samples {sample_idx - len(streaming_buffer) + 1} to {sample_idx}...")
+                    streaming_tran, offline_tran = perform_streaming(
+                        asr_model=asr_model,
+                        audio_info=sample,
+                        streaming_buffer=streaming_buffer,
+                        rttm_left=args.rttm_left,
+                        rttm_right=args.rttm_right,
+                        compare_vs_offline=args.compare_vs_offline,
+                        debug_mode=args.debug_mode,
+                        pad_and_drop_preencoded=args. pad_and_drop_preencoded,
+                    )
+                    all_streaming_tran.extend(streaming_tran)
+                    if args.compare_vs_offline:
+                        all_offline_tran.extend(offline_tran)
+                    streaming_buffer.reset_buffer()
+
+        elif args.mode == 'tgt':
+            if args.initial_chunk:
+                asr_model.encoder.streaming_cfg.chunk_size[0] = args.initial_chunk
+                asr_model.encoder.streaming_cfg.shift_size[0] = args.initial_shift
+            for sample_idx, sample in enumerate(samples):
+                streaming_buffer= CacheAwareStreamingAudioTgtSpkBuffer(
+                                                    model=asr_model,
+                                                    online_normalization=online_normalization,
+                                                    pad_and_drop_preencoded=args.pad_and_drop_preencoded,
+                                                )
+                processed_signal, processed_signal_length, stream_id = streaming_buffer.append_audio_file(
+                    sample, stream_id=-1
+                )
+                if "text" in sample:
+                    all_refs_text.append(sample["text"])
+                logging.info(f'Added this sample to the buffer: {sample["audio_filepath"]}')
+                if (sample_idx + 1) % args.batch_size == 0 or sample_idx == len(samples) - 1:
+                    logging.info(f"Starting to stream samples {sample_idx - len(streaming_buffer) + 1} to {sample_idx}...")
+                    streaming_tran, offline_tran = perform_streaming_tgt(
+                        asr_model=asr_model,
+                        audio_info=sample,
+                        streaming_buffer=streaming_buffer,
+                        rttm_left=args.rttm_left,
+                        rttm_right=args.rttm_right,
+                        compare_vs_offline=args.compare_vs_offline,
+                        debug_mode=args.debug_mode,
+                        pad_and_drop_preencoded=args. pad_and_drop_preencoded,
+                    )
+                    all_streaming_tran.extend(streaming_tran)
+                    if args.compare_vs_offline:
+                        all_offline_tran.extend(offline_tran)
+                    streaming_buffer.reset_buffer()
+
+
+
         if args.compare_vs_offline and len(all_refs_text) == len(all_offline_tran):
             offline_wer = word_error_rate(hypotheses=all_offline_tran, references=all_refs_text)
             logging.info(f"WER% of offline mode: {round(offline_wer * 100, 2)}")
@@ -603,6 +859,8 @@ def main():
                 for i, hyp in enumerate(all_streaming_tran):
                     record = {
                     'audio_filepath': samples[i]['audio_filepath'], 
+                    'offset':samples[i]['offset'],
+                    'duration': samples[i]['duration'],
                     "pred_text": all_streaming_tran[i],
                     "text": all_refs_text[i],
                     # "wer": round(word_error_rate(hypotheses=[hyp], references=[all_refs_text[i]]) * 100, 2),

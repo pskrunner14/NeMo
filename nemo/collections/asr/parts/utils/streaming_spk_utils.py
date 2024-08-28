@@ -28,6 +28,7 @@ from nemo.collections.asr.parts.preprocessing.features import normalize_batch
 from nemo.collections.asr.parts.utils.audio_utils import get_samples
 from nemo.core.classes import IterableDataset
 from nemo.core.neural_types import LengthsType, MelSpectrogramType, NeuralType
+from nemo.collections.asr.data.audio_to_text_lhotse_target_speaker import LhotseSpeechToTextTgtSpkBpeDataset
 
 # Minimum number of tokens required to assign a LCS merge step, otherwise ignore and
 # select all i-1 and ith buffer tokens to merge.
@@ -324,3 +325,162 @@ class CacheAwareStreamingAudioSpkBuffer:
                 normalize_type=self.model_normalize_type,
             )
         return processed_signal, self.streams_length
+    
+
+class CacheAwareStreamingAudioTgtSpkBuffer(CacheAwareStreamingAudioSpkBuffer):
+    def __init__(self, model, online_normalization=None, pad_and_drop_preencoded=False):
+        super().__init__(model = model, online_normalization = online_normalization, pad_and_drop_preencoded = pad_and_drop_preencoded)
+    
+    def append_audio_file(self, sample, stream_id=-1):
+        audio_filepath = sample['audio_filepath']
+        audio = get_samples(audio_filepath) #get sub clip
+        audio = audio[int(sample['offset'] * 16000): int((sample['offset'] + sample['duration']) * 16000)]
+        #prepend query audio
+        query_audio_filepath = sample['query_audio_filepath']
+        query_audio = get_samples(query_audio_filepath)
+        query_audio = query_audio[int(sample['query_offset'] * 16000) : int((sample['query_offset'] + sample['query_duration']) * 16000)]
+        #separater audio
+        separater = LhotseSpeechToTextTgtSpkBpeDataset.separate_sound(freq=500, sr=16000, duration=1, ratio=0.3)
+        separater = np.float32(separater)
+        audio = np.concatenate([query_audio, separater, audio])
+        processed_signal, processed_signal_length, stream_id = self.append_audio(audio, stream_id)
+        return processed_signal, processed_signal_length, stream_id
+
+    def append_audio(self, audio, stream_id=-1):
+        processed_signal, processed_signal_length, audio_signal, audio_signal_len = self.preprocess_audio(audio)
+        processed_signal, processed_signal_length, stream_id = self.append_processed_signal(
+            processed_signal, audio_signal, stream_id
+        )
+        return processed_signal, processed_signal_length, stream_id
+
+
+    def __iter__(self):
+        while True:
+            if self.buffer_idx >= self.buffer.size(-1):
+                return
+            if self.buffer_idx == 0 and isinstance(self.streaming_cfg.chunk_size, list):
+                if self.pad_and_drop_preencoded:
+                    chunk_size = self.streaming_cfg.chunk_size[1]
+                else:
+                    chunk_size = self.streaming_cfg.chunk_size[0]
+            else:
+                chunk_size = (
+                    self.streaming_cfg.chunk_size[1]
+                    if isinstance(self.streaming_cfg.chunk_size, list)
+                    else self.streaming_cfg.chunk_size
+                )
+
+            if self.buffer_idx == 0 and isinstance(self.streaming_cfg.shift_size, list):
+                if self.pad_and_drop_preencoded:
+                    shift_size = self.streaming_cfg.shift_size[1]
+                else:
+                    shift_size = self.streaming_cfg.shift_size[0]
+            else:
+                shift_size = (
+                    self.streaming_cfg.shift_size[1]
+                    if isinstance(self.streaming_cfg.shift_size, list)
+                    else self.streaming_cfg.shift_size
+                )
+
+            audio_chunk = self.buffer[:, :, self.buffer_idx : self.buffer_idx + chunk_size]
+
+            chunk_size_audio = self.get_audio_sample_len_from_frame(chunk_size)
+
+            raw_audio_chunk = self.buffer_audio[:,self.buffer_audio_idx: self.buffer_audio_idx + chunk_size_audio]
+
+            if self.sampling_frames is not None:
+                # checking to make sure the audio chunk has enough frames to produce at least one output after downsampling
+                if self.buffer_idx == 0 and isinstance(self.sampling_frames, list):
+                    cur_sampling_frames = self.sampling_frames[0]
+                else:
+                    cur_sampling_frames = (
+                        self.sampling_frames[1] if isinstance(self.sampling_frames, list) else self.sampling_frames
+                    )
+                if audio_chunk.size(-1) < cur_sampling_frames:
+                    return
+
+            # Adding the cache needed for the pre-encoder part of the model to the chunk
+            # if there is not enough frames to be used as the pre-encoding cache, zeros would be added
+            zeros_pads = None
+            zeros_pads_audio = None
+            if self.buffer_idx == 0 and isinstance(self.streaming_cfg.pre_encode_cache_size, list):
+                if self.pad_and_drop_preencoded:
+                    cache_pre_encode_num_frames = self.streaming_cfg.pre_encode_cache_size[1]
+                else:
+                    cache_pre_encode_num_frames = self.streaming_cfg.pre_encode_cache_size[0]
+                cache_pre_encode = torch.zeros(
+                    (audio_chunk.size(0), self.input_features, cache_pre_encode_num_frames),
+                    device=audio_chunk.device,
+                    dtype=audio_chunk.dtype,
+                )
+                cache_pre_encode_audio = torch.zeros(
+                    (raw_audio_chunk.size(0), self.get_audio_sample_len_from_frame(cache_pre_encode_num_frames)),
+                    device=audio_chunk.device,
+                    dtype=audio_chunk.dtype,
+                )
+            else:
+                if isinstance(self.streaming_cfg.pre_encode_cache_size, list):
+                    pre_encode_cache_size = self.streaming_cfg.pre_encode_cache_size[1]
+                    pre_encode_cache_size_audio = self.get_audio_sample_len_from_frame(self.streaming_cfg.pre_encode_cache_size[1])
+                else:
+                    pre_encode_cache_size = self.streaming_cfg.pre_encode_cache_size
+
+                start_pre_encode_cache = self.buffer_idx - pre_encode_cache_size
+                start_pre_encode_cache_audio = self.buffer_audio_idx - pre_encode_cache_size_audio
+                if start_pre_encode_cache < 0:
+                    start_pre_encode_cache = 0
+                if start_pre_encode_cache_audio < 0:
+                    start_pre_encode_cache_audio = 0
+                cache_pre_encode = self.buffer[:, :, start_pre_encode_cache : self.buffer_idx]
+                cache_pre_encode_audio = self.buffer_audio[:, start_pre_encode_cache_audio: self.buffer_audio_idx]
+                if cache_pre_encode.size(-1) < pre_encode_cache_size:
+                    zeros_pads = torch.zeros(
+                        (
+                            audio_chunk.size(0),
+                            audio_chunk.size(-2),
+                            pre_encode_cache_size - cache_pre_encode.size(-1),
+                        ),
+                        device=audio_chunk.device,
+                        dtype=audio_chunk.dtype,
+                    )
+                if cache_pre_encode_audio.size(-1) < pre_encode_cache_size_audio:
+                    zeros_pads_audio = torch.zeros(
+                        (
+                            raw_audio_chunk.size(0),
+                            pre_encode_cache_size - cache_pre_encode_audio.size(-1),
+                        ),
+                        device=raw_audio_chunk.device,
+                        dtype=raw_audio_chunk.dtype,
+                    )
+
+            added_len = cache_pre_encode.size(-1)
+            added_len_audio = cache_pre_encode_audio.size(-1)
+            audio_chunk = torch.cat((cache_pre_encode, audio_chunk), dim=-1)
+            raw_audio_chunk = torch.cat((cache_pre_encode_audio, raw_audio_chunk), dim = -1)
+
+            if self.online_normalization:
+                audio_chunk, x_mean, x_std = normalize_batch(
+                    x=audio_chunk,
+                    seq_len=torch.tensor([audio_chunk.size(-1)] * audio_chunk.size(0)),
+                    normalize_type=self.model_normalize_type,
+                )
+
+            if zeros_pads is not None:
+                # TODO: check here when zero_pads is not None and added_len is already non-zero
+                audio_chunk = torch.cat((zeros_pads, audio_chunk), dim=-1)
+                added_len += zeros_pads.size(-1)
+            if zeros_pads_audio is not None:
+                raw_audio_chunk = torch.cat((zeros_pads_audio, raw_audio_chunk), dim=-1)
+                added_len_audio += zeros_pads_audio.size(-1)
+
+            max_chunk_lengths = self.streams_length - self.buffer_idx
+            max_chunk_lengths = max_chunk_lengths + added_len
+            chunk_lengths = torch.clamp(max_chunk_lengths, min=0, max=audio_chunk.size(-1))
+            max_chunk_lengths_audio = self.streams_length_audio - self.buffer_audio_idx
+            max_chunk_lengths_audio = max_chunk_lengths_audio + added_len_audio
+            chunk_lengths_audio = torch.clamp(max_chunk_lengths_audio, min=0, max=raw_audio_chunk.size(-1))
+
+            self.buffer_idx += shift_size
+            self.buffer_audio_idx += self.get_audio_sample_len_from_frame(shift_size)
+            self.step += 1
+            yield audio_chunk, chunk_lengths, raw_audio_chunk, chunk_lengths_audio, self.buffer_audio_idx - self.get_audio_sample_len_from_frame(shift_size), self.buffer_audio_idx

@@ -349,7 +349,6 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
                 concat_enc_states = concat_enc_states.flatten(2,3)
                 encoded = self.joint_proj(concat_enc_states)
             elif self.diar_kernel_type == 'metacat_residule':
-                import pdb; pdb.set_trace()
                 #only pick speaker 0
                 concat_enc_states = encoded.unsqueeze(2) * diar_preds[:,:,:1].unsqueeze(3)
                 concat_enc_states = concat_enc_states.flatten(2,3)
@@ -624,7 +623,6 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
                     speaker_infusion_asr = torch.nn.functional.normalize(speaker_infusion_asr, p=2, dim=-1)
                 encoded = speaker_infusion_asr + encoded
             elif self.diar_kernel_type == 'metacat':
-                # import pdb; pdb.set_trace()
                 concat_enc_states = encoded.unsqueeze(2) * diar_preds.unsqueeze(3)
                 concat_enc_states = concat_enc_states.flatten(2,3)
                 encoded = self.joint_proj(concat_enc_states)

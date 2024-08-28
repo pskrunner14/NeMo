@@ -277,6 +277,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             return get_lhotse_dataloader_from_config(
                 config,
                 global_rank=self.global_rank,
+                local_rank=self.local_rank,
                 world_size=self.world_size,
                 dataset=LhotseSpeechToDiarizationLabelDataset(cfg=config),
             )

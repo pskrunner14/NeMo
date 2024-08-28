@@ -152,13 +152,13 @@ class LhotseDataLoadingConfig:
     # a. Concatentaion of cuts
     concat_simulation: bool = False
     including_real_data: bool = False
-    intra_session_concat_prob: float = 1.0
+    intra_session_concat_prob:  Any = 0.5 # float | list[float] | None = 0.5
     ms_data_type: str = "msasr"
     concat_min_duration: float = 30.0
     concat_max_duration: float = 40.0
     max_num_speakers: int = 4
     num_meetings: int = 100000
-    speaker_count_distribution: tuple[int] = (0, 2, 2, 2)
+    speaker_count_distribution: Any = None # list[float] [0, 2, 0.1, 4]
     skip_long_segments: bool = False
 
 def get_lhotse_dataloader_from_config(
@@ -167,6 +167,7 @@ def get_lhotse_dataloader_from_config(
     world_size: int,
     dataset: torch.utils.data.Dataset,
     tokenizer=None,
+    local_rank: int = 0,
 ) -> torch.utils.data.DataLoader:
     """
     Set up a Lhotse training dataloder.
@@ -209,7 +210,9 @@ def get_lhotse_dataloader_from_config(
             speaker_count_distribution=config.speaker_count_distribution,
             skip_long_segments=config.skip_long_segments,
         )
-        simulated_cuts = simulator.simulate(cuts, num_meetings=config.num_meetings, num_jobs=1)
+
+        simulated_cuts = simulator.simulate(cuts, num_meetings=config.num_meetings, num_jobs=1, seed=global_rank*world_size+local_rank+seed)
+        print(simulated_cuts[0])
         if config.including_real_data:
             cuts = CutSet.from_cuts(cuts + simulated_cuts)
         else:

@@ -308,12 +308,12 @@ class ConcatenationMeetingSimulator():
 
     def __init__(
         self,
-        intra_session_concat_prob: float = 1.0,
+        intra_session_concat_prob: float|List[float] = [0, 1.0, 0.5, 0.2],
         data_type: str = "msasr",
         min_duration: float = 30.0,
         max_duration: float = 40.0,
         max_num_speakers: int = 4,
-        speaker_count_distribution: List[int] = [0, 2, 3, 4],
+        speaker_count_distribution: List[float] = [0, 2, 3, 4],
         skip_long_segments: bool = True,
     ):
         """
@@ -325,7 +325,12 @@ class ConcatenationMeetingSimulator():
         :param max_duration: the maximum duration of the simulated meeting. [Default: 40.0]
         """
         super().__init__()
-        self.intra_session_concat_prob = intra_session_concat_prob
+        if isinstance(intra_session_concat_prob, float):
+            self.intra_session_concat_prob = [intra_session_concat_prob] * (max_num_speakers)
+        elif len(intra_session_concat_prob) == max_num_speakers:
+            self.intra_session_concat_prob = intra_session_concat_prob
+        else:
+            raise ValueError(f"intra_session_concat_prob must be either a float or a list of floats, but got {intra_session_concat_prob}")
         if data_type not in ["msasr", "diar"]:
             raise ValueError("data_type must be either 'msasr' or 'diar', but got {data_type}")
         self.data_type = data_type
@@ -405,7 +410,7 @@ class ConcatenationMeetingSimulator():
             # intra-dataset but inter-session concatenation
             tracks, num_speakers = self.get_inter_session_tracks(n_speakers, db_norm=db_norm)
 
-        cut = MixedCut(id=str(uuid4()), tracks=tracks)
+        cut = MixedCut(id='_'.join([track.cut.id for track in tracks]), tracks=tracks)
         if self.data_type == "msasr":
             cut = self.reorder_spk_mapping(cut)
 
@@ -580,7 +585,7 @@ class ConcatenationMeetingSimulator():
             if n_mt <= 0:
                 logging.warning(f"No intra-session concatentation samples for {n_spk} speakers. Will skip simulation for {n_spk} speakers.")
                 continue
-            n_intra_mt = int(n_mt * self.intra_session_concat_prob)
+            n_intra_mt = int(n_mt * self.intra_session_concat_prob[n_spk-1])
             n_inter_mt = n_mt - n_intra_mt
             if n_spk in self.num_spk2sess_ids:
                 logging.warn(f"Will be genrating {n_intra_mt} {n_spk}-speaker intra-session concatentation samples.")

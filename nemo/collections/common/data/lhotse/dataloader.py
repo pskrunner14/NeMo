@@ -41,7 +41,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from nemo.collections.common.data.lhotse.cutset import guess_parse_cutset, read_cutset_from_config
 from nemo.collections.common.prompts.fn import get_prompt_format_fn
-from nemo.collections.asr.parts.utils.asr_multispeaker_utils import ConcatenationMeetingSimulator
+from nemo.collections.asr.parts.utils.asr_multispeaker_utils import ConcatenationMeetingSimulator, LibriSpeechMixGenerator
 from nemo.utils import logging
 
 
@@ -212,11 +212,15 @@ def get_lhotse_dataloader_from_config(
         )
 
         simulated_cuts = simulator.simulate(cuts, num_meetings=config.num_meetings, num_jobs=1, seed=global_rank*world_size+local_rank+seed)
-        
+
         if config.including_real_data:
             cuts = CutSet.from_cuts(cuts + simulated_cuts)
         else:
             cuts = simulated_cuts
+
+    if hasattr(cuts[0], 'delays'):
+        generator = LibriSpeechMixGenerator()
+        cuts = generator.generate(cuts)
 
     # Apply channel selector
     if config.channel_selector is not None:

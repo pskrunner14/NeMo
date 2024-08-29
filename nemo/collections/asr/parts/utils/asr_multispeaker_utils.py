@@ -26,12 +26,14 @@ from collections import defaultdict
 from typing import Dict, Optional, Tuple, List
 
 import numpy as np
+import soundfile
 from tqdm import tqdm
 from scipy.stats import norm
 
 import torch.utils.data
+from lhotse.cut.set import mix
 from lhotse.cut import CutSet, MixedCut, MonoCut, MixTrack
-from lhotse import SupervisionSet, dill_enabled
+from lhotse import SupervisionSet, SupervisionSegment, dill_enabled, AudioSource, Recording
 from lhotse.utils import uuid4
 
 def apply_spk_mapping(diar_preds: torch.Tensor, spk_mappings: torch.Tensor) -> torch.Tensor:
@@ -649,3 +651,62 @@ class ConcatenationMeetingSimulator():
         #     pbar.close()
 
         return CutSet.from_cuts(intra_mixtures + inter_mixtures)
+    
+
+class LibriSpeechMixGenerator():
+    def __init__(self):
+        pass
+
+    def generate(self, cuts):
+        cut_set = []
+        for cut in tqdm(cuts):
+            offsets = cut.delays
+            durations = cut.durations
+            wavs = cut.wavs
+            texts = cut.texts
+            speakers = cut.speakers
+
+            tracks = []
+            for i, (offset, duration, wav, text, speaker) in enumerate(zip(offsets, durations, wavs, texts, speakers)):
+                wav_dur = soundfile.info(wav).duration
+                wav_samples = soundfile.info(wav).frames
+                custom = {
+                    'speaker': speaker,
+                    'text': text,
+                }
+                cut_1spk = MonoCut(
+                    id=wav.split('/')[-1].replace('.wav', ''),
+                    start=0,
+                    duration=duration,
+                    channel=0,
+                    supervisions=[],
+                    recording=Recording(
+                        id=wav.split('/')[-1].replace('.wav', ''),
+                        sources=[
+                            AudioSource(
+                                type='file',
+                                channels=[0],
+                                source=wav
+                            )
+                        ],
+                        sampling_rate=16000, 
+                        num_samples=wav_samples,
+                        duration=wav_dur
+                    ),
+                    custom=custom
+                )
+
+                tracks.append(MixTrack(cut=cut_1spk, type=type(cut_1spk), offset=offset))
+            sup = SupervisionSegment(
+                id=cut.id,
+                recording_id=cut.recording_id,
+                start=0,
+                duration=offset+wav_dur,
+                text=cut.text,
+            )
+            tracks[0].cut.supervisions.append(sup)
+            cut_multi_spk = MixedCut(id=cut.id, tracks=tracks)
+            
+            cut_set.append(cut_multi_spk)
+        
+        return CutSet.from_cuts(cut_set)

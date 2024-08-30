@@ -105,7 +105,7 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
                     torch.nn.Linear(proj_out_size*2, proj_out_size)
                 )
                 self.diar_kernel = self.joint_proj
-            elif self.diar_kernel_type == 'metacat_residule':
+            elif self.diar_kernel_type == 'metacat_residule' or self.diar_kernel_type == 'metacat_residule_early':
                 # projection layer
                 proj_in_size = cfg.model_defaults.enc_hidden
                 proj_out_size = cfg.model_defaults.enc_hidden
@@ -115,6 +115,15 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
                     torch.nn.Linear(proj_out_size*2, proj_out_size)
                 )
                 self.diar_kernel = self.joint_proj
+            elif self.diar_kernel_type == 'metacat_residule_projection':
+                proj_in_size = cfg.model_defaults.enc_hidden + self.num_speakers
+                proj_out_size = cfg.model_defaults.enc_hidden
+                self.joint_proj = torch.nn.Sequential(
+                    torch.nn.Linear(proj_in_size, proj_out_size*2),
+                    torch.nn.ReLU(),
+                    torch.nn.Linear(proj_out_size*2, proj_out_size)
+                )
+                self.diar_kernel = self.joint_proj                
 
             #binarize diar_pred
             self.binarize_diar_preds_threshold = cfg.get('binarize_diar_preds_threshold', None)
@@ -307,7 +316,7 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
                 with torch.set_grad_enabled(not self.cfg.freeze_diar):
                     diar_preds, _preds, attn_score_stack, total_memory_list, encoder_states_list = self.forward_diar(signal, signal_len)
                     if self.binarize_diar_preds_threshold:
-                        diar_preds = torch.where(diar_preds > self.binarize_diar_preds_threshold, torch.tensor(1), torch.tensor(0)).to(encoded.device)
+                        diar_preds = torch.where(diar_preds > self.binarize_diar_preds_threshold, torch.tensor(1), torch.tensor(0)).to(encoded.device).half()
                 if diar_preds is None:
                     raise ValueError("`diar_pred`is required for speaker supervision strategy 'diar'")
             elif self.cfg.spk_supervision_strategy == 'mix':
@@ -352,7 +361,19 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
                 #only pick speaker 0
                 concat_enc_states = encoded.unsqueeze(2) * diar_preds[:,:,:1].unsqueeze(3)
                 concat_enc_states = concat_enc_states.flatten(2,3)
-                encoded += self.joint_proj(concat_enc_states)
+                encoded = encoded + self.joint_proj(concat_enc_states)    
+            elif self.diar_kernel_type == 'metacat_residule_early':
+                #only pick speaker 0
+                concat_enc_states = encoded.unsqueeze(2) * diar_preds[:,:,:1].unsqueeze(3)
+                concat_enc_states = concat_enc_states.flatten(2,3)
+                encoded = self.joint_proj(encoded + concat_enc_states)
+            elif self.diar_kernel_type == 'metacat_residule_projection':
+                #only pick speaker 0 and add diar_preds
+                concat_enc_states = encoded.unsqueeze(2) * diar_preds[:,:,:1].unsqueeze(3)
+                concat_enc_states = concat_enc_states.flatten(2,3)
+                encoded = encoded + concat_enc_states
+                concat_enc_states = torch.cat([encoded, diar_preds], dim = -1)
+                encoded = self.joint_proj(concat_enc_states)
             else:
                 concat_enc_states = torch.cat([encoded, diar_preds], dim=-1)
                 encoded = self.joint_proj(concat_enc_states)

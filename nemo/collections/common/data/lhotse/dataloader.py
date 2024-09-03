@@ -41,7 +41,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from nemo.collections.common.data.lhotse.cutset import guess_parse_cutset, read_cutset_from_config
 from nemo.collections.common.prompts.fn import get_prompt_format_fn
-from nemo.collections.asr.parts.utils.asr_multispeaker_utils import ConcatenationMeetingSimulator, LibriSpeechMixGenerator
+from nemo.collections.asr.parts.utils.asr_multispeaker_utils import ConcatenationMeetingSimulator, MixMeetingSimulator, LibriSpeechMixGenerator
 from nemo.utils import logging
 
 
@@ -149,17 +149,21 @@ class LhotseDataLoadingConfig:
     force_finite: bool = False
 
     # 6. Cut simulation for multi-speaker ASR
-    # a. Concatentaion of cuts
-    concat_simulation: bool = False
+    simulators: Any = None  # dict | None = None
     including_real_data: bool = False
-    intra_session_concat_prob:  Any = 0.5 # float | list[float] | None = 0.5
-    ms_data_type: str = "msasr"
-    concat_min_duration: float = 30.0
-    concat_max_duration: float = 40.0
-    max_num_speakers: int = 4
-    num_meetings: int = 100000
-    speaker_count_distribution: Any = None # list[float] [0, 2, 0.1, 4]
-    skip_long_segments: bool = False
+    # a. Concatentaion of cuts
+    # concat_simulation: bool = False
+    # mix_simulation: bool = False
+    # lsmix_simulation: bool = False # LibriSpeechMix
+    # including_real_data: bool = False
+    # intra_session_concat_prob:  Any = 0.5 # float | list[float] | None = 0.5
+    # ms_data_type: str = "msasr"
+    # min_duration: float = 30.0
+    # max_duration: float = 40.0
+    # max_num_speakers: int = 4
+    # num_meetings: int = 100000
+    # speaker_count_distribution: Any = None # list[float] [0, 2, 0.1, 4]
+    # skip_long_segments: bool = False
 
 def get_lhotse_dataloader_from_config(
     config: DictConfig,
@@ -200,18 +204,38 @@ def get_lhotse_dataloader_from_config(
 
     # 1. Load a manifest as a Lhotse CutSet.
     cuts, is_tarred = read_cutset_from_config(config)
-    if config.concat_simulation:
-        simulator = ConcatenationMeetingSimulator(
-            intra_session_concat_prob=config.intra_session_concat_prob,
-            data_type=config.ms_data_type,
-            min_duration=config.concat_min_duration,
-            max_duration=config.concat_max_duration,
-            max_num_speakers=config.max_num_speakers,
-            speaker_count_distribution=config.speaker_count_distribution,
-            skip_long_segments=config.skip_long_segments,
-        )
+    if config.simulators is not None:
+        simulated_cuts = CutSet()
+        for simulator_name in config.simulators.keys():
+            simulator_config = config.simulators[simulator_name]
+            
+            if simulator_config.get('concat', False):
+                simulator = ConcatenationMeetingSimulator(
+                    intra_session_concat_prob=simulator_config.intra_session_concat_prob,
+                    data_type=simulator_config.ms_data_type,
+                    min_duration=simulator_config.min_duration,
+                    max_duration=simulator_config.max_duration,
+                    max_num_speakers=simulator_config.max_num_speakers,
+                    speaker_count_distribution=simulator_config.speaker_count_distribution,
+                    skip_long_segments=simulator_config.skip_long_segments,
+                )
+                
+                simulated_cuts += simulator.simulate(cuts, num_meetings=simulator_config.num_meetings, num_jobs=1, seed=seed)
+            
+            if simulator_config.get('mix', False):
+                simulator = MixMeetingSimulator(
+                    intra_session_concat_prob=simulator_config.intra_session_concat_prob,
+                    data_type=simulator_config.ms_data_type,
+                    min_duration=simulator_config.min_duration,
+                    max_duration=simulator_config.max_duration,
+                    max_num_speakers=simulator_config.max_num_speakers,
+                    speaker_count_distribution=simulator_config.speaker_count_distribution,
+                )
 
-        simulated_cuts = simulator.simulate(cuts, num_meetings=config.num_meetings, num_jobs=1, seed=global_rank*world_size+local_rank+seed)
+                simulated_cuts += simulator.simulate(cuts, num_meetings=simulator_config.num_meetings, num_jobs=1, seed=seed)
+            
+            if simulator_config.get('lsmix', False):
+                simulator = LibriSpeechMixSimulator()
 
         if config.including_real_data:
             cuts = CutSet.from_cuts(cuts + simulated_cuts)

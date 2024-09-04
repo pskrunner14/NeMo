@@ -209,6 +209,8 @@ def get_lhotse_dataloader_from_config(
         for simulator_name in config.simulators.keys():
             simulator_config = config.simulators[simulator_name]
             
+            skip_long_segments = simulator_config.get('skip_long_segments', False)
+            valid_dataset_ids = simulator_config.get('valid_dataset_ids', [])
             if simulator_config.get('concat', False):
                 simulator = ConcatenationMeetingSimulator(
                     intra_session_concat_prob=simulator_config.intra_session_concat_prob,
@@ -217,19 +219,21 @@ def get_lhotse_dataloader_from_config(
                     max_duration=simulator_config.max_duration,
                     max_num_speakers=simulator_config.max_num_speakers,
                     speaker_count_distribution=simulator_config.speaker_count_distribution,
-                    skip_long_segments=simulator_config.skip_long_segments,
+                    skip_long_segments=skip_long_segments,
+                    valid_dataset_ids=valid_dataset_ids,
                 )
                 
                 simulated_cuts += simulator.simulate(cuts, num_meetings=simulator_config.num_meetings, num_jobs=1, seed=seed)
             
             if simulator_config.get('mix', False):
                 simulator = MixMeetingSimulator(
-                    intra_session_concat_prob=simulator_config.intra_session_concat_prob,
+                    intra_session_mix_prob=simulator_config.intra_session_mix_prob,
                     data_type=simulator_config.ms_data_type,
                     min_duration=simulator_config.min_duration,
                     max_duration=simulator_config.max_duration,
                     max_num_speakers=simulator_config.max_num_speakers,
                     speaker_count_distribution=simulator_config.speaker_count_distribution,
+                    valid_dataset_ids=valid_dataset_ids,
                 )
 
                 simulated_cuts += simulator.simulate(cuts, num_meetings=simulator_config.num_meetings, num_jobs=1, seed=seed)

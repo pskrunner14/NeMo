@@ -317,6 +317,7 @@ class ConcatenationMeetingSimulator():
         max_num_speakers: int = 4,
         speaker_count_distribution: List[float] = [0, 2, 3, 4],
         skip_long_segments: bool = True,
+        valid_dataset_ids: List[str] = [],
     ):
         """
         :param intra_session_concat_prob: the probability of concatenating segments from the same
@@ -347,6 +348,8 @@ class ConcatenationMeetingSimulator():
         else:
             self.skip_duration = max_duration
 
+        self.valid_dataset_ids = valid_dataset_ids
+
     def fit(self, cuts) -> CutSet:
         """
         Read the manifest file and return a CutSet object. 
@@ -365,6 +368,8 @@ class ConcatenationMeetingSimulator():
             if cut.duration > self.skip_duration:
                 continue
             if not hasattr(cut, 'dataset_id') or cut.dataset_id is None:
+                continue
+            if self.valid_dataset_ids and cut.dataset_id not in self.valid_dataset_ids:
                 continue
             if cut.dataset_id not in self.data2num_spk2cut_ids:
                 self.data2num_spk2cut_ids[cut.dataset_id] = defaultdict(list)
@@ -411,7 +416,7 @@ class ConcatenationMeetingSimulator():
             # intra-dataset but inter-session concatenation
             tracks, num_speakers = self.get_inter_session_tracks(n_speakers, db_norm=db_norm)
 
-        cut = MixedCut(id='concat' + '_'.join([track.cut.id for track in tracks]), tracks=tracks)
+        cut = MixedCut(id='concat_' + '_'.join([track.cut.id for track in tracks]), tracks=tracks)
         if self.data_type == "msasr":
             cut = self.reorder_spk_mapping(cut)
 
@@ -666,15 +671,16 @@ class MixMeetingSimulator():
 
     def __init__(
         self,
-        intra_session_concat_prob: float|List[float] = [0, 1.0, 0.5, 0.2],
+        intra_session_mix_prob: float|List[float] = [0, 0, 0, 0],
         data_type: str = "msasr",
         min_duration: float = 80.0,
         max_duration: float = 100.0,
         max_num_speakers: int = 4,
-        speaker_count_distribution: List[float] = [0, 2, 3, 4],
+        speaker_count_distribution: List[float] = [0, 0, 0.1, 4],
+        valid_dataset_ids: List[str] = [],
     ):
         """
-        :param intra_session_concat_prob: the probability of concatenating segments from the same
+        :param intra_session_mix_prob: the probability of concatenating segments from the same
             session. [Default: 1]
         :param data_type: the type of data to simulate. Either 'msasr' or 'diar'. If 'msasr',
             the transcripts are included in the simulation,and the boundary segments are 
@@ -682,12 +688,12 @@ class MixMeetingSimulator():
         :param max_duration: the maximum duration of the simulated meeting. [Default: 40.0]
         """
         super().__init__()
-        if isinstance(intra_session_concat_prob, float):
-            self.intra_session_concat_prob = [intra_session_concat_prob] * (max_num_speakers)
-        elif len(intra_session_concat_prob) == max_num_speakers:
-            self.intra_session_concat_prob = intra_session_concat_prob
+        if isinstance(intra_session_mix_prob, float):
+            self.intra_session_mix_prob = [intra_session_mix_prob] * (max_num_speakers)
+        elif len(intra_session_mix_prob) == max_num_speakers:
+            self.intra_session_mix_prob = intra_session_mix_prob
         else:
-            raise ValueError(f"intra_session_concat_prob must be either a float or a list of floats, but got {intra_session_concat_prob}")
+            raise ValueError(f"intra_session_mix_prob must be either a float or a list of floats, but got {intra_session_mix_prob}")
         if data_type not in ["msasr", "diar"]:
             raise ValueError("data_type must be either 'msasr' or 'diar', but got {data_type}")
         self.data_type = data_type
@@ -695,6 +701,7 @@ class MixMeetingSimulator():
         self.max_duration = max_duration
         self.max_num_speakers = max_num_speakers
         self.speaker_count_distribution = speaker_count_distribution
+        self.valid_dataset_ids = valid_dataset_ids
         assert len(speaker_count_distribution) == max_num_speakers, f"Length of speaker_count_distribution {len(speaker_count_distribution)} must be equal to max_num_speakers {max_num_speakers}"
 
     def fit(self, cuts) -> CutSet:
@@ -715,6 +722,8 @@ class MixMeetingSimulator():
             if not self.min_duration <= cut.duration <= self.max_duration:
                 continue
             if not hasattr(cut, 'dataset_id') or cut.dataset_id is None:
+                continue
+            if self.valid_dataset_ids and cut.dataset_id not in self.valid_dataset_ids:
                 continue
             if cut.dataset_id not in self.data2num_spk2cut_ids:
                 self.data2num_spk2cut_ids[cut.dataset_id] = defaultdict(list)
@@ -761,7 +770,7 @@ class MixMeetingSimulator():
             # intra-dataset but inter-session concatenation
             tracks, num_speakers = self.get_inter_session_tracks(n_speakers, db_norm=db_norm)
 
-        cut = MixedCut(id='mix' + '_'.join([track.cut.id for track in tracks]), tracks=tracks)
+        cut = MixedCut(id='mix_' + '_'.join([track.cut.id for track in tracks]), tracks=tracks)
         if self.data_type == "msasr":
             cut = self.reorder_spk_mapping(cut)
 
@@ -935,7 +944,7 @@ class MixMeetingSimulator():
             if n_mt <= 0:
                 logging.warning(f"No intra-session concatentation samples for {n_spk} speakers. Will skip simulation for {n_spk} speakers.")
                 continue
-            n_intra_mt = int(n_mt * self.intra_session_concat_prob[n_spk-1])
+            n_intra_mt = int(n_mt * self.intra_session_mix_prob[n_spk-1])
             n_inter_mt = n_mt - n_intra_mt
             if n_spk in self.num_spk2sess_ids:
                 logging.warn(f"Will be genrating {n_intra_mt} {n_spk}-speaker intra-session concatentation samples.")

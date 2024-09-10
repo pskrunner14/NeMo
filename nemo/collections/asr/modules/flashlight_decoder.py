@@ -25,9 +25,10 @@ from nemo.core.neural_types import LengthsType, LogprobsType, NeuralType, Predic
 
 
 class _TokensWrapper:
-    def __init__(self, vocabulary: List[str], tokenizer: TokenizerSpec):
+    def __init__(self, vocabulary: List[str], tokenizer: TokenizerSpec, lang: str):
         self.vocabulary = vocabulary
         self.tokenizer = tokenizer
+        self.lang = lang
 
         if tokenizer is None:
             self.reverse_map = {self.vocabulary[i]: i for i in range(len(self.vocabulary))}
@@ -65,7 +66,12 @@ class _TokensWrapper:
             return -1
 
         if self.tokenizer is not None:
-            return self.tokenizer.token_to_id(token)
+            if type(self.tokenizer).__name__ == 'AggregateTokenizer':
+                if self.lang not in self.tokenizer.langs:
+                    print(f'lang {self.lang} not in tokenizer langs {self.tokenizer.langs}', flush=True)
+                return self.tokenizer.token_to_id(token, self.lang)
+            else:
+                return self.tokenizer.token_to_id(token)
         else:
             return self.reverse_map[token]
 
@@ -107,6 +113,7 @@ class FlashLightKenLMBeamSearchDecoder(NeuralModule):
         word_score: float = -1.0,
         unk_weight: float = -math.inf,
         sil_weight: float = 0.0,
+        lang: str = 'en',
     ):
 
         try:
@@ -129,7 +136,7 @@ class FlashLightKenLMBeamSearchDecoder(NeuralModule):
         super().__init__()
 
         self.criterion_type = CriterionType.CTC
-        self.tokenizer_wrapper = _TokensWrapper(vocabulary, tokenizer)
+        self.tokenizer_wrapper = _TokensWrapper(vocabulary, tokenizer, lang)
         self.vocab_size = self.tokenizer_wrapper.vocab_size
         self.blank = self.tokenizer_wrapper.blank
         self.silence = self.tokenizer_wrapper.unk_id

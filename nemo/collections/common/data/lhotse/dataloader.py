@@ -208,7 +208,7 @@ def get_lhotse_dataloader_from_config(
         simulated_cuts = CutSet()
         for simulator_name in config.simulators.keys():
             simulator_config = config.simulators[simulator_name]
-            
+
             skip_long_segments = simulator_config.get('skip_long_segments', False)
             valid_dataset_ids = simulator_config.get('valid_dataset_ids', [])
             if simulator_config.get('concat', False):
@@ -222,9 +222,9 @@ def get_lhotse_dataloader_from_config(
                     skip_long_segments=skip_long_segments,
                     valid_dataset_ids=valid_dataset_ids,
                 )
-                
-                simulated_cuts += simulator.simulate(cuts, num_meetings=simulator_config.num_meetings, num_jobs=1, seed=seed)
-            
+
+                simulated_cuts += simulator.simulate(cuts, num_meetings=simulator_config.num_meetings, num_jobs=1, seed=global_rank*world_size+local_rank+seed)
+
             if simulator_config.get('mix', False):
                 simulator = MixMeetingSimulator(
                     intra_session_mix_prob=simulator_config.intra_session_mix_prob,
@@ -236,8 +236,8 @@ def get_lhotse_dataloader_from_config(
                     valid_dataset_ids=valid_dataset_ids,
                 )
 
-                simulated_cuts += simulator.simulate(cuts, num_meetings=simulator_config.num_meetings, num_jobs=1, seed=seed)
-            
+                simulated_cuts += simulator.simulate(cuts, num_meetings=simulator_config.num_meetings, num_jobs=1, seed=global_rank*world_size+local_rank+seed)
+
             if simulator_config.get('lsmix', False):
                 simulator = LibriSpeechMixSimulator()
 

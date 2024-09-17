@@ -21,7 +21,7 @@ from nemo.collections.common.tokenizers.sentencepiece_tokenizer import SentenceP
 
 from nemo.utils import logging
 
-__all__ = ['CanaryTokenizer']
+__all__ = ['CanaryTokenizer', 'MSCanaryTokenizer']
 
 # Default tokens for compatibility with Canary.
 CANARY_BOS = "<|startoftranscript|>"

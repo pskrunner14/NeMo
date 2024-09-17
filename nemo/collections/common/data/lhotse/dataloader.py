@@ -38,6 +38,7 @@ from lhotse.utils import fastcopy, fix_random_seed
 from omegaconf import DictConfig, OmegaConf
 
 from nemo.collections.common.data.lhotse.cutset import guess_parse_cutset, read_cutset_from_config
+from nemo.collections.asr.parts.utils.asr_multispeaker_utils import LibriSpeechMixGenerator
 from nemo.utils import logging
 
 
@@ -174,6 +175,10 @@ def get_lhotse_dataloader_from_config(
 
     # 1. Load a manifest as a Lhotse CutSet.
     cuts, is_tarred = read_cutset_from_config(config)
+
+    if hasattr(cuts[0], 'delays'):
+        generator = LibriSpeechMixGenerator()
+        cuts = generator.generate(cuts)
 
     # Apply channel selector
     if config.channel_selector is not None:
@@ -500,7 +505,7 @@ def _merge_supervisions(cuts: CutSet) -> CutSet:
 
 def _flatten_alt_text(cut) -> list:
     ans = [cut]
-    if not isinstance(cut, Cut) or cut.custom is None or cut.custom.get("alt_text") is None:
+    if not isinstance(cut, Cut) or not hasattr(cut, 'custom') or cut.custom.get("alt_text") is None:
         return ans
     cut = cut.move_to_memory(audio_format="wav")  # performs I/O once and holds audio in memory from now on
     # Popping to ease eyesight on debug.

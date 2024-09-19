@@ -26,7 +26,8 @@ from torch.utils.data import ChainDataset
 from tqdm import tqdm
 
 from nemo.collections.asr.parts.preprocessing.features import WaveformFeaturizer
-from nemo.collections.asr.parts.utils.audio_utils import ChannelSelectorType
+from nemo.collections.asr.parts.preprocessing.segment import ChannelSelectorType
+from nemo.collections.asr.parts.preprocessing.segment import available_formats as valid_sf_formats
 from nemo.collections.common import tokenizers
 from nemo.collections.common.parts.preprocessing import collections, parsers
 from nemo.core.classes import Dataset, IterableDataset
@@ -70,7 +71,9 @@ def _speech_collate_fn(batch, pad_id):
     has_audio = audio_lengths[0] is not None
     if has_audio:
         max_audio_len = max(audio_lengths).item()
-    max_tokens_len = max(tokens_lengths).item()
+    has_tokens = tokens_lengths[0] is not None
+    if has_tokens:
+        max_tokens_len = max(tokens_lengths).item()
 
     audio_signal, tokens = [], []
     for b in batch:
@@ -84,19 +87,24 @@ def _speech_collate_fn(batch, pad_id):
                 pad = (0, max_audio_len - sig_len)
                 sig = torch.nn.functional.pad(sig, pad)
             audio_signal.append(sig)
-        tokens_i_len = tokens_i_len.item()
-        if tokens_i_len < max_tokens_len:
-            pad = (0, max_tokens_len - tokens_i_len)
-            tokens_i = torch.nn.functional.pad(tokens_i, pad, value=pad_id)
-        tokens.append(tokens_i)
+        if has_tokens:
+            tokens_i_len = tokens_i_len.item()
+            if tokens_i_len < max_tokens_len:
+                pad = (0, max_tokens_len - tokens_i_len)
+                tokens_i = torch.nn.functional.pad(tokens_i, pad, value=pad_id)
+            tokens.append(tokens_i)
 
     if has_audio:
         audio_signal = torch.stack(audio_signal)
         audio_lengths = torch.stack(audio_lengths)
     else:
         audio_signal, audio_lengths = None, None
-    tokens = torch.stack(tokens)
-    tokens_lengths = torch.stack(tokens_lengths)
+    if has_tokens:
+        tokens = torch.stack(tokens)
+        tokens_lengths = torch.stack(tokens_lengths)
+    else:
+        tokens = None
+        tokens_lengths = None
     if sample_ids is None:
         return audio_signal, audio_lengths, tokens, tokens_lengths
     else:
@@ -302,8 +310,7 @@ def cache_datastore_manifests(
     if num_datastore_manifests > 0:
         # Local utility function
         def cache_data(manifest_filepaths, cache_audio, num_workers, max_num_workers):
-            """Cache manifests and audio data from object store.
-            """
+            """Cache manifests and audio data from object store."""
             # Determine the number of workers to use
             if num_workers is None:
                 num_workers = os.cpu_count() - 1
@@ -467,8 +474,7 @@ class _AudioTextDataset(Dataset):
 
     @property
     def output_types(self) -> Optional[Dict[str, NeuralType]]:
-        """Returns definitions of module output ports.
-               """
+        """Returns definitions of module output ports."""
         return {
             'audio_signal': NeuralType(('B', 'T'), AudioSignal()),
             'a_sig_length': NeuralType(tuple('B'), LengthsType()),
@@ -591,8 +597,7 @@ class AudioToCharDataset(_AudioTextDataset):
 
     @property
     def output_types(self) -> Optional[Dict[str, NeuralType]]:
-        """Returns definitions of module output ports.
-               """
+        """Returns definitions of module output ports."""
         return {
             'audio_signal': NeuralType(('B', 'T'), AudioSignal()),
             'a_sig_length': NeuralType(tuple('B'), LengthsType()),
@@ -685,8 +690,7 @@ class AudioToBPEDataset(_AudioTextDataset):
 
     @property
     def output_types(self) -> Optional[Dict[str, NeuralType]]:
-        """Returns definitions of module output ports.
-               """
+        """Returns definitions of module output ports."""
         return {
             'audio_signal': NeuralType(('B', 'T'), AudioSignal()),
             'a_sig_length': NeuralType(tuple('B'), LengthsType()),
@@ -963,8 +967,7 @@ class _TarredAudioToTextDataset(IterableDataset):
         return TarredAudioFilter(self.manifest_processor.collection)
 
     def _loop_offsets(self, iterator):
-        """This function is used to iterate through utterances with different offsets for each file.
-        """
+        """This function is used to iterate through utterances with different offsets for each file."""
 
         class TarredAudioLoopOffsets:
             def __init__(self, collection):
@@ -997,8 +1000,7 @@ class _TarredAudioToTextDataset(IterableDataset):
         return _speech_collate_fn(batch, self.pad_id)
 
     def _build_sample(self, tup):
-        """Builds the training sample by combining the data from the WebDataset with the manifest info.
-        """
+        """Builds the training sample by combining the data from the WebDataset with the manifest info."""
         audio_bytes, audio_filename, offset_id = tup
 
         # Grab manifest entry from self.manifest_preprocessor.collection
@@ -1368,7 +1370,9 @@ class BucketingDataset(IterableDataset):
     """
 
     def __init__(
-        self, dataset: IterableDataset, bucketing_batch_size: int,
+        self,
+        dataset: IterableDataset,
+        bucketing_batch_size: int,
     ):
         self.wrapped_dataset = dataset
         self.bucketing_batch_size = bucketing_batch_size

@@ -408,14 +408,14 @@ class _AudioMSDDTrainDataset(Dataset):
             if index == 0:
                 seg_stt_feat = 0
             else:
-                seg_stt_feat = stride * (index - 1)
+                seg_stt_feat = stride * index - 1 - int(stride / 2)
             if index == num_seg - 1:
                 seg_end_feat = feat_level_target.shape[0]
             else:
-                seg_end_feat = stride * (index + 1) + 1
-            targets[index] = torch.mean(feat_level_target[seg_stt_feat:seg_end_feat, :], axis=0)
+                seg_end_feat = stride * index - 1 + int(stride / 2)
+            targets[index] = torch.mean(feat_level_target[seg_stt_feat:seg_end_feat+1, :], axis=0)
         return targets
-
+    
     def get_ms_seg_timestamps(
         self, 
         duration: float, 

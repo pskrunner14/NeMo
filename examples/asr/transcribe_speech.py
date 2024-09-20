@@ -372,8 +372,10 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig, List[Hypothesis
         # prepare audio filepaths and decide wether it's partial audio
         filepaths, partial_audio = prepare_audio_data(cfg)
 
-    filepaths = sorted_manifest_path if sorted_manifest_path is not None else filepaths
-
+    if not cfg.allow_partial_transcribe:
+        # by defatul, use model's transcribe() function, unless partial audio is required
+        partial_audio = False
+        
     # setup AMP (optional)
     if cfg.amp and torch.cuda.is_available() and hasattr(torch.cuda, 'amp') and hasattr(torch.cuda.amp, 'autocast'):
         logging.info("AMP enabled!\n")

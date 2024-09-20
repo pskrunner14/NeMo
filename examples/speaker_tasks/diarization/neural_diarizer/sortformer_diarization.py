@@ -60,6 +60,7 @@ class DiarizationConfig:
     # Required configs
     model_path: Optional[str] = None  # Path to a .nemo file
     pretrained_name: Optional[str] = None  # Name of a pretrained model
+    use_lhotse : bool = True  # Use Lhotse for preprocessing
     audio_dir: Optional[str] = None  # Path to a directory which contains audio files
     tensor_image_dir: Optional[str] = None  # Path to a directory which contains tensor images
     save_tensor_images: bool = False  # If True, saves tensor images to disk for debugging purposes
@@ -111,9 +112,11 @@ class DiarizationConfig:
 class VadParams():
     # Trial 2522 finished with value: 0.09605644326924494 and parameters: {'onset': 0.62, 'offset': 0.57, 'pad_onset': 0.23, 'pad_offset': 0.09, 'min_duration_on': 0.13, 'min_duration_off': 0.25}. Best is trial 2522 with value: 0.09605644326924494. (im303a e19last)
     # Trial 3683 finished with value: 0.09960175732817779 and parameters: {'onset': 0.6, 'offset': 0.6, 'pad_onset': 0.22, 'pad_offset': 0.1, 'min_duration_on': 0.06, 'min_duration_off': 0.25}. Best is trial 3683 with value: 0.09960175732817779. (im303a e6-e19)
-    opt_style = "callhome_part1"
+    # opt_style = "callhome_part1"
+    # opt_style = "ch11"
+    opt_style = "dihard_dev" 
     # opt_style = None
-    if opt_style == "callhome_part1":
+    if opt_style == "callhome_part1_f2f":
         window_length_in_sec: float = 0.15
         shift_length_in_sec: float = 0.01
         smoothing: str = False
@@ -124,12 +127,48 @@ class VadParams():
         pad_offset: float = 0.09
         min_duration_on: float = 0.13
         min_duration_off: float = 0.25
-        # onset: float = 0.6
-        # offset: float = 0.53
-        # pad_onset: float = 0.22
-        # pad_offset: float = 0.06
-        # min_duration_on: float = 0.09
-        # min_duration_off: float = 0.23
+        filter_speech_first: bool = True
+    elif opt_style == "callhome_part1":
+        # {'onset': 0.5, 'offset': 0.48, 'pad_onset': 0.19, 'pad_offset': 0.0, 'min_duration_on': 0.16999999999999998, 'min_duration_off': 0.34} Best is trial 18 with value: 0.10043863883598678.
+        # Trial 568 finished with value: 0.09846947956871487 and parameters: {'onset': 0.5700000000000001, 'offset': 0.49, 'pad_onset': 0.22999999999999998, 'pad_offset': 0.0, 'min_duration_on': 0.4, 'min_duration_off': 0.34}. Best is trial 568 with value: 0.09846947956871487.
+        window_length_in_sec: float = 0.15
+        shift_length_in_sec: float = 0.01
+        smoothing: str = False
+        overlap: float = 0.5
+        onset: float = 0.57
+        offset: float = 0.49
+        pad_onset: float = 0.23
+        pad_offset: float = 0.0
+        min_duration_on: float = 0.4
+        min_duration_off: float = 0.34
+        filter_speech_first: bool = True
+    elif opt_style == "ch11":
+        # Trial 753 finished with value: 0.12761722145938803 and parameters: {'onset': 0.77, 'offset': 0.88, 'pad_onset': 0.25, 'pad_offset': 0.01, 'min_duration_on': 0.22, 'min_duration_off': 0.24}. Best is trial 753 with value: 0.12761722145938803.
+        # Trial 1057 finished with value: 0.12725160262920568 and parameters: {'onset': 0.76, 'offset': 0.85, 'pad_onset': 0.25, 'pad_offset': 0.0, 'min_duration_on': 0.17, 'min_duration_off': 0.25}. Best is trial 1057 with value: 0.12725160262920568.
+        window_length_in_sec: float = 0.15
+        shift_length_in_sec: float = 0.01
+        smoothing: str = False
+        overlap: float = 0.5
+        onset: float = 0.77
+        offset: float = 0.88
+        pad_onset: float = 0.25
+        pad_offset: float = 0.01
+        min_duration_on: float = 0.22
+        min_duration_off: float = 0.24
+        filter_speech_first: bool = True
+
+    elif opt_style == "dihard_dev":
+        # Trial 179 finished with value: 0.13015545039443618 and parameters: {'onset': 0.62, 'offset': 0.76, 'pad_onset': 0.05, 'pad_offset': 0.0, 'min_duration_on': 0.11, 'min_duration_off': 0.17}. Best is trial 179 with value: 0.13015545039443618.
+        window_length_in_sec: float = 0.15
+        shift_length_in_sec: float = 0.01
+        smoothing: str = False
+        overlap: float = 0.5
+        onset: float = 0.62
+        offset: float = 0.76
+        pad_onset: float = 0.05
+        pad_offset: float = 0.0
+        min_duration_on: float = 0.11
+        min_duration_off: float = 0.17
         filter_speech_first: bool = True
     elif opt_style == "ami_dev":
         window_length_in_sec: float = 0.15

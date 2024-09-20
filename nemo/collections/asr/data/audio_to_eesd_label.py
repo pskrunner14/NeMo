@@ -444,6 +444,12 @@ class _AudioMSDDTrainDataset(Dataset):
     
 
     def __getitem__(self, index):
+        if isinstance(index, list):
+            if len(index) > 1:
+                raise ValueError("Index should be a single integer or a list of integers.")
+            else:
+                index = index[0]
+                
         sample = self.collection[index]
         if sample.offset is None:
             sample.offset = 0
@@ -498,6 +504,7 @@ def _msdd_train_collate_fn(self, batch):
         targets (torch.tensor):
             Groundtruth Speaker label for the given input embedding sequence.
     """
+    import ipdb; ipdb.set_trace()
     packed_batch = list(zip(*batch))
     # audio_signal, feature_length, ms_seg_timestamps, ms_seg_counts, scale_mapping, targets  = packed_batch
     audio_signal, feature_length, targets, ms_seg_counts = packed_batch

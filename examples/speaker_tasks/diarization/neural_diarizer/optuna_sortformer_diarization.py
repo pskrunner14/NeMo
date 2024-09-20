@@ -82,8 +82,27 @@ def optuna_suggest_params(vad_cfg, trial):
     vad_cfg.min_duration_off=trial.suggest_float("min_duration_off", 0.0, 0.25, step=0.01)
     return vad_cfg
 
+def optuna_suggest_params_ns2k(vad_cfg, trial):
+    # {'onset': 0.62, 'offset': 0.57, 'pad_onset': 0.23, 'pad_offset': 0.09, 'min_duration_on': 0.13, 'min_duration_off': 0.25}.
+    vad_cfg.onset=trial.suggest_float("onset", 0.5, 0.75, step=0.01)
+    vad_cfg.offset=trial.suggest_float("offset", 0.48, 0.7, step=0.01)
+    vad_cfg.pad_onset=trial.suggest_float("pad_onset", 0.15, 0.3, step=0.01)
+    vad_cfg.pad_offset=trial.suggest_float("pad_offset", 0.0, 0.15, step=0.01)
+    vad_cfg.min_duration_on=trial.suggest_float("min_duration_on", 0.05, 0.4, step=0.01)
+    vad_cfg.min_duration_off=trial.suggest_float("min_duration_off", 0.2, 0.4, step=0.01)
+    return vad_cfg
+
+def optuna_suggest_params_dh(vad_cfg, trial):
+    vad_cfg.onset=trial.suggest_float("onset", 0.1, 0.9, step=0.01)
+    vad_cfg.offset=trial.suggest_float("offset", 0.1, 0.9, step=0.01)
+    vad_cfg.pad_onset=trial.suggest_float("pad_onset", 0.0, 0.25, step=0.01)
+    vad_cfg.pad_offset=trial.suggest_float("pad_offset", 0.0, 0.25, step=0.01)
+    vad_cfg.min_duration_on=trial.suggest_float("min_duration_on", 0.0, 0.25, step=0.01)
+    vad_cfg.min_duration_off=trial.suggest_float("min_duration_off", 0.0, 0.25, step=0.01)
+    return vad_cfg
 
 def diarization_objective(
+    tensor_filename,
     trial, 
     vad_cfg, 
     temp_out_dir, 
@@ -94,7 +113,14 @@ def diarization_objective(
     ):
     with tempfile.TemporaryDirectory(dir=temp_out_dir, prefix="Diar_PostProcessing_") as local_temp_out_dir:
         if trial is not None:
-            vad_cfg = optuna_suggest_params(vad_cfg, trial) 
+            # vad_cfg = optuna_suggest_params(vad_cfg, trial) 
+            if "dihard" in tensor_filename:
+                vad_cfg = optuna_suggest_params_dh(vad_cfg, trial) 
+            elif "NIST_SRE_2000" in tensor_filename:
+                vad_cfg = optuna_suggest_params_ns2k(vad_cfg, trial) 
+            else:
+                vad_cfg = optuna_suggest_params(vad_cfg, trial) 
+ 
         all_hyps, all_refs, all_uems = convert_pred_mat_to_segments(infer_audio_rttm_dict, 
                                                                     vad_cfg=vad_cfg, 
                                                                     batch_preds_list=diar_model_preds_total_list, 
@@ -155,6 +181,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     else:
         raise ValueError("cfg.model_path must end with.ckpt or.nemo!")
     diar_model._cfg.diarizer.out_dir = cfg.tensor_image_dir
+    diar_model._cfg.test_ds.use_lhotse = cfg.use_lhotse
     diar_model._cfg.test_ds.session_len_sec = cfg.session_len_sec
     trainer = pl.Trainer(devices=device, accelerator=accelerator)
     diar_model.set_trainer(trainer)
@@ -170,6 +197,8 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     diar_model.msdd_multiscale_args_dict['scale_dict'][scale_n-1] = (float(cfg.interpolated_scale), float(cfg.interpolated_scale/2))
     
     # Model setup for inference 
+    # diar_model._cfg.test_ds.use_lhotse = cfg.get("use_lhotse", False)
+    diar_model._cfg.test_ds.use_bucketing = False
     diar_model._cfg.test_ds.num_workers = cfg.num_workers
     diar_model.setup_test_data(test_data_config=diar_model._cfg.test_ds)    
     diar_model.streaming_mode = cfg.streaming_mode
@@ -180,29 +209,53 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     # Check if the saved tensor exists:
     tensor_filename = os.path.basename(cfg.dataset_manifest).replace("manifest.", "").replace(".json", "")
     model_base_path = os.path.dirname(cfg.model_path)
-    tensor_path = f"{model_base_path}/pred_tensors/{tensor_filename}.pt"
+    tensor_folder = f"{model_base_path}/pred_tensors_v2"
+    tensor_path = f"{tensor_folder}/{tensor_filename}.pt"
     if os.path.exists(tensor_path):
         logging.info(f"Loading the saved tensors from {tensor_path}...")
         diar_model_preds_total_list = torch.load(tensor_path)
+        del diar_model 
+        torch.cuda.empty_cache()
     else:
         diar_model.test_batch()
+        if not os.path.exists(tensor_folder):
+            os.makedirs(os.path.dirname(tensor_folder), exist_ok=True)
         torch.save(diar_model.preds_total_list, tensor_path)
+        diar_model_preds_total_list = diar_model.preds_total_list
+    vad_cfg = VadParams() 
+    if not cfg.no_der:
+        all_hyps, all_refs, all_uems = convert_pred_mat_to_segments(infer_audio_rttm_dict,
+                                                                    vad_cfg=vad_cfg, 
+                                                                    batch_preds_list=diar_model_preds_total_list, 
+                                                                    unit_10ms_frame_count=8,
+                                                                    bypass_postprocessing=cfg.bypass_postprocessing)
+        logging.info(f"Evaluating the model on the {len(diar_model_preds_total_list)} audio segments...")
+        metric, mapping_dict, itemized_errors = score_labels(AUDIO_RTTM_MAP=infer_audio_rttm_dict, 
+                                                            all_reference=all_refs, 
+                                                            all_hypothesis=all_hyps, 
+                                                            all_uem=all_uems, 
+                                                            collar=cfg.collar, 
+                                                            ignore_overlap=cfg.ignore_overlap
+                                                            )
+        print("VadParams:", VadParams())
     # if temp_out_dir does not exist, create it:
+    import ipdb; ipdb.set_trace()
     temp_out_dir = os.path.join(model_base_path, "temp_out_dir")
     if not os.path.exists(temp_out_dir):
         os.makedirs(temp_out_dir)
     
-    vad_cfg = VadParams() 
     worker_function = lambda trial: diarization_objective(
+        tensor_filename=tensor_filename,
         trial=trial,
         vad_cfg=vad_cfg,
         temp_out_dir=temp_out_dir,
         infer_audio_rttm_dict=infer_audio_rttm_dict, 
         diar_model_preds_total_list=diar_model_preds_total_list,
+        collar=cfg.collar,
     )
     study = optuna.create_study(
         direction="minimize", 
-        study_name=cfg.optuna_study_name, 
+        study_name=f"{cfg.optuna_study_name}-{tensor_filename}", 
         storage=cfg.storage, 
         load_if_exists=True
     )

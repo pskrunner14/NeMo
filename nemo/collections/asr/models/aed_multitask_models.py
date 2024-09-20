@@ -1080,7 +1080,8 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
         if 'diar_model_path' in self.cfg:
             self.diar = True
             # Initialize the speaker branch
-            self._init_diar_model()
+            if 'init_diar' in self.cfg:
+                self._init_diar_model()
 
             if 'max_num_speakers' in cfg:
                 self.max_num_speakers = cfg.max_num_speakers

@@ -29,6 +29,7 @@ import numpy as np
 import soundfile
 from tqdm import tqdm
 from scipy.stats import norm
+from nltk.tokenize import SyllableTokenizer
 
 import torch.utils.data
 from lhotse.cut.set import mix
@@ -172,7 +173,21 @@ def speaker_to_target(
     
     segments_total = []
     for i, cut in enumerate(cut_list):
-        rttms = SupervisionSet.from_rttm(cut.rttm_filepath)
+        if hasattr(cut, 'rttm_filepath') and cut.rttm_filepath is not None:
+            rttms = SupervisionSet.from_rttm(cut.rttm_filepath)
+        elif hasattr(cut, 'speaker_id') and cut.speaker_id is not None:
+            rttms = SupervisionSet.from_segments([SupervisionSegment(
+                id=uuid4(),
+                recording_id=cut.recording_id,
+                start=0,
+                duration=cut.duration,
+                channel=1,
+                speaker=cut.speaker_id,
+                language=None
+            )])
+        else:
+            raise ValueError(f"Cut {cut.id} does not have rttm_filepath or speaker_id")
+
         if boundary_segments: # segments with seg_start < total_end and seg_end > total_start are included
             segments_iterator = find_segments_from_rttm(recording_id=cut.recording_id, rttms=rttms, start_after=cut.start, end_before=cut.end, tolerance=0.0)
         else: # segments with seg_start > total_start and seg_end < total_end are included
@@ -317,7 +332,6 @@ class ConcatenationMeetingSimulator():
         max_num_speakers: int = 4,
         speaker_count_distribution: List[float] = [0, 2, 3, 4],
         skip_long_segments: bool = True,
-        valid_dataset_ids: List[str] = [],
     ):
         """
         :param intra_session_concat_prob: the probability of concatenating segments from the same
@@ -348,8 +362,6 @@ class ConcatenationMeetingSimulator():
         else:
             self.skip_duration = max_duration
 
-        self.valid_dataset_ids = valid_dataset_ids
-
     def fit(self, cuts) -> CutSet:
         """
         Read the manifest file and return a CutSet object. 
@@ -368,8 +380,6 @@ class ConcatenationMeetingSimulator():
             if cut.duration > self.skip_duration:
                 continue
             if not hasattr(cut, 'dataset_id') or cut.dataset_id is None:
-                continue
-            if self.valid_dataset_ids and cut.dataset_id not in self.valid_dataset_ids:
                 continue
             if cut.dataset_id not in self.data2num_spk2cut_ids:
                 self.data2num_spk2cut_ids[cut.dataset_id] = defaultdict(list)
@@ -581,39 +591,39 @@ class ConcatenationMeetingSimulator():
         
 
         num_speakers2num_meetings = self.apply_speaker_distribution(num_meetings, self.speaker_count_distribution)
-        logging.warn(f"Will be generating {(','.join([str(i) for i in num_speakers2num_meetings.values()]))} samples for {(','.join([str(i) for i in num_speakers2num_meetings.keys()]))} speakers given speaker count distribution of {str(self.speaker_count_distribution)}.")
+        logging.warning(f"Will be generating {(','.join([str(i) for i in num_speakers2num_meetings.values()]))} samples for {(','.join([str(i) for i in num_speakers2num_meetings.keys()]))} speakers given speaker count distribution of {str(self.speaker_count_distribution)}.")
         num_speakers2num_meetings[1] = 0 # skip 1-speaker samples
-        logging.warn(f'But 1-speaker samples will be skipped. Will be generating {sum(num_speakers2num_meetings.values()) - num_speakers2num_meetings[1]} samples in total.')
+        logging.warning(f'But 1-speaker samples will be skipped. Will be generating {sum(num_speakers2num_meetings.values()) - num_speakers2num_meetings[1]} samples in total.')
 
         # Step 0: Calculate the number of intra-session and inter-session concatentation samples
         n_spks = [k for k, v in self.num_spk2cut_ids.items() if len(v) > 0]
         valid_sim_n_spks = set([i+j for i in n_spks for j in n_spks]) # valid number of speakers for inter-session samples
         n_spk2n_intra_mt, n_spk2n_inter_mt = {i+1:0 for i in range(self.max_num_speakers)}, {i+1:0 for i in range(self.max_num_speakers)}
         for n_spk, n_mt in num_speakers2num_meetings.items():
-            logging.warn(f"=="*16 + f"{n_spk}-speaker" + "=="*16)
+            logging.warning(f"=="*16 + f"{n_spk}-speaker" + "=="*16)
             if n_mt <= 0:
                 logging.warning(f"No concatentation samples for {n_spk} speakers. Will skip simulation for {n_spk} speakers.")
                 continue
             n_intra_mt = int(n_mt * self.intra_session_concat_prob[n_spk-1])
             n_inter_mt = n_mt - n_intra_mt
             if n_spk in self.num_spk2sess_ids:
-                logging.warn(f"Will be genrating {n_intra_mt} {n_spk}-speaker intra-session concatentation samples.")
+                logging.warning(f"Will be genrating {n_intra_mt} {n_spk}-speaker intra-session concatentation samples.")
                 n_spk2n_intra_mt[n_spk] = n_intra_mt
             else:
                 logging.warning(f"Cannot generate {n_intra_mt} {n_spk}-speaker intra-session samples by concatenating two samples from the same session since we only have samples for {','.join([str(i) for i in n_spks])} speakers.")
                 n_spk2n_intra_mt[n_spk] = 0
                 n_inter_mt = n_mt
             if n_spk in valid_sim_n_spks:
-                logging.warn(f"Will be genrating {n_inter_mt} {n_spk}-speaker inter-session concatentation samples.")
+                logging.warning(f"Will be genrating {n_inter_mt} {n_spk}-speaker inter-session concatentation samples.")
                 n_spk2n_inter_mt[n_spk] = n_inter_mt
             else:
                 logging.warning(f"Cannot generate {n_inter_mt} {n_spk}-speaker inter-session samples by concatenating two samples from different sessions since we only have samples for {','.join([str(i) for i in n_spks])} speakers.")
                 if n_spk2n_intra_mt[n_spk] != 0:
                     n_spk2n_intra_mt[n_spk] = n_mt
-                    logging.warn(f"Will be genrating {n_spk2n_intra_mt[n_spk]} {n_spk}-speaker intra-session concatentation samples instead.")
+                    logging.warning(f"Will be genrating {n_spk2n_intra_mt[n_spk]} {n_spk}-speaker intra-session concatentation samples instead.")
                 else:
                     logging.warning(f"No samples for {n_spk} speakers. Will skip simulation for {n_spk} speakers.")
-        logging.warn(f"""Will be generating {','.join([str(i) for i in n_spk2n_intra_mt.values()])} intra-session concatentation samples and {','.join([str(i) for i in n_spk2n_inter_mt.values()])} inter-session concatentation samples for {','.join([str(i+1) for i in range(self.max_num_speakers)])} speakers.""")
+        logging.warning(f"""Will be generating {','.join([str(i) for i in n_spk2n_intra_mt.values()])} intra-session concatentation samples and {','.join([str(i) for i in n_spk2n_inter_mt.values()])} inter-session concatentation samples for {','.join([str(i+1) for i in range(self.max_num_speakers)])} speakers.""")
         # Step 1: intra-session
         num_intra_meetings = 0
         intra_mixtures = []
@@ -677,7 +687,6 @@ class MixMeetingSimulator():
         max_duration: float = 100.0,
         max_num_speakers: int = 4,
         speaker_count_distribution: List[float] = [0, 0, 0.1, 4],
-        valid_dataset_ids: List[str] = [],
     ):
         """
         :param intra_session_mix_prob: the probability of concatenating segments from the same
@@ -701,7 +710,6 @@ class MixMeetingSimulator():
         self.max_duration = max_duration
         self.max_num_speakers = max_num_speakers
         self.speaker_count_distribution = speaker_count_distribution
-        self.valid_dataset_ids = valid_dataset_ids
         assert len(speaker_count_distribution) == max_num_speakers, f"Length of speaker_count_distribution {len(speaker_count_distribution)} must be equal to max_num_speakers {max_num_speakers}"
 
     def fit(self, cuts) -> CutSet:
@@ -722,8 +730,6 @@ class MixMeetingSimulator():
             if not self.min_duration <= cut.duration <= self.max_duration:
                 continue
             if not hasattr(cut, 'dataset_id') or cut.dataset_id is None:
-                continue
-            if self.valid_dataset_ids and cut.dataset_id not in self.valid_dataset_ids:
                 continue
             if cut.dataset_id not in self.data2num_spk2cut_ids:
                 self.data2num_spk2cut_ids[cut.dataset_id] = defaultdict(list)
@@ -931,39 +937,39 @@ class MixMeetingSimulator():
         self.fit(cuts)
 
         num_speakers2num_meetings = self.apply_speaker_distribution(num_meetings, self.speaker_count_distribution)
-        logging.warn(f"Will be generating {(','.join([str(i) for i in num_speakers2num_meetings.values()]))} samples for {(','.join([str(i) for i in num_speakers2num_meetings.keys()]))} speakers given speaker count distribution of {str(self.speaker_count_distribution)}.")
+        logging.warning(f"Will be generating {(','.join([str(i) for i in num_speakers2num_meetings.values()]))} samples for {(','.join([str(i) for i in num_speakers2num_meetings.keys()]))} speakers given speaker count distribution of {str(self.speaker_count_distribution)}.")
         num_speakers2num_meetings[1] = 0 # skip 1-speaker samples
-        logging.warn(f'But 1-speaker samples will be skipped. Will be generating {sum(num_speakers2num_meetings.values()) - num_speakers2num_meetings[1]} samples in total.')
+        logging.warning(f'But 1-speaker samples will be skipped. Will be generating {sum(num_speakers2num_meetings.values()) - num_speakers2num_meetings[1]} samples in total.')
 
         # Step 0: Calculate the number of intra-session and inter-session concatentation samples
         n_spks = [k for k, v in self.num_spk2cut_ids.items() if len(v) > 0]
         valid_sim_n_spks = set([i+j for i in n_spks for j in n_spks]) # valid number of speakers for inter-session samples
         n_spk2n_intra_mt, n_spk2n_inter_mt = {i+1:0 for i in range(self.max_num_speakers)}, {i+1:0 for i in range(self.max_num_speakers)}
         for n_spk, n_mt in num_speakers2num_meetings.items():
-            logging.warn(f"=="*16 + f"{n_spk}-speaker" + "=="*16)
+            logging.warning(f"=="*16 + f"{n_spk}-speaker" + "=="*16)
             if n_mt <= 0:
                 logging.warning(f"No intra-session concatentation samples for {n_spk} speakers. Will skip simulation for {n_spk} speakers.")
                 continue
             n_intra_mt = int(n_mt * self.intra_session_mix_prob[n_spk-1])
             n_inter_mt = n_mt - n_intra_mt
             if n_spk in self.num_spk2sess_ids:
-                logging.warn(f"Will be genrating {n_intra_mt} {n_spk}-speaker intra-session concatentation samples.")
+                logging.warning(f"Will be genrating {n_intra_mt} {n_spk}-speaker intra-session concatentation samples.")
                 n_spk2n_intra_mt[n_spk] = n_intra_mt
             else:
                 logging.warning(f"Cannot generate {n_intra_mt} {n_spk}-speaker intra-session samples by concatenating two samples from the same session since we only have samples for {','.join([str(i) for i in n_spks])} speakers.")
                 n_spk2n_intra_mt[n_spk] = 0
                 n_inter_mt = n_mt
             if n_spk in valid_sim_n_spks:
-                logging.warn(f"Will be genrating {n_inter_mt} {n_spk}-speaker inter-session concatentation samples.")
+                logging.warning(f"Will be genrating {n_inter_mt} {n_spk}-speaker inter-session concatentation samples.")
                 n_spk2n_inter_mt[n_spk] = n_inter_mt
             else:
                 logging.warning(f"Cannot generate {n_inter_mt} {n_spk}-speaker inter-session samples by concatenating two samples from different sessions since we only have samples for {','.join([str(i) for i in n_spks])} speakers.")
                 if n_spk2n_intra_mt[n_spk] != 0:
                     n_spk2n_intra_mt[n_spk] = n_mt
-                    logging.warn(f"Will be genrating {n_spk2n_intra_mt[n_spk]} {n_spk}-speaker intra-session concatentation samples instead.")
+                    logging.warning(f"Will be genrating {n_spk2n_intra_mt[n_spk]} {n_spk}-speaker intra-session concatentation samples instead.")
                 else:
                     logging.warning(f"No samples for {n_spk} speakers. Will skip simulation for {n_spk} speakers.")
-        logging.warn(f"""Will be generating {','.join([str(i) for i in n_spk2n_intra_mt.values()])} intra-session concatentation samples and {','.join([str(i) for i in n_spk2n_inter_mt.values()])} inter-session concatentation samples for {','.join([str(i+1) for i in range(self.max_num_speakers)])} speakers.""")
+        logging.warning(f"""Will be generating {','.join([str(i) for i in n_spk2n_intra_mt.values()])} intra-session concatentation samples and {','.join([str(i) for i in n_spk2n_inter_mt.values()])} inter-session concatentation samples for {','.join([str(i+1) for i in range(self.max_num_speakers)])} speakers.""")
         # Step 1: intra-session
         num_intra_meetings = 0
         intra_mixtures = []
@@ -1000,25 +1006,112 @@ class LibriSpeechMixSimulator():
 
     def __init__(
         self,
-        min_duration: float = 80.0,
-        max_duration: float = 100.0,
-        n_mix_speakers: List[int] = [1, 2, 3],
-        speaker_count_distribution: List[float] = [1, 1, 1],
+        data_type: str = "diar",
+        min_delay: float = 0.5,
+        max_num_speakers: int = 4,
+        speaker_count_distribution: List[float] = [0, 2, 3, 4],
     ):
         """
-        :param min_duration: the minimum duration of the simulated meeting. [Default: 80.0]
-        :param max_duration: the maximum duration of the simulated meeting. [Default: 100.0]
         """
         super().__init__()
-        self.min_duration = min_duration
-        self.max_duration = max_duration
-        self.n_mix_speakers = n_mix_speakers
+        self.data_type = data_type
+        self.min_delay = min_delay
+        self.max_num_speakers = max_num_speakers
         self.speaker_count_distribution = speaker_count_distribution
-        assert len(speaker_count_distribution) == len(n_mix_speakers), f"Length of speaker_count_distribution {len(speaker_count_distribution)} must be equal to max_num_speakers {len(n_mix_speakers)}"
+        assert len(speaker_count_distribution) == max_num_speakers, f"Length of speaker_count_distribution {len(speaker_count_distribution)} must be equal to max_num_speakers {max_num_speakers}"
 
     def fit(self, cuts) -> CutSet:
-        pass
+        self.speaker_id2cut_ids = defaultdict(list)
+        self.id2cuts = defaultdict(list)
+        for cut in tqdm(cuts, desc="Reading segments", ncols=100):
+            # if not hasattr(cut, 'dataset_id') or cut.dataset_id != 'librispeech':
+            #     continue
+            if hasattr(cuts[0], 'speaker_id'):
+                speaker_id = cut.speaker_id
+            else: #LibriSpeech
+                speaker_id = cut.recording_id.split('-')[0]
+                cut.speaker_id = speaker_id
+            self.speaker_id2cut_ids[speaker_id].append(cut.id)
+            self.id2cuts[cut.id] = cut
+        
+        self.speaker_ids = list(self.speaker_id2cut_ids.keys())
 
+    def _create_mixture(self, n_speakers: int) -> MixedCut:
+        sampled_speaker_ids = random.sample(self.speaker_ids, n_speakers)
+        tracks = []
+        offset = 0.0
+
+        for speaker_id in sampled_speaker_ids:
+            cut_id = random.choice(self.speaker_id2cut_ids[speaker_id])
+            cut = self.id2cuts[cut_id]
+            tracks.append(MixTrack(cut=deepcopy(cut), type=type(cut), offset=offset))
+            offset += random.uniform(self.min_delay, cut.duration)
+        
+        cut = MixedCut(id='lsmix_' + '_'.join([track.cut.id for track in tracks]), tracks=tracks)
+
+        if self.data_type == "msasr":
+            text = self.get_text(cut)
+            sup = SupervisionSegment(id=cut.id, recording_id=cut.recording_id, start=0, duration=cut.duration, text=text)
+            cut.supervisions.append(sup)
+
+        if self.data_type == "tsasr":
+            query_speaker_id = random.choice(sampled_speaker_ids)
+            query_audio_path = random.choice(self.speaker_id2cut_ids[query_speaker_id])
+            pass # TODO: need to implement the query audio path
+
+        if self.data_type == "diar":
+            pass # TODO: need to implement the diar data type
+
+        return cut
+    
+    # TODO: text is necessary for msasr and tsasr, but not for diar
+    # def get_text(self, cut: MixedCut, speaker_token_style='<|spltoken*|>', speaker_token_position='word') -> str:
+    #     text = ''
+    #     stt_words_spks = []
+    #     if speaker_token_position == 'word':
+    #         SSP = SyllableTokenizer()
+    #         for i, track in enumerate(cut.tracks):
+    #             stt_time, end_time = track.start, track.end
+    #             word_seq = track.cut.text
+    #             word_list = word_seq.split()
+    #             syllab_word_list = [[] for _ in range(len(word_list))]
+    #             syllab_list = []
+    #             for idx,word in enumerate(word_list):
+    #                 syllables = SSP.tokenize(word)
+    #                 syllab_word_list[idx].extend(syllables)
+    #                 syllab_list.extend(syllables)
+    #             avg_sylllable_dur = (end_time - stt_time) / len(syllab_list)
+    #             offset = stt_time
+    #             stt_times, end_times = [], []
+    #             for word, syllabs in zip(word_list, syllab_word_list):
+    #                 stt_times.append(round(offset, 3))
+    #                 end_time = round(offset + avg_sylllable_dur * len(syllabs), 3)
+    #                 end_times.append(end_time)
+    #                 offset = end_time
+    #                 stt_words_spks.append([stt_time, word, speaker_token_style.replace('*', str(i))])
+    #             stt_words_spks = sorted(stt_words_spks, key=lambda x: x[0])
+    #             text += ' '.join([f'{spk} {word}' for stt_time, word, spk in stt_words_spks])
+    #     elif speaker_token_position == 'segments':
+    #         pass
+
+    #     return text
+    
+    def apply_speaker_distribution(self, num_meetings: int, speaker_count_distribution) -> Dict[int, int]:
+        """
+        Balance the speaker distribution for the simulated meetings.
+        Args:
+            num_meetings: The total number of simulated meetings.
+            speaker_count_distribution: The speaker count distribution for the simulated meetings.
+        For each number of speakers, calculate the number of meetings needed to balance the distribution.
+        """
+
+        total_spk = sum(speaker_count_distribution)
+        num_speakers2num_meetings = {}
+        for i_spk in range(self.max_num_speakers):
+            num_speakers2num_meetings[i_spk+1] = round(num_meetings * speaker_count_distribution[i_spk] / total_spk)
+
+        return num_speakers2num_meetings
+            
     def simulate(self, 
         cuts: CutSet,
         num_meetings: int = 10000,
@@ -1027,12 +1120,17 @@ class LibriSpeechMixSimulator():
     ) -> CutSet:
         random.seed(seed)
 
+        self.fit(cuts)
+
+        self.num_speakers2num_meetings = self.apply_speaker_distribution(num_meetings, self.speaker_count_distribution)
+
         cut_set = []
-        for n_speakers, n_mt in zip(self.n_mix_speakers, self.speaker_count_distribution):
+        for n_speakers, n_mt in self.num_speakers2num_meetings.items():
             if n_mt <= 0:
                 continue
             for i in tqdm(range(n_mt), desc=f"Simulating {n_speakers}-speaker mixtures", ncols=128):
                 cut_set.append(self._create_mixture(n_speakers=n_speakers))
+
         return CutSet.from_cuts(cut_set)
 
 class LibriSpeechMixGenerator():
@@ -1053,7 +1151,7 @@ class LibriSpeechMixGenerator():
                 wav_dur = soundfile.info(wav).duration
                 wav_samples = soundfile.info(wav).frames
                 custom = {
-                    'speaker': speaker,
+                    'speaker_id': speaker,
                     'text': text,
                 }
                 cut_1spk = MonoCut(

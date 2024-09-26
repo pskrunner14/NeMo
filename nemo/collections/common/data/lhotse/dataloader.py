@@ -41,7 +41,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from nemo.collections.common.data.lhotse.cutset import guess_parse_cutset, read_cutset_from_config
 from nemo.collections.common.prompts.fn import get_prompt_format_fn
-from nemo.collections.asr.parts.utils.asr_multispeaker_utils import ConcatenationMeetingSimulator, MixMeetingSimulator, LibriSpeechMixGenerator
+from nemo.collections.asr.parts.utils.asr_multispeaker_utils import ConcatenationMeetingSimulator, MixMeetingSimulator, LibriSpeechMixGenerator, LibriSpeechMixSimulator
 from nemo.utils import logging
 
 
@@ -211,6 +211,14 @@ def get_lhotse_dataloader_from_config(
 
             skip_long_segments = simulator_config.get('skip_long_segments', False)
             valid_dataset_ids = simulator_config.get('valid_dataset_ids', [])
+            if simulator_config.get('manifest_filepath', None):
+                cfg_for_simulation = LhotseDataLoadingConfig()
+                cfg_for_simulation = OmegaConf.create(cfg_for_simulation)
+                cfg_for_simulation.manifest_filepath = simulator_config.manifest_filepath
+                cuts_for_simulation, _ = read_cutset_from_config(cfg_for_simulation)
+            else:
+                cuts_for_simulation = cuts
+
             if simulator_config.get('concat', False):
                 simulator = ConcatenationMeetingSimulator(
                     intra_session_concat_prob=simulator_config.intra_session_concat_prob,
@@ -220,10 +228,9 @@ def get_lhotse_dataloader_from_config(
                     max_num_speakers=simulator_config.max_num_speakers,
                     speaker_count_distribution=simulator_config.speaker_count_distribution,
                     skip_long_segments=skip_long_segments,
-                    valid_dataset_ids=valid_dataset_ids,
                 )
-
-                simulated_cuts += simulator.simulate(cuts, num_meetings=simulator_config.num_meetings, num_jobs=1, seed=global_rank*world_size+local_rank+seed)
+                
+                simulated_cuts += simulator.simulate(cuts_for_simulation, num_meetings=simulator_config.num_meetings, num_jobs=1, seed=global_rank*world_size+local_rank+seed)
 
             if simulator_config.get('mix', False):
                 simulator = MixMeetingSimulator(
@@ -233,13 +240,18 @@ def get_lhotse_dataloader_from_config(
                     max_duration=simulator_config.max_duration,
                     max_num_speakers=simulator_config.max_num_speakers,
                     speaker_count_distribution=simulator_config.speaker_count_distribution,
-                    valid_dataset_ids=valid_dataset_ids,
                 )
 
-                simulated_cuts += simulator.simulate(cuts, num_meetings=simulator_config.num_meetings, num_jobs=1, seed=global_rank*world_size+local_rank+seed)
+                simulated_cuts += simulator.simulate(cuts_for_simulation, num_meetings=simulator_config.num_meetings, num_jobs=1, seed=global_rank*world_size+local_rank+seed)
 
             if simulator_config.get('lsmix', False):
-                simulator = LibriSpeechMixSimulator()
+                simulator = LibriSpeechMixSimulator(
+                    data_type=simulator_config.ms_data_type,
+                    min_delay=0.5,
+                    max_num_speakers=simulator_config.max_num_speakers,
+                    speaker_count_distribution=simulator_config.speaker_count_distribution,
+                )
+                simulated_cuts += simulator.simulate(cuts_for_simulation, num_meetings=simulator_config.num_meetings, num_jobs=1, seed=global_rank*world_size+local_rank+seed)
 
         if config.including_real_data:
             cuts = CutSet.from_cuts(cuts + simulated_cuts)

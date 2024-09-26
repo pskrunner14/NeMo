@@ -75,6 +75,7 @@ class DiarizationConfig:
     eval_mode: bool = True
     no_der: bool = False
     use_new_pil: bool = False
+    feat_normalize: bool = False
     
     # General configs
     output_filename: Optional[str] = None
@@ -90,8 +91,8 @@ class DiarizationConfig:
     
     # Streaming diarization configs
     streaming_mode: bool = True # If True, streaming diarization will be used. For long-form audio, set mem_len=step_len
-    mem_len: int = 2000
-    step_len: int = 2000
+    mem_len: int = 100
+    step_len: int = 100
 
     # If `cuda` is a negative number, inference will be on CPU only.
     cuda: Optional[int] = None
@@ -341,7 +342,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
 
     if cfg.random_seed:
         pl.seed_everything(cfg.random_seed)
-
+        
     if cfg.model_path is None and cfg.pretrained_name is None:
         raise ValueError("Both cfg.model_path and cfg.pretrained_name cannot be None!")
     if cfg.audio_dir is None and cfg.dataset_manifest is None:
@@ -377,6 +378,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     diar_model._cfg.test_ds.session_len_sec = cfg.session_len_sec
     trainer = pl.Trainer(devices=device, accelerator=accelerator)
     diar_model.set_trainer(trainer)
+    # import ipdb; ipdb.set_trace()
     if cfg.eval_mode:
         diar_model = diar_model.eval()
     diar_model._cfg.test_ds.manifest_filepath = cfg.dataset_manifest
@@ -394,14 +396,17 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     # Save the list of tensors
     tensor_filename = os.path.basename(cfg.dataset_manifest).replace("manifest.", "").replace(".json", "")
     model_base_path = os.path.dirname(cfg.model_path)
-    tensor_path = f"{model_base_path}/pred_tensors/{tensor_filename}.pt"
-    if False:
-        logging.info(f"Loading the saved tensors from {tensor_path}...")
-        diar_model_preds_total_list = torch.load(tensor_path)
-    else:
-        diar_model.test_batch()
-        diar_model_preds_total_list = diar_model.preds_total_list
-        torch.save(diar_model_preds_total_list, tensor_path)
+    # tensor_path = f"{model_base_path}/pred_tensors/{tensor_filename}.pt"
+    # if False:
+    #     logging.info(f"Loading the saved tensors from {tensor_path}...")
+    #     diar_model_preds_total_list = torch.load(tensor_path)
+    # else:
+    # diar_model._cfg.preprocessor.normalize = "NA"
+    # diar_model._cfg.preprocessor.normalize = "NA"
+    # diar_model.preprocessor._cfg.normalize = "NA"
+    diar_model.test_batch()
+    diar_model_preds_total_list = diar_model.preds_total_list
+    # torch.save(diar_model_preds_total_list, tensor_path)
 
     # Evaluation
     vad_cfg = VadParams(opt_style='callhome_part1')

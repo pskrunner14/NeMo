@@ -23,6 +23,50 @@ from nemo.core.classes import Dataset
 from nemo.core.neural_types import AudioSignal, LengthsType, NeuralType, ProbsType
 import numpy as np
 
+
+def get_sample_frames(self, audio_signal, audio_signal_length, targets, target_lens, min_sample_duration, subsegment_check_frames, cfg, preprocessor):
+    audio_signal_sec = audio_signal.shape[1] / preprocessor._sample_rate
+    n_tries = 0
+    check_window = subsegment_check_frames
+    while True:
+        sample_duration_sec = min_sample_duration + random.random() * (audio_signal_sec - min_sample_duration)
+        sample_offset_sec = random.random() * (audio_signal_sec - sample_duration_sec)
+        sample_length = int(sample_duration_sec * preprocessor._sample_rate)
+        samples_per_frame = preprocessor._sample_rate * cfg.interpolated_scale / 2
+        sample_duration_frames = int(sample_length / samples_per_frame) + 1
+        sample_offset_frames = int(sample_offset_sec * 2 / cfg.interpolated_scale)
+        sample_offset = int(sample_offset_frames * samples_per_frame)
+        # check if subsegment is good
+        targets_from_offset = targets[:,sample_offset_frames:sample_offset_frames+check_window,:]
+        #logging.info(f"offset={sample_offset_frames} frames, targets from offset: {targets_from_offset}")
+        num_spks = torch.max(torch.sum(torch.max(targets_from_offset, dim=1).values, dim=1))
+        if num_spks > 1:
+            logging.info(f"subsegment has {num_spks} speakers in {check_window} starting frames, sampling once again")
+            pass
+        else:
+            if num_spks == 1 and torch.max(torch.sum(torch.max(targets_from_offset, dim=1).values, dim=1) - torch.sum(targets_from_offset[:,check_window-1,:],dim=1)) > 0:
+                logging.info("probably too short starting speaker's speech segment, sampling once again")
+                pass
+            else:
+                logging.info(f"subsegment has {num_spks} speakers in {check_window} starting frames, this is ok")
+                break
+        n_tries += 1
+        if n_tries == 50:
+            check_window -= 1
+            n_tries = 0
+            if check_window == 1:
+                sample_offset = 0
+                sample_length = audio_signal.shape[1]
+                sample_offset_frames = 0
+                sample_duration_frames = int(sample_length / samples_per_frame) + 1
+                break
+    audio_signal = audio_signal[:,sample_offset:sample_offset+sample_length]
+    audio_signal_length[:] = sample_length
+    targets = targets[:, sample_offset_frames:sample_offset_frames+sample_duration_frames, :]
+    return audio_signal, audio_signal_length, targets, target_lens 
+
+
+
 def get_subsegments_to_scale_timestamps(subsegments: List[Tuple[float, float]], feat_per_sec: int = 100, max_end_ts: float=None, decimals=2):
     """
     Convert subsegment timestamps to scale timestamps.

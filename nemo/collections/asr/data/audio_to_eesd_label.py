@@ -23,50 +23,6 @@ from nemo.core.classes import Dataset
 from nemo.core.neural_types import AudioSignal, LengthsType, NeuralType, ProbsType
 import numpy as np
 
-
-def get_sample_frames(self, audio_signal, audio_signal_length, targets, target_lens, min_sample_duration, subsegment_check_frames, cfg, preprocessor):
-    audio_signal_sec = audio_signal.shape[1] / preprocessor._sample_rate
-    n_tries = 0
-    check_window = subsegment_check_frames
-    while True:
-        sample_duration_sec = min_sample_duration + random.random() * (audio_signal_sec - min_sample_duration)
-        sample_offset_sec = random.random() * (audio_signal_sec - sample_duration_sec)
-        sample_length = int(sample_duration_sec * preprocessor._sample_rate)
-        samples_per_frame = preprocessor._sample_rate * cfg.interpolated_scale / 2
-        sample_duration_frames = int(sample_length / samples_per_frame) + 1
-        sample_offset_frames = int(sample_offset_sec * 2 / cfg.interpolated_scale)
-        sample_offset = int(sample_offset_frames * samples_per_frame)
-        # check if subsegment is good
-        targets_from_offset = targets[:,sample_offset_frames:sample_offset_frames+check_window,:]
-        #logging.info(f"offset={sample_offset_frames} frames, targets from offset: {targets_from_offset}")
-        num_spks = torch.max(torch.sum(torch.max(targets_from_offset, dim=1).values, dim=1))
-        if num_spks > 1:
-            logging.info(f"subsegment has {num_spks} speakers in {check_window} starting frames, sampling once again")
-            pass
-        else:
-            if num_spks == 1 and torch.max(torch.sum(torch.max(targets_from_offset, dim=1).values, dim=1) - torch.sum(targets_from_offset[:,check_window-1,:],dim=1)) > 0:
-                logging.info("probably too short starting speaker's speech segment, sampling once again")
-                pass
-            else:
-                logging.info(f"subsegment has {num_spks} speakers in {check_window} starting frames, this is ok")
-                break
-        n_tries += 1
-        if n_tries == 50:
-            check_window -= 1
-            n_tries = 0
-            if check_window == 1:
-                sample_offset = 0
-                sample_length = audio_signal.shape[1]
-                sample_offset_frames = 0
-                sample_duration_frames = int(sample_length / samples_per_frame) + 1
-                break
-    audio_signal = audio_signal[:,sample_offset:sample_offset+sample_length]
-    audio_signal_length[:] = sample_length
-    targets = targets[:, sample_offset_frames:sample_offset_frames+sample_duration_frames, :]
-    return audio_signal, audio_signal_length, targets, target_lens 
-
-
-
 def get_subsegments_to_scale_timestamps(subsegments: List[Tuple[float, float]], feat_per_sec: int = 100, max_end_ts: float=None, decimals=2):
     """
     Convert subsegment timestamps to scale timestamps.
@@ -168,33 +124,6 @@ def extract_seg_info_from_rttm(uniq_id, offset, duration, rttm_lines, mapping_di
         sess_to_global_spkids.update({speaker_set.index(speaker):speaker})
     rttm_mat = (stt_list, end_list, speaker_list)
     return rttm_mat, sess_to_global_spkids
-
-## copied from trainer dataloader
-def get_soft_label_vectors(
-    feat_level_target, 
-    duration, 
-    ms_seg_counts,
-    feat_per_sec,
-    seg_stride,
-    feat_per_segment,
-    max_spks,
-    ):
-    """
-    Generate the final targets for the actual diarization step.
-    """
-    soft_label_vec_list = []
-    stride = int(feat_per_sec * seg_stride)
-    for index in range(torch.max(ms_seg_counts)):
-        seg_stt_feat, seg_end_feat = (stride * index), (stride * index + feat_per_segment)
-        if seg_stt_feat < feat_level_target.shape[0]:
-            range_label_sum = torch.sum(feat_level_target[seg_stt_feat:seg_end_feat, :], axis=0)
-            soft_label_vec_list.append(range_label_sum)
-        else:
-            range_label_sum = torch.zeros(max_spks)
-            range_label_sum[0] = int(feat_per_segment) # Silence label should exist always
-            soft_label_vec_list.append(range_label_sum)
-    return soft_label_vec_list
-
 
 def get_frame_targets_from_rttm(
     rttm_timestamps: list, 

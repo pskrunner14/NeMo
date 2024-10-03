@@ -32,12 +32,11 @@ import random
 from nemo.collections.asr.parts.preprocessing.perturb import process_augmentations
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 from nemo.collections.asr.data.audio_to_eesd_label_lhotse import LhotseSpeechToDiarizationLabelDataset
-from nemo.collections.asr.data.audio_to_eesd_label import AudioToSpeechMSDDTrainDataset, get_sample_frames
+from nemo.collections.asr.data.audio_to_eesd_label import AudioToSpeechMSDDTrainDataset
 from nemo.collections.asr.metrics.multi_binary_acc import MultiBinaryAccuracy
 from nemo.collections.asr.models.asr_model import ExportableEncDecModel
 from nemo.collections.asr.models.label_models import EncDecSpeakerLabelModel
 from nemo.collections.asr.parts.preprocessing.features import WaveformFeaturizer
-from nemo.collections.asr.parts.utils.multiscale_utils import MultiScaleLayer
 
 from nemo.core.classes import ModelPT
 from nemo.core.classes.common import PretrainedModelInfo
@@ -145,7 +144,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         self.original_audio_offsets = {}
         self.eps = 1e-3
         self.emb_dim = self._cfg.diarizer_module.emb_dim
-        # self._init_frame_lengths() 
 
         if trainer is not None:
             self.loss = instantiate(self._cfg.loss)
@@ -175,11 +173,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         self.pil_weight = pil_weight/(pil_weight + ats_weight)
         self.ats_weight = ats_weight/(pil_weight + ats_weight)
         logging.info(f"Normalized weights for PIL {self.pil_weight} and ATS {self.ats_weight}")
-         
-    def _init_frame_lengths(self):
-        self.n_memory_frame = self.sortformer_diarizer.mem_len*self.n_feat_fr
-        self.n_step_frame = self.sortformer_diarizer.step_len*self.n_feat_fr
-        import ipdb; ipdb.set_trace()
         
     def _init_eval_metrics(self):
         self._accuracy_test = MultiBinaryAccuracy()
@@ -225,7 +218,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         logging.info("AAB: Starting Dataloader Instance loading... Step A")
         
         AudioToSpeechDiarTrainDataset = AudioToSpeechMSDDTrainDataset
-        # self._init_segmentation_info()
         
         preprocessor = EncDecSpeakerLabelModel.from_config_dict(self._cfg.preprocessor)
         dataset = AudioToSpeechDiarTrainDataset(
@@ -339,7 +331,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             emb_seq = self.encoder_proj(emb_seq)   
         return emb_seq, emb_seq_length
 
-    def forward_infer(self, emb_seq, streaming_mode=True, start_pos=0):
+    def forward_infer(self, emb_seq, start_pos=0):
         """
         The main forward pass for diarization inference.
 
@@ -396,11 +388,10 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         processed_signal, processed_signal_length = self.process_signal(audio_signal=audio_signal, audio_signal_length=audio_signal_length)
         processed_signal = processed_signal[:, :, :processed_signal_length.max()]
         if self.streaming_mode:
-            preds, encoder_states_list = self.forward_streaming_infer(processed_signal, streaming_mode=self.streaming_mode) 
+            preds, encoder_states_list = self.forward_streaming_infer(processed_signal)
         else:
             emb_seq, _ = self.frontend_encoder(processed_signal=processed_signal, processed_signal_length=processed_signal_length)
-            preds, encoder_states_list = self.forward_infer(emb_seq, streaming_mode=self.streaming_mode)
-            total_memory_list = []
+            preds, encoder_states_list = self.forward_infer(emb_seq)
         return preds, encoder_states_list
     
     def _streaming_feat_loader(self, feat_seq, chunk_n):
@@ -452,16 +443,16 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             chunk_pre_encoded, _ = self.encoder.pre_encode(x=chunk_feat_seq_t, lengths=feat_lengths)
             if step_idx == 0:
                 memory_buff = new_context_embs = chunk_pre_encoded
-                memory_buff = new_context_embs
             elif step_idx > 0:
                 chunk_pre_encoded, _ = self.encoder.pre_encode(x=chunk_feat_seq_t, lengths=feat_lengths)
                 new_context_embs = torch.cat([memory_buff, chunk_pre_encoded], dim=1)
                 chunk_emb_seq = chunk_pre_encoded
-               
+              
+            # Specify `pre_encode_input=True` to skip pre-encode layers  
             org_feat_lengths = torch.tensor(new_context_embs.shape[1]*self.n_feat_fr).repeat(new_context_embs.shape[0]).to(self.device)
             nest_embs, _ = self.frontend_encoder(processed_signal=new_context_embs, processed_signal_length=org_feat_lengths, pre_encode_input=True)
 
-            preds_mem_new, encoder_states_list = self.forward_infer(nest_embs, streaming_mode=streaming_mode)
+            preds_mem_new, encoder_states_list = self.forward_infer(nest_embs)
             if step_idx == 0:
                 total_pred_list.append(preds_mem_new)
             else:

@@ -31,3 +31,5 @@ from nemo.collections.asr.modules.transformer.transformer_generators import (
 )
 from nemo.collections.asr.modules.transformer.transformer_modules import AttentionBridge, TransformerEmbedding
 from nemo.collections.asr.modules.transformer.transformer_utils import get_nemo_transformer
+
+from nemo.collections.asr.modules.transformer.compressive_transformer_encoders import CompressiveTransformer

@@ -848,3 +848,137 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         total_count = torch.prod(torch.tensor(self._accuracy_test.targets.shape))
         simple_acc = num_correct / total_count
         return f1_score, simple_acc
+    
+
+class CompressiveSortformerEncLabelModel(SortformerEncLabelModel):
+    def __init__(self, cfg: DictConfig, trainer: Trainer = None):
+        super().__init__(cfg=cfg, trainer=trainer)
+        self.automatic_optimization = False
+        # self.split_size = self._cfg.truncated_bptt_steps
+        self.split_size = 100
+        self.compressive_transformer_encoder = CompressiveSortformerEncLabelModel.from_config_dict(self._cfg.compressive_transformer_encoder)
+
+    def split_batch(self, data, split_size):
+        """
+        data: B x T x D
+        """
+
+        splits = []
+        for t in range(0, data.shape[1], split_size):
+            data_split = data[:, t:t + split_size]
+            splits.append(data_split)    
+
+        return splits
+        
+    def forward(
+        self, 
+        audio_signal, 
+        audio_signal_length, 
+    ):
+        """
+        Forward pass for training.
+        
+        Args:
+            audio_signal (torch.Tensor): tensor containing audio waveform
+                Dimension: (batch_size, num_samples)
+            audio_signal_length (torch.Tensor): tensor containing lengths of audio waveforms
+                Dimension: (batch_size,)
+            
+        Returns:
+            preds (torch.Tensor): Sorted tensor containing predicted speaker labels
+                Dimension: (batch_size, max. diar frame count, num_speakers)
+            encoder_states_list (list): List containing total speaker memory for each step for debugging purposes
+                Dimension: [(batch_size, max. diar frame count, inner dim), ]
+        """
+        processed_signal, processed_signal_length = self.process_signal(audio_signal=audio_signal, audio_signal_length=audio_signal_length)
+        processed_signal = processed_signal[:, :, :processed_signal_length.max()]
+        emb_seq, _ = self.frontend_encoder(processed_signal=processed_signal, processed_signal_length=processed_signal_length)
+
+        preds, encoder_states_list = self.forward_infer(emb_seq, streaming_mode=self.streaming_mode)
+        return preds, encoder_states_list
+    
+    def get_stats(self, preds, targets_pil, targets_ats, target_lens, suffix=""):
+        self._reset_train_f1_accs()
+        preds_vad, preds_ovl, targets_vad, targets_ovl = self.compute_aux_f1(preds, targets_pil)
+        self._accuracy_train_vad(preds_vad, targets_vad, target_lens)
+        self._accuracy_train_ovl(preds_ovl, targets_ovl, target_lens)
+        train_f1_vad = self._accuracy_train_vad.compute()
+        train_f1_ovl = self._accuracy_train_ovl.compute()
+        self._accuracy_train(preds, targets_pil, target_lens)
+        f1_acc = self._accuracy_train.compute()
+        precision, recall = self._accuracy_train.compute_pr()
+
+        self.log('train_f1_acc' + suffix, f1_acc, sync_dist=True)
+        self.log('train_precision' + suffix, precision, sync_dist=True)
+        self.log('train_recall' + suffix, recall, sync_dist=True)
+        self.log('train_f1_vad_acc' + suffix, train_f1_vad, sync_dist=True)
+        self.log('train_f1_ovl_acc' + suffix, train_f1_ovl, sync_dist=True)
+
+        self._reset_train_f1_accs()
+        preds_vad, preds_ovl, targets_vad, targets_ovl = self.compute_aux_f1(preds, targets_ats)
+        self._accuracy_train_vad(preds_vad, targets_vad, target_lens)
+        self._accuracy_train_ovl(preds_ovl, targets_ovl, target_lens)
+        train_f1_vad = self._accuracy_train_vad.compute()
+        train_f1_ovl = self._accuracy_train_ovl.compute()
+        self._accuracy_train(preds, targets_ats, target_lens)
+        f1_acc = self._accuracy_train.compute()
+
+        self.log('train_f1_acc_ats' + suffix, f1_acc, sync_dist=True)
+        self.log('train_f1_vad_acc_ats' + suffix, train_f1_vad, sync_dist=True)
+        self.log('train_f1_ovl_acc_ats' + suffix, train_f1_ovl, sync_dist=True)
+        self._accuracy_train.reset()
+    
+    def training_step(self, batch: List, batch_idx: int):
+        opt = self.optimizers()
+
+        audio_signal, audio_signal_length, targets, target_lens = batch
+        # 0. get the targets 
+        targets_ats = self.sort_probs_and_labels(targets.clone(), discrete=False, accum_frames=self.sort_accum_frames)
+        
+        # 1. Forward fast-conformer
+        processed_signal, processed_signal_length = self.process_signal(audio_signal=audio_signal, audio_signal_length=audio_signal_length)
+        processed_signal = processed_signal[:, :, :processed_signal_length.max()] # B x D x T
+
+        # 2. Split the batch for truncated BPTT
+        #split_batches = zip(map(self.split_batch, [(emb_seq, self.split_size), (targets_ats, self.split_size), (targets, self.split_size)]))
+        processed_signal_splits = self.split_batch(processed_signal.transpose(1, 2), self.split_size*8)
+        processed_signal_splits = [x.transpose(1, 2) for x in processed_signal_splits]
+        targets_ats_splits = self.split_batch(targets_ats, self.split_size)
+        targets_splits = self.split_batch(targets, self.split_size)
+        split_batches = list(zip(processed_signal_splits, targets_ats_splits, targets_splits))
+        
+        memories, mask = None, None
+        total_preds = torch.empty(processed_signal.shape[0], 0, 4).to(processed_signal.device)
+        # 3. start the training loop for BPTT
+        grad_accum_every = len(targets_splits)
+        for i, split_batches in tqdm(enumerate(split_batches), total=len(split_batches), desc="BPTT loop", leave=False):
+            processed_signal_split, targets_ats_split, targets_split = split_batches
+            processed_signal_length_split = (torch.ones(processed_signal_split.shape[0], ).to(processed_signal_split.device) * processed_signal_split.shape[2]).int()
+            target_lens_split = (torch.ones(targets_ats.shape[0], 1).to(targets_ats.device) * targets_ats_split.shape[1]).int()
+            
+            # preds,  = self.forward(emb_seq_split, memories=memories, mask=mask)
+            emb_seq_split, _ = self.frontend_encoder(processed_signal=processed_signal_split, processed_signal_length=processed_signal_length_split)
+            trans_emb_seq, memories, aux_loss = self.compressive_transformer_encoder(emb_seq_split, memories=memories, mask=mask)
+            preds = self.sortformer_diarizer.forward_speaker_sigmoids(trans_emb_seq)
+            targets_pil_split = self.sort_targets_with_preds(targets_split.clone(), preds)
+            ats_loss = self.loss(probs=preds, labels=targets_ats_split, target_lens=target_lens_split)
+            pil_loss = self.loss(probs=preds, labels=targets_pil_split, target_lens=target_lens_split)
+            loss = self.ats_weight * ats_loss + self.pil_weight * pil_loss +0.1*aux_loss
+            # loss = pil_loss
+            self.log('loss', loss, sync_dist=True)
+            self.log('ats_loss', ats_loss, sync_dist=True)
+            self.log('pil_loss', pil_loss, sync_dist=True)
+            self.log('aux_loss', aux_loss, sync_dist=True)
+            self.log('learning_rate', self._optimizer.param_groups[0]['lr'], sync_dist=True)
+
+            self.get_stats(preds, targets_pil_split, targets_ats_split, target_lens_split, suffix="_split")
+            total_preds = torch.cat([total_preds, preds], dim=1)
+
+            opt.zero_grad()
+            self.manual_backward(loss / grad_accum_every)
+            opt.step()
+
+        targets_pil = self.sort_targets_with_preds(targets.clone(), total_preds)
+        self.get_stats(total_preds, targets_pil, targets_ats, target_lens, suffix="_total")
+
+        #self.clip_gradients(opt, gradient_clip_val=0.5, gradient_clip_algorithm="norm")

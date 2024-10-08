@@ -411,7 +411,7 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig, List[Hypothesis
                     )
                 total_duration += item["duration"]
 
-    with autocast(dtype=amp_dtype, enabled=cfg.amp):
+    with torch.amp.autocast('cuda' if torch.cuda.is_available() else 'cpu', dtype=amp_dtype, enabled=cfg.amp):
         with torch.no_grad():
             if cfg.calculate_rtfx:
                 start_time = time.time()

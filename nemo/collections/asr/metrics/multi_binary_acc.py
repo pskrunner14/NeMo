@@ -120,8 +120,7 @@ class MultiBinaryAccuracy(Metric):
         """
         Compute F1 score from the accumulated values. Return -1 if the F1 score is NaN.
         """
-        self.precision = self.true_positive_count / (self.true_positive_count + self.false_positive_count + self.eps)
-        self.recall = self.true_positive_count / (self.true_positive_count + self.false_negative_count + self.eps)
+        self.compute_pr()
         self.f1_score = (2 * self.precision * self.recall / (self.precision + self.recall + self.eps)).detach().clone()
         if torch.isnan(self.f1_score):
             logging.warn("self.f1_score contains NaN value. Returning -1 instead of NaN value.")
@@ -135,6 +134,3 @@ class MultiBinaryAccuracy(Metric):
         self.precision = self.true_positive_count / (self.true_positive_count + self.false_positive_count + self.eps)
         self.recall = self.true_positive_count / (self.true_positive_count + self.false_negative_count + self.eps)
         return self.precision, self.recall
-
-
-

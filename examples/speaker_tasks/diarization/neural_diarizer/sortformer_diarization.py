@@ -26,7 +26,7 @@ import pytorch_lightning as pl
 from omegaconf import OmegaConf
 from pytorch_lightning import seed_everything
 
-from nemo.collections.asr.models import SortformerEncLabelModel
+from nemo.collections.asr.models import SpkDiarEncLabelModel
 from nemo.core.config import hydra_runner
 from nemo.collections.asr.metrics.der import score_labels
 
@@ -369,12 +369,12 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         map_location = torch.device(f'cuda:{cfg.cuda}')
 
     if cfg.model_path.endswith(".ckpt"):
-        diar_model = SortformerEncLabelModel.load_from_checkpoint(checkpoint_path=cfg.model_path, map_location=map_location, strict=False)
+        diar_model = SpkDiarEncLabelModel.load_from_checkpoint(checkpoint_path=cfg.model_path, map_location=map_location, strict=False)
     elif cfg.model_path.endswith(".nemo"):
-        diar_model = SortformerEncLabelModel.restore_from(restore_path=cfg.model_path, map_location=map_location)
+        diar_model = SpkDiarEncLabelModel.restore_from(restore_path=cfg.model_path, map_location=map_location)
     else:
         raise ValueError("cfg.model_path must end with.ckpt or.nemo!")
-    diar_model._cfg.diarizer.out_dir = cfg.tensor_image_dir
+    # diar_model._cfg.diarizer.out_dir = cfg.tensor_image_dir
     diar_model._cfg.test_ds.session_len_sec = cfg.session_len_sec
     trainer = pl.Trainer(devices=device, accelerator=accelerator)
     diar_model.set_trainer(trainer)

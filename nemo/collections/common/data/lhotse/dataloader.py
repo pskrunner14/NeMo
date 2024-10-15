@@ -38,7 +38,7 @@ from lhotse.utils import fastcopy, fix_random_seed
 from omegaconf import DictConfig, OmegaConf
 
 from nemo.collections.common.data.lhotse.cutset import guess_parse_cutset, read_cutset_from_config
-from nemo.collections.asr.parts.utils.asr_multispeaker_utils import LibriSpeechMixGenerator
+from nemo.collections.asr.parts.utils.asr_multispeaker_utils import ConcatenationMeetingSimulator, MixMeetingSimulator, LibriSpeechMixGenerator, LibriSpeechMixSimulator
 from nemo.utils import logging
 
 
@@ -134,6 +134,10 @@ class LhotseDataLoadingConfig:
     # Note that this will not allow actual dataloading; it's only for manifest iteration as Lhotse objects.
     metadata_only: bool = False
 
+    # 6. Cut simulation for multi-speaker ASR
+    simulators: Any = None  # dict | None = None
+    including_real_data: bool = False
+
 
 def get_lhotse_dataloader_from_config(
     config: DictConfig,
@@ -141,6 +145,7 @@ def get_lhotse_dataloader_from_config(
     world_size: int,
     dataset: torch.utils.data.Dataset,
     tokenizer=None,
+    local_rank: int = 0,
 ) -> torch.utils.data.DataLoader:
     """
     Set up a Lhotse training dataloder.
@@ -175,10 +180,65 @@ def get_lhotse_dataloader_from_config(
 
     # 1. Load a manifest as a Lhotse CutSet.
     cuts, is_tarred = read_cutset_from_config(config)
+    if config.simulators is not None:
+        simulated_cuts = CutSet()
+        for simulator_name in config.simulators.keys():
+            simulator_config = config.simulators[simulator_name]
+
+            skip_long_segments = simulator_config.get('skip_long_segments', False)
+            valid_dataset_ids = simulator_config.get('valid_dataset_ids', [])
+            if simulator_config.get('manifest_filepath', None):
+                cfg_for_simulation = LhotseDataLoadingConfig()
+                cfg_for_simulation = OmegaConf.create(cfg_for_simulation)
+                cfg_for_simulation.manifest_filepath = simulator_config.manifest_filepath
+                cuts_for_simulation, _ = read_cutset_from_config(cfg_for_simulation)
+            else:
+                cuts_for_simulation = cuts
+
+            if simulator_config.get('concat', False):
+                simulator = ConcatenationMeetingSimulator(
+                    intra_session_concat_prob=simulator_config.intra_session_concat_prob,
+                    data_type=simulator_config.ms_data_type,
+                    min_duration=simulator_config.min_duration,
+                    max_duration=simulator_config.max_duration,
+                    max_num_speakers=simulator_config.max_num_speakers,
+                    speaker_count_distribution=simulator_config.speaker_count_distribution,
+                    skip_long_segments=skip_long_segments,
+                )
+                
+                simulated_cuts += simulator.simulate(cuts_for_simulation, num_meetings=simulator_config.num_meetings, num_jobs=1, seed=global_rank*world_size+local_rank+seed)
+
+            if simulator_config.get('mix', False):
+                simulator = MixMeetingSimulator(
+                    intra_session_mix_prob=simulator_config.intra_session_mix_prob,
+                    data_type=simulator_config.ms_data_type,
+                    min_duration=simulator_config.min_duration,
+                    max_duration=simulator_config.max_duration,
+                    max_num_speakers=simulator_config.max_num_speakers,
+                    speaker_count_distribution=simulator_config.speaker_count_distribution,
+                )
+
+                simulated_cuts += simulator.simulate(cuts_for_simulation, num_meetings=simulator_config.num_meetings, num_jobs=1, seed=global_rank*world_size+local_rank+seed)
+
+            if simulator_config.get('lsmix', False):
+                simulator = LibriSpeechMixSimulator(
+                    data_type=simulator_config.ms_data_type,
+                    min_delay=0.5,
+                    max_num_speakers=simulator_config.max_num_speakers,
+                    speaker_count_distribution=simulator_config.speaker_count_distribution,
+                )
+                simulated_cuts += simulator.simulate(cuts_for_simulation, num_meetings=simulator_config.num_meetings, num_jobs=1, seed=global_rank*world_size+local_rank+seed)
+
+        if config.including_real_data:
+            cuts = CutSet.from_cuts(cuts + simulated_cuts)
+        else:
+            cuts = simulated_cuts
 
     if hasattr(cuts[0], 'delays'):
         generator = LibriSpeechMixGenerator()
         cuts = generator.generate(cuts)
+
+    # import ipdb; ipdb.set_trace()
 
     # Apply channel selector
     if config.channel_selector is not None:
@@ -242,7 +302,7 @@ def get_lhotse_dataloader_from_config(
     # Duration filtering, same as native NeMo dataloaders.
     # We can filter after the augmentations because they are applied only when calling load_audio().
     cuts = cuts.filter(DurationFilter(config.min_duration, config.max_duration))
-
+    
     if config.use_multimodal_sampling:
         constraint = MultimodalSamplingConstraint(
             token_equivalent_duration=config.token_equivalent_duration,

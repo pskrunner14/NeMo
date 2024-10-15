@@ -71,7 +71,7 @@ class PromptedAudioToTextLhotseDataset(torch.utils.data.Dataset):
         else:
             prompts = None
             prompts_lens = None
-
+        
         return audio, audio_lens, prompts_with_answers, prompts_with_answers_lens, prompts, prompts_lens
 
 

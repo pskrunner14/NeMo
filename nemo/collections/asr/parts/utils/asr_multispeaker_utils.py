@@ -1011,6 +1011,128 @@ class MixMeetingSimulator():
 
         return CutSet.from_cuts(intra_mixtures + inter_mixtures)
 
+class LibriSpeechMixSimulator():
+
+    def __init__(
+        self,
+        data_type: str = "diar",
+        min_delay: float = 0.5,
+        max_num_speakers: int = 4,
+        speaker_count_distribution: List[float] = [0, 2, 3, 4],
+    ):
+        """
+        """
+        super().__init__()
+        self.data_type = data_type
+        self.min_delay = min_delay
+        self.max_num_speakers = max_num_speakers
+        self.speaker_count_distribution = speaker_count_distribution
+        assert len(speaker_count_distribution) == max_num_speakers, f"Length of speaker_count_distribution {len(speaker_count_distribution)} must be equal to max_num_speakers {max_num_speakers}"
+
+    def fit(self, cuts) -> CutSet:
+        self.speaker_id2cut_ids = defaultdict(list)
+        self.id2cuts = defaultdict(list)
+        for cut in tqdm(cuts, desc="Reading segments", ncols=100):
+            # if not hasattr(cut, 'dataset_id') or cut.dataset_id != 'librispeech':
+            #     continue
+            if hasattr(cuts[0], 'speaker_id'):
+                speaker_id = cut.speaker_id
+            else: #LibriSpeech
+                speaker_id = cut.recording_id.split('-')[0]
+                cut.speaker_id = speaker_id
+            self.speaker_id2cut_ids[speaker_id].append(cut.id)
+            self.id2cuts[cut.id] = cut
+        
+        self.speaker_ids = list(self.speaker_id2cut_ids.keys())
+
+    def _create_mixture(self, n_speakers: int) -> MixedCut:
+        sampled_speaker_ids = random.sample(self.speaker_ids, n_speakers)
+        tracks = []
+        offset = 0.0
+
+        for speaker_id in sampled_speaker_ids:
+            cut_id = random.choice(self.speaker_id2cut_ids[speaker_id])
+            cut = self.id2cuts[cut_id]
+            custom = {
+                    'pnc': 'no',
+                    'source_lang': 'en',
+                    'target_lang': 'en',
+                    'task': 'asr'
+                }
+            cut.custom.update(custom)
+            tracks.append(MixTrack(cut=deepcopy(cut), type=type(cut), offset=offset))
+            offset += random.uniform(self.min_delay, cut.duration)
+        
+        cut = MixedCut(id='lsmix_' + '_'.join([track.cut.id for track in tracks]), tracks=tracks)
+
+        if self.data_type == "msasr":
+            text = self.get_text(cut)
+            sup = SupervisionSegment(id=cut.id, recording_id=cut.id, start=0, duration=cut.duration, text=text)
+            cut.tracks[0].cut.supervisions.append(sup)
+
+        if self.data_type == "tsasr":
+            query_speaker_id = random.choice(sampled_speaker_ids)
+            query_audio_path = random.choice(self.speaker_id2cut_ids[query_speaker_id])
+            pass # TODO: need to implement the query audio path
+
+        if self.data_type == "diar":
+            pass # TODO: need to implement the diar data type
+
+        return cut
+    
+    # TODO: text is necessary for msasr and tsasr, but not for diar
+    def get_text(self, cut: MixedCut, speaker_token_style='<|spltoken*|>', speaker_token_position='sot') -> str:
+        text = ''
+        stt_words_spks = []
+        if speaker_token_position == 'word':
+            pass
+        elif speaker_token_position == 'segments':
+            pass
+        elif speaker_token_position == 'sot':
+            text = ''
+            for i, track in enumerate(cut.tracks):
+                cut = track.cut
+                text += speaker_token_style.replace('*', str(i)) + ' ' + cut.text + ' '
+
+        return text
+    
+    def apply_speaker_distribution(self, num_meetings: int, speaker_count_distribution) -> Dict[int, int]:
+        """
+        Balance the speaker distribution for the simulated meetings.
+        Args:
+            num_meetings: The total number of simulated meetings.
+            speaker_count_distribution: The speaker count distribution for the simulated meetings.
+        For each number of speakers, calculate the number of meetings needed to balance the distribution.
+        """
+
+        total_spk = sum(speaker_count_distribution)
+        num_speakers2num_meetings = {}
+        for i_spk in range(self.max_num_speakers):
+            num_speakers2num_meetings[i_spk+1] = round(num_meetings * speaker_count_distribution[i_spk] / total_spk)
+
+        return num_speakers2num_meetings
+            
+    def simulate(self, 
+        cuts: CutSet,
+        num_meetings: int = 10000,
+        seed: int = 0,
+        num_jobs: int = 1,
+    ) -> CutSet:
+        random.seed(seed)
+
+        self.fit(cuts)
+
+        self.num_speakers2num_meetings = self.apply_speaker_distribution(num_meetings, self.speaker_count_distribution)
+
+        cut_set = []
+        for n_speakers, n_mt in self.num_speakers2num_meetings.items():
+            if n_mt <= 0:
+                continue
+            for i in tqdm(range(n_mt), desc=f"Simulating {n_speakers}-speaker mixtures", ncols=128):
+                cut_set.append(self._create_mixture(n_speakers=n_speakers))
+
+        return CutSet.from_cuts(cut_set)
+
 class LibriSpeechMixGenerator():
     def __init__(self):
         pass

@@ -1076,7 +1076,11 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
         super().__init__(cfg)
         # Initialize the asr branch
-        self._init_asr_model()
+
+        #KD edit
+        if 'asr_model_path' in self.cfg and cfg.asr_model_path is not None:
+            self._init_asr_model()
+
         if 'diar_model_path' in self.cfg:
             self.diar = True
             # Initialize the speaker branch

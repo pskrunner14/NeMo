@@ -136,7 +136,7 @@ model:
   freeze_asr: true
   asr_model_path: null
   encoder:
-    _target_: nemo.collections.asr.modules.ConformerEncoderAdapter
+    _target_: nemo.collections.asr.modules.ConformerEncoder
     feat_in: ${model.preprocessor.features}
     feat_out: -1 # you may set it if you need different output size other than the default d_model
     n_layers: 24
@@ -300,7 +300,6 @@ model:
       hidden_act: relu
       pre_ln: true
       vocab_size: None  # Will be set by the model at runtime
-      adapter: true
 
   # Label Prediction Head (Token Classifier)
   head:

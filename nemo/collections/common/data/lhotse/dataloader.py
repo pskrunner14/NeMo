@@ -11,15 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import bisect
 import os
+import random
 import warnings
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Optional, TypeVar, Union
+from typing import Any, Optional, Sequence, TypeVar, Union
 
 import numpy as np
 import torch
-from lhotse import CutSet
+from lhotse import CutSet, RecordingSet
 from lhotse.cut import Cut
 from lhotse.cut.text import TextExample, TextPairExample
 from lhotse.dataset import (
@@ -27,15 +29,19 @@ from lhotse.dataset import (
     DynamicBucketingSampler,
     DynamicCutSampler,
     IterableDatasetWrapper,
+    ReverbWithImpulseResponse,
     make_worker_init_fn,
 )
 from lhotse.dataset.dataloading import resolve_seed
 from lhotse.dataset.sampling.base import SamplingConstraint, TimeConstraint, TokenConstraint
+from lhotse.dataset.sampling.dynamic_bucketing import FixedBucketBatchSizeConstraint
 from lhotse.lazy import LazyFlattener
 from lhotse.utils import fastcopy, fix_random_seed
 from omegaconf import DictConfig, OmegaConf
 
-from nemo.collections.common.data.lhotse.cutset import read_cutset_from_config
+from nemo.collections.common.data.lhotse.cutset import guess_parse_cutset, read_cutset_from_config
+# from nemo.collections.common.prompts.fn import get_prompt_format_fn
+from nemo.collections.asr.parts.utils.asr_multispeaker_utils import ConcatenationMeetingSimulator, MixMeetingSimulator, LibriSpeechMixGenerator, LibriSpeechMixSimulator
 from nemo.utils import logging
 
 
@@ -65,10 +71,12 @@ class LhotseDataLoadingConfig:
     quadratic_duration: float | None = None
     #   c. Lhotse bucketing.
     use_bucketing: bool = False
+    bucket_batch_size: list[int] | None = None
     num_buckets: int = 30
     num_cuts_for_bins_estimate: int = 10000
-    bucket_duration_bins: list[float] | None = None
+    bucket_duration_bins: Any = None  # list[float] | list[list[float]] | None = None
     bucket_buffer_size: int = 10000
+    concurrent_bucketing: bool = True  # fetches data in a background thread
     #   d. Other Lhotse sampling options.
     shuffle_buffer_size: int | None = 10000
     drop_last: bool = False
@@ -77,6 +85,8 @@ class LhotseDataLoadingConfig:
     cuda_expandable_segments: bool = True
 
     # 2.1 Multimodal sampling override options
+    pretokenize: bool = True  # should we apply tokenizer before data sampling
+    prompt_format: str | None = None  # when provided, we'll apply the prompt in addition to the tokenizer
     use_multimodal_sampling: bool = False
     token_equivalent_duration: float | None = None
     batch_tokens: int | None = None
@@ -91,10 +101,14 @@ class LhotseDataLoadingConfig:
     num_workers: int = 0
     pin_memory: bool = False
     channel_selector: int | str | None = None
+    min_tps: int = -1  # allowed tokens per second
+    max_tps: float = float("inf")
 
     # 4. Optional Lhotse data augmentation.
     #   a. On-the-fly noise/audio mixing.
-    noise_path: str | None = None
+    noise_path: Any | None = (
+        None  # str | dict where dict can have any of keys: manifest_filepath, tarred_audio_filepaths, cuts_path, shar_path
+    )
     noise_snr: tuple[float, float] = (10.0, 20.0)
     noise_mix_prob: float = 0.5
     #   b. On-the-fly 3-way speed perturbation.
@@ -113,18 +127,51 @@ class LhotseDataLoadingConfig:
     cut_into_windows_duration: Optional[float] = None  # set this to enable
     cut_into_windows_hop: Optional[float] = None
     #       III) common options
-    keep_excessive_supervisions: bool = True  # when a cut is truncated in the middle of a supervision, should we keep them.
+    keep_excessive_supervisions: bool = (
+        True  # when a cut is truncated in the middle of a supervision, should we keep them.
+    )
+    #   e. RIR augmentation (synthetic RIR if rir_path is None)
+    #   at the moment supports only Lhotse recording manifests, e.g. https://github.com/lhotse-speech/lhotse/blob/master/lhotse/recipes/rir_noise.py
+    rir_enabled: bool = False
+    rir_path: str | None = None  # str, must point to a lhotse RecordingSet manifest
+    rir_prob: float = 0.5
 
     # 5. Other Lhotse options.
     text_field: str = "text"  # key to read the transcript from
     lang_field: str = "lang"  # key to read the language tag from
     # Enables iteration of NeMo non-tarred manifests that don't have a "sampling_rate" key without performing any I/O.
     # Note that this will not allow actual dataloading; it's only for manifest iteration as Lhotse objects.
-    missing_sampling_rate_ok: bool = False
+    metadata_only: bool = False
+    # Forces the resulting CutSet to be finite, so that the iteration will end after a full single epoch.
+    # Do not turn this on unless you're sure that you know what you're doing.
+    # In most cases (such as regular multi-GPU training) it will result in a deadlock due to
+    # a different number of steps on different DDP ranks.
+    force_finite: bool = False
 
+    # 6. Cut simulation for multi-speaker ASR
+    simulators: Any = None  # dict | None = None
+    including_real_data: bool = False
+    # a. Concatentaion of cuts
+    # concat_simulation: bool = False
+    # mix_simulation: bool = False
+    # lsmix_simulation: bool = False # LibriSpeechMix
+    # including_real_data: bool = False
+    # intra_session_concat_prob:  Any = 0.5 # float | list[float] | None = 0.5
+    # ms_data_type: str = "msasr"
+    # min_duration: float = 30.0
+    # max_duration: float = 40.0
+    # max_num_speakers: int = 4
+    # num_meetings: int = 100000
+    # speaker_count_distribution: Any = None # list[float] [0, 2, 0.1, 4]
+    # skip_long_segments: bool = False
 
 def get_lhotse_dataloader_from_config(
-    config: DictConfig, global_rank: int, world_size: int, dataset: torch.utils.data.Dataset, tokenizer=None,
+    config: DictConfig,
+    global_rank: int,
+    world_size: int,
+    dataset: torch.utils.data.Dataset,
+    tokenizer=None,
+    local_rank: int = 0,
 ) -> torch.utils.data.DataLoader:
     """
     Set up a Lhotse training dataloder.
@@ -140,11 +187,9 @@ def get_lhotse_dataloader_from_config(
     For an example, see: :class:`nemo.collections.asr.data.audio_to_text_lhotse.LhotseSpeechToTextBpeDataset`,
     which is constructed from just a tokenizer and essentially loads and collates audio and tokenizes the transcript.
 
-    The ``tokenizer`` is used when text-only datasets are included in dataloading.
-    In these cases we will tokenize ``TextExample``s before sampling mini-batches so that
-    we can account for their number of tokens.
-    Note: this behaviour might eventually be extended to audio datasets too.
-
+    The ``tokenizer`` is used both for audio and text datasets for on-the-fly tokenization.
+    This allows us to stratify the bucketing by the count of input/output tokens (depending on modality).
+    If "prompt_format" is additionally provided in the config, we will also apply a prompt formatter.
     Note that ``tokenizer`` can be any tokenizer type (e.g. both SentencePiece and Aggregate tokenizers work).
     """
     logging.info("We will be using a Lhotse DataLoader.")
@@ -159,6 +204,63 @@ def get_lhotse_dataloader_from_config(
 
     # 1. Load a manifest as a Lhotse CutSet.
     cuts, is_tarred = read_cutset_from_config(config)
+    if config.simulators is not None:
+        simulated_cuts = CutSet()
+        for simulator_name in config.simulators.keys():
+            simulator_config = config.simulators[simulator_name]
+
+            skip_long_segments = simulator_config.get('skip_long_segments', False)
+            valid_dataset_ids = simulator_config.get('valid_dataset_ids', [])
+            if simulator_config.get('manifest_filepath', None):
+                cfg_for_simulation = LhotseDataLoadingConfig()
+                cfg_for_simulation = OmegaConf.create(cfg_for_simulation)
+                cfg_for_simulation.manifest_filepath = simulator_config.manifest_filepath
+                cuts_for_simulation, _ = read_cutset_from_config(cfg_for_simulation)
+            else:
+                cuts_for_simulation = cuts
+
+            if simulator_config.get('concat', False):
+                simulator = ConcatenationMeetingSimulator(
+                    intra_session_concat_prob=simulator_config.intra_session_concat_prob,
+                    data_type=simulator_config.ms_data_type,
+                    min_duration=simulator_config.min_duration,
+                    max_duration=simulator_config.max_duration,
+                    max_num_speakers=simulator_config.max_num_speakers,
+                    speaker_count_distribution=simulator_config.speaker_count_distribution,
+                    skip_long_segments=skip_long_segments,
+                )
+                
+                simulated_cuts += simulator.simulate(cuts_for_simulation, num_meetings=simulator_config.num_meetings, num_jobs=1, seed=global_rank*world_size+local_rank+seed)
+
+            if simulator_config.get('mix', False):
+                simulator = MixMeetingSimulator(
+                    intra_session_mix_prob=simulator_config.intra_session_mix_prob,
+                    data_type=simulator_config.ms_data_type,
+                    min_duration=simulator_config.min_duration,
+                    max_duration=simulator_config.max_duration,
+                    max_num_speakers=simulator_config.max_num_speakers,
+                    speaker_count_distribution=simulator_config.speaker_count_distribution,
+                )
+
+                simulated_cuts += simulator.simulate(cuts_for_simulation, num_meetings=simulator_config.num_meetings, num_jobs=1, seed=global_rank*world_size+local_rank+seed)
+
+            if simulator_config.get('lsmix', False):
+                simulator = LibriSpeechMixSimulator(
+                    data_type=simulator_config.ms_data_type,
+                    min_delay=0.5,
+                    max_num_speakers=simulator_config.max_num_speakers,
+                    speaker_count_distribution=simulator_config.speaker_count_distribution,
+                )
+                simulated_cuts += simulator.simulate(cuts_for_simulation, num_meetings=simulator_config.num_meetings, num_jobs=1, seed=global_rank*world_size+local_rank+seed)
+
+        if config.including_real_data:
+            cuts = CutSet.from_cuts(cuts + simulated_cuts)
+        else:
+            cuts = simulated_cuts
+
+    if hasattr(cuts[0], 'delays'):
+        generator = LibriSpeechMixGenerator()
+        cuts = generator.generate(cuts)
 
     # Apply channel selector
     if config.channel_selector is not None:
@@ -171,24 +273,34 @@ def get_lhotse_dataloader_from_config(
     # Expands cuts if multiple translations are provided.
     cuts = CutSet(LazyFlattener(cuts.map(_flatten_alt_text, apply_fn=None)))
 
-    if config.use_multimodal_sampling:
-        assert (
-            tokenizer is not None
-        ), "You must pass a tokenizer to `get_lhotse_dataloader_from_config` in order to read text-only datasets (enabled via use_multimodal_dataloading)"
+    if tokenizer is not None and config.pretokenize:
         from nemo.collections.asr.data.audio_to_text_lhotse import TokenizerWrapper
 
-        if not isinstance(tokenizer, TokenizerWrapper):
-            tokenizer = TokenizerWrapper(tokenizer)
-        # Note this code can also pre-tokenize the text in cuts, but for now we disable it with apply_fn.
-        cuts = cuts.map(partial(tokenize, tokenizer=tokenizer), apply_fn=is_text)
+        if not is_tarred:
+            logging.warning(
+                "You are using a non-tarred dataset and requested tokenization during data sampling (pretokenize=True). "
+                "This will cause the tokenization to happen in the main (GPU) process, possibly impacting the training speed "
+                "if your tokenizer is very large. If the impact is noticable, set pretokenize=False in dataloader config. "
+                "(note: that will disable token-per-second filtering and 2D bucketing features)"
+            )
+
+        if config.prompt_format is not None:
+            cuts = cuts.map(
+                partial(tokenize_with_prompt, tokenizer=tokenizer, prompt_format=config.prompt_format), apply_fn=None
+            )
+        else:
+            if not isinstance(tokenizer, TokenizerWrapper):
+                tokenizer = TokenizerWrapper(tokenizer)
+            cuts = cuts.map(partial(tokenize, tokenizer=tokenizer), apply_fn=None)
+        cuts = cuts.filter(TokenPerSecondFilter(config.min_tps, config.max_tps))
 
     # 2. Optional augmentations.
     # 2.a. Noise mixing.
     if config.noise_path is not None:
-        noise = CutSet.from_file(config.noise_path)
+        noise = guess_parse_cutset(config.noise_path)
         cuts = cuts.mix(
             cuts=noise,
-            snr=config.noise_snr,
+            snr=tuple(config.noise_snr),
             mix_prob=config.noise_mix_prob,
             seed=config.shard_seed,
             random_mix_offset=True,
@@ -199,7 +311,11 @@ def get_lhotse_dataloader_from_config(
     #    and applying it here (before sampler/dataset) ensures optimal
     #    bucket allocation.
     if config.perturb_speed:
-        cuts = CutSet.mux(cuts, cuts.perturb_speed(0.9), cuts.perturb_speed(1.1),)
+        cuts = CutSet.mux(
+            cuts,
+            cuts.perturb_speed(0.9),
+            cuts.perturb_speed(1.1),
+        )
 
     # 2.d: truncation/slicing
     if config.truncate_duration is not None:
@@ -214,24 +330,44 @@ def get_lhotse_dataloader_from_config(
             hop=config.cut_into_windows_hop,
             keep_excessive_supervisions=config.keep_excessive_supervisions,
         )
-
     # Duration filtering, same as native NeMo dataloaders.
     # We can filter after the augmentations because they are applied only when calling load_audio().
     cuts = cuts.filter(DurationFilter(config.min_duration, config.max_duration))
 
+    bucket_duration_bins = determine_bucket_duration_bins(config)
+
     if config.use_multimodal_sampling:
-        constraint = MultimodalSamplingConstraint(
-            token_equivalent_duration=config.token_equivalent_duration,
-            batch_size=config.batch_size,
-            batch_tokens=config.batch_tokens,
-            quadratic_factor=config.quadratic_factor,
-        )
+        if config.bucket_batch_size is not None:
+            assert (
+                bucket_duration_bins is not None
+            ), "Cannot use bucket_batch_size option if bucket_duration_bins are not provided."
+            constraint = MultimodalFixedBucketBatchSizeConstraint2D(
+                max_seq_len_buckets=bucket_duration_bins,
+                batch_sizes=config.bucket_batch_size,
+                token_equivalent_duration=config.token_equivalent_duration,
+            )
+        else:
+            constraint = MultimodalSamplingConstraint(
+                token_equivalent_duration=config.token_equivalent_duration,
+                batch_size=config.batch_size,
+                batch_tokens=config.batch_tokens,
+                quadratic_factor=config.quadratic_factor,
+            )
     else:
-        constraint = TimeConstraint(
-            max_cuts=config.batch_size,
-            max_duration=config.batch_duration,
-            quadratic_duration=config.quadratic_duration,
-        )
+        if config.bucket_batch_size is not None:
+            assert (
+                bucket_duration_bins is not None
+            ), "Cannot use bucket_batch_size option if bucket_duration_bins are not provided."
+            constraint = FixedBucketBatchSizeConstraint2D(
+                max_seq_len_buckets=bucket_duration_bins,
+                batch_sizes=config.bucket_batch_size,
+            )
+        else:
+            constraint = TimeConstraint(
+                max_cuts=config.batch_size,
+                max_duration=config.batch_duration,
+                quadratic_duration=config.quadratic_duration,
+            )
 
     # 3. The sampler.
     if config.use_bucketing:
@@ -243,6 +379,7 @@ def get_lhotse_dataloader_from_config(
             f"Creating a Lhotse DynamicBucketingSampler "
             f"(max_batch_duration={config.batch_duration} max_batch_size={config.batch_size})"
         )
+        # Determine the bucket duration bins
         sampler = DynamicBucketingSampler(
             cuts,
             constraint=constraint,
@@ -251,9 +388,10 @@ def get_lhotse_dataloader_from_config(
             shuffle_buffer_size=config.shuffle_buffer_size,
             seed=config.shard_seed,
             num_buckets=config.num_buckets,
-            duration_bins=config.bucket_duration_bins,
+            duration_bins=determine_bucket_duration_bins(config),
             num_cuts_for_bins_estimate=config.num_cuts_for_bins_estimate,
             buffer_size=config.bucket_buffer_size,
+            concurrent=config.concurrent_bucketing,
             rank=0 if is_tarred else global_rank,
             world_size=1 if is_tarred else world_size,
         )
@@ -285,12 +423,24 @@ def get_lhotse_dataloader_from_config(
         # object with texts joined by a whitespace so that "regular" dataset classes don't
         # have to add a special support for multi-supervision cuts.
         sampler = sampler.map(
-            CutConcatenate(gap=config.concatenate_gap_seconds, duration_factor=config.concatenate_duration_factor,)
+            CutConcatenate(
+                gap=config.concatenate_gap_seconds,
+                duration_factor=config.concatenate_duration_factor,
+            )
         )
         if config.db_norm is not None:
             sampler = sampler.map(partial(_normalize_loudness, db_norm=config.db_norm))
         if config.concatenate_merge_supervisions:
             sampler = sampler.map(_merge_supervisions)
+
+    if config.rir_enabled:
+        sampler = sampler.map(
+            ReverbWithImpulseResponse(
+                rir_recordings=RecordingSet.from_file(config.rir_path) if config.rir_path is not None else None,
+                p=config.rir_prob,
+                randgen=random.Random(seed),
+            )
+        )
 
     # 4. Creating dataloader.
     if is_tarred:
@@ -312,10 +462,41 @@ def get_lhotse_dataloader_from_config(
         # the meta-data to Dataset, which performs the actual I/O inside its __getitem__ method.
         dloader_kwargs = dict(dataset=dataset, sampler=sampler)
     dloader = torch.utils.data.DataLoader(
-        **dloader_kwargs, batch_size=None, num_workers=config.num_workers, pin_memory=config.pin_memory,
+        **dloader_kwargs,
+        batch_size=None,
+        num_workers=config.num_workers,
+        pin_memory=config.pin_memory,
     )
 
     return dloader
+
+
+def determine_bucket_duration_bins(config):
+    if config.bucket_duration_bins is not None:
+        # Bucket duration bins are provided: just use them.
+        ans = OmegaConf.to_container(config.bucket_duration_bins)
+        if isinstance(ans[0], Sequence):
+            # 2D bucketing. Ensure we're using tuples for correct behaviour of '<' operator
+            # between the bucket bin tuples and the output of measure_length.
+            ans = [tuple(item) for item in ans]
+        return ans
+    # Bucket duration bins are not set.
+    if config.use_multimodal_sampling:
+        # For multimodal sampling it's currently impossible to define a linspace over durations
+        # because the buckets are counted in the number of tokens.
+        # The bins will be auto-estimated by lhotse at the cost of a slight lag in the training start.
+        return None
+    elif config.max_duration is not None and config.max_duration < float("inf"):
+        # If max duration is provided, we can use that to compute uniformly distant bucket bins.
+        # This is not optimal but should be close enough for users who didn't want to estimate these up-front.
+        begin = config.min_duration if config.min_duration is not None and config.min_duration > 0 else 0.0
+        end = config.max_duration
+        return np.linspace(begin, end, config.num_buckets + 1)[1:-1].tolist()
+    else:
+        # If we don't know max_duration, we can't guess a reasonable estimate of the upper bound of
+        # durations.
+        # The bins will be auto-estimated by lhotse at the cost of a slight lag in the training start.
+        return None
 
 
 def make_structured_with_schema_warnings(config: DictConfig) -> DictConfig:
@@ -363,7 +544,9 @@ class MultimodalSamplingConstraint(SamplingConstraint):
 
     def __post_init__(self):
         self._internal = TokenConstraint(
-            max_tokens=self.batch_tokens, max_examples=self.batch_size, quadratic_length=self.quadratic_factor,
+            max_tokens=self.batch_tokens,
+            max_examples=self.batch_size,
+            quadratic_length=self.quadratic_factor,
         )
 
     def add(self, example: Any) -> None:
@@ -389,6 +572,61 @@ class MultimodalSamplingConstraint(SamplingConstraint):
         raise RuntimeError(f"Unsupported example type: {type(example)}")
 
 
+@dataclass
+class FixedBucketBatchSizeConstraint2D(FixedBucketBatchSizeConstraint):
+    @property
+    def bucketing_2d_enabled(self) -> bool:
+        return isinstance(self.max_seq_len_buckets[0], Sequence) and len(self.max_seq_len_buckets[0]) == 2
+
+    def measure_length(self, example: Any) -> tuple[float, float]:
+        if self.bucketing_2d_enabled:
+            return example.duration, _measure_tokens(example)
+        else:
+            return example.duration
+
+    def select_bucket(self, buckets: Any, example: Any = None, example_len: Any = None) -> int:
+        if not self.bucketing_2d_enabled:
+            return super().select_bucket(buckets=buckets, example=example, example_len=example_len)
+        if example_len is None:
+            example_len = self.measure_length(example)
+        bucket_idx = bisect.bisect_right(buckets, example_len)
+        # For 2D bucketing we have to refine the initially found bucket_idx, as bisect
+        # looks primarily at the first index of a tuple (i.e. duration).
+        # For example, with buckets [(1, 1), (1, 2), (2, 2), (2, 4)] and example (1.5, 3)
+        # bisect would allocate it to bucket_idx=2 instead of bucket_idx=3.
+        # To refine, we'll try to push the example to as many buckets to the right as possible,
+        # as long as they have the same dim0 length (e.g. audio duration) and the example's dim1
+        # is smaller than the bin's dim1 (e.g., output token sequence length).
+        bin_dim0, bin_dim1 = self.max_seq_len_buckets[bucket_idx]
+        num_buckets = len(self.max_seq_len_buckets)
+        while (
+            (next_idx := bucket_idx + 1) < num_buckets  # There is a next bucket
+            and (bin := self.max_seq_len_buckets[next_idx])[0] == bin_dim0  # The next bucket has the same 1st dim.
+            # The example's 2nd dim is between that of the current and the next bucket; or,
+            # the next bucket's 2nd dim is still smaller than example.
+            and (bin_dim1 < example_len[1] <= bin[1] or bin[1] < example_len[1])
+        ):
+            bucket_idx = next_idx
+            bin_dim0, bin_dim1 = self.max_seq_len_buckets[bucket_idx]
+        return bucket_idx
+
+
+@dataclass
+class MultimodalFixedBucketBatchSizeConstraint2D(FixedBucketBatchSizeConstraint2D):
+    token_equivalent_duration: float | None = None
+
+    def measure_length(self, example: Any) -> float:
+        assert not self.bucketing_2d_enabled, "2D bucketing for multimodal sampling is not yet supported."
+        if hasattr(example, "num_tokens"):
+            return example.num_tokens
+        if isinstance(example, Cut):
+            assert (
+                self.token_equivalent_duration is not None
+            ), "Cannot use MultimodalFixedBucketBatchSizeConstraint with speech data when token_equivalent_duration was not specified."
+            return example.duration / self.token_equivalent_duration
+        raise RuntimeError(f"Unsupported example type: {type(example)}")
+
+
 def is_text(example) -> bool:
     return isinstance(example, (TextExample, TextPairExample))
 
@@ -399,7 +637,8 @@ Example = TypeVar("Example", bound=Union[Cut, TextExample, TextPairExample])
 def tokenize(example: Example, tokenizer) -> Example:
     if isinstance(example, Cut):
         for s in example.supervisions:
-            s.tokens = np.asarray(tokenizer(s.text, s.language))
+            if s.text is not None:
+                s.tokens = np.asarray(tokenizer(s.text, s.language))
     elif isinstance(example, TextExample):
         example.tokens = np.asarray(tokenizer(example.text, example.language))
     elif isinstance(example, TextPairExample):
@@ -407,6 +646,23 @@ def tokenize(example: Example, tokenizer) -> Example:
         example.target.tokens = np.asarray(tokenizer(example.source.text, example.target.language))
     else:
         raise RuntimeError(f"Unsupported type of example: {type(example)}")
+    return example
+
+
+def tokenize_with_prompt(example: Example, tokenizer, prompt_format: str) -> Example:
+    # TODO(pzelasko): This mechanism makes it possible to measure the actual output sequence length
+    #   for prompted models such as AED MultiTask (Canary), which includes the transcript and the prompt.
+    #   We intend to extend it for text modality in follow-up work.
+    if isinstance(example, Cut):
+        prompt_format_fn = get_prompt_format_fn(prompt_format)
+        (tokenized_prompted_transcript,), (tokenized_prompt,), (tokenized_transcript,) = prompt_format_fn(
+            CutSet([example]), tokenizer
+        )
+        example.tokenized_prompted_transcript = tokenized_prompted_transcript
+        example.tokenized_prompt = tokenized_prompt
+        example.tokenized_transcript = tokenized_transcript
+    else:
+        raise RuntimeError(f"Currently we only support tokenization + prompting during sampling for audio modality.")
     return example
 
 
@@ -430,6 +686,41 @@ class DurationFilter:
             return True  # does not apply to text etc.
 
 
+class TokenPerSecondFilter:
+    """
+    Callable, returns ``True`` if a cut's num_tokens (sum of len(tokens) for each supervision)
+    is in range [tps_min, tps_max] and ``False`` otherwise.
+    """
+
+    def __init__(self, tps_min: float, tps_max: float) -> None:
+        assert tps_min <= tps_max
+        self.tps_min = tps_min
+        self.tps_max = tps_max
+        self.enabled = tps_min > 0 or tps_max < float("inf")
+
+    def __call__(self, example) -> bool:
+        if not isinstance(example, Cut) or not self.enabled:
+            return True  # pass-through for non-audio examples.
+        tps = _measure_tps(example)
+        return self.tps_min <= tps <= self.tps_max
+
+
+def _measure_tokens(cut: Cut) -> int:
+    if hasattr(cut, "tokenized_prompted_transcript"):
+        return len(cut.tokenized_prompted_transcript)  # tokenized with prompt formatter
+    supervisions_with_tokens = [s for s in cut.supervisions if hasattr(s, "tokens")]
+    assert len(supervisions_with_tokens) > 0, (
+        "Cannot measure tokens-per-second with untokenized supervisions. "
+        "Did you forget to provide the tokenizer argument to get_lhotse_dataloader_from_config() method?"
+    )
+    return sum(len(s.tokens) for s in supervisions_with_tokens)
+
+
+def _measure_tps(cut: Cut) -> float:
+    num_tokens = _measure_tokens(cut)
+    return num_tokens / cut.duration
+
+
 def _normalize_loudness(cuts: CutSet, db_norm: float) -> CutSet:
     return cuts.normalize_loudness(target=db_norm, mix_first=False)
 
@@ -440,7 +731,7 @@ def _merge_supervisions(cuts: CutSet) -> CutSet:
 
 def _flatten_alt_text(cut) -> list:
     ans = [cut]
-    if not isinstance(cut, Cut) or cut.custom is None or cut.custom.get("alt_text") is None:
+    if not isinstance(cut, Cut) or not hasattr(cut, 'custom') or cut.custom.get("alt_text") is None:
         return ans
     cut = cut.move_to_memory(audio_format="wav")  # performs I/O once and holds audio in memory from now on
     # Popping to ease eyesight on debug.
@@ -473,7 +764,13 @@ def maybe_set_cuda_expandable_segments(enabled: bool):
             warnings.warn(
                 "You have set PYTORCH_CUDA_ALLOC_CONF without expandable_segments:True option. We're setting that option anyway. To disable it, set cuda_expandable_segments=False in NeMo dataloader configuration."
             )
-        torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+
+        try:
+            torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+        except RuntimeError:
+            logging.info(
+                "Failed to set expandable_segments:True for PyTorch CUDA allocator. You may get training speed improvements if you enable this"
+            )
 
 
 def _select_channel(cut, channel_selector: int | str) -> list:

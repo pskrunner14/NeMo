@@ -854,9 +854,11 @@ class CompressiveSortformerEncLabelModel(SortformerEncLabelModel):
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
         super().__init__(cfg=cfg, trainer=trainer)
         self.automatic_optimization = False
-        # self.split_size = self._cfg.truncated_bptt_steps
-        self.split_size = 100
-        self.compressive_transformer_encoder = CompressiveSortformerEncLabelModel.from_config_dict(self._cfg.compressive_transformer_encoder)
+        self.split_size = self._cfg.step_size        
+        self.truncated_bptt_size = self._cfg.truncated_bptt_steps
+        self.compressive_transformer_encoder = CompressiveSortformerEncLabelModel.from_config_dict(cfg.compressive_transformer_encoder)
+        pretrained_sortformer_model = SortformerEncLabelModel.restore_from('/home/weiqingw/workspace/projects/diasr/clean_diarization_compressive_sortformer/im303a-ft7_epoch6-19.nemo', map_location="cpu")
+        self.encoder.load_state_dict(pretrained_sortformer_model.encoder.state_dict(), strict=True)
 
     def split_batch(self, data, split_size):
         """
@@ -897,6 +899,7 @@ class CompressiveSortformerEncLabelModel(SortformerEncLabelModel):
         preds, encoder_states_list = self.forward_infer(emb_seq, streaming_mode=self.streaming_mode)
         return preds, encoder_states_list
     
+    @torch.no_grad()
     def get_stats(self, preds, targets_pil, targets_ats, target_lens, suffix=""):
         self._reset_train_f1_accs()
         preds_vad, preds_ovl, targets_vad, targets_ovl = self.compute_aux_f1(preds, targets_pil)
@@ -934,51 +937,233 @@ class CompressiveSortformerEncLabelModel(SortformerEncLabelModel):
         audio_signal, audio_signal_length, targets, target_lens = batch
         # 0. get the targets 
         targets_ats = self.sort_probs_and_labels(targets.clone(), discrete=False, accum_frames=self.sort_accum_frames)
-        
-        # 1. Forward fast-conformer
-        processed_signal, processed_signal_length = self.process_signal(audio_signal=audio_signal, audio_signal_length=audio_signal_length)
-        processed_signal = processed_signal[:, :, :processed_signal_length.max()] # B x D x T
 
-        # 2. Split the batch for truncated BPTT
-        #split_batches = zip(map(self.split_batch, [(emb_seq, self.split_size), (targets_ats, self.split_size), (targets, self.split_size)]))
-        processed_signal_splits = self.split_batch(processed_signal.transpose(1, 2), self.split_size*8)
-        processed_signal_splits = [x.transpose(1, 2) for x in processed_signal_splits]
+        # 1. Split the batch for truncated BPTT
+        audio_signal_splits = self.split_batch(audio_signal, self.split_size*8*160)
         targets_ats_splits = self.split_batch(targets_ats, self.split_size)
         targets_splits = self.split_batch(targets, self.split_size)
-        split_batches = list(zip(processed_signal_splits, targets_ats_splits, targets_splits))
-        
+        split_batches = list(zip(audio_signal_splits, targets_ats_splits, targets_splits))[:-1]
+                
         memories, mask = None, None
-        total_preds = torch.empty(processed_signal.shape[0], 0, 4).to(processed_signal.device)
-        # 3. start the training loop for BPTT
-        grad_accum_every = len(targets_splits)
-        for i, split_batches in tqdm(enumerate(split_batches), total=len(split_batches), desc="BPTT loop", leave=False):
-            processed_signal_split, targets_ats_split, targets_split = split_batches
-            processed_signal_length_split = (torch.ones(processed_signal_split.shape[0], ).to(processed_signal_split.device) * processed_signal_split.shape[2]).int()
+        # total_preds = torch.empty(processed_signal.shape[0], 0, 2).to(processed_signal.device)
+        # 2. start the training loop for BPTT
+        grad_accum_every = len(split_batches)
+        losses = []
+        for i, split_batches in tqdm(enumerate(split_batches), total=len(split_batches), desc="BPTT loop, lr %.8lf" % opt.param_groups[0]['lr'], leave=False):
+            audio_signal_splits, targets_ats_split, targets_split = split_batches
+            audio_signal_length_split = (torch.ones(audio_signal_splits.shape[0], ).to(audio_signal_splits.device) * audio_signal_splits.shape[1]).int()
+            processed_signal_split, processed_signal_length_split = self.process_signal(audio_signal=audio_signal_splits, audio_signal_length=audio_signal_length_split)
+            processed_signal_length_split -= 1
+            processed_signal_split = processed_signal_split[:, :, :processed_signal_length_split.max()] # B x D x T
             target_lens_split = (torch.ones(targets_ats.shape[0], 1).to(targets_ats.device) * targets_ats_split.shape[1]).int()
             
             # preds,  = self.forward(emb_seq_split, memories=memories, mask=mask)
             emb_seq_split, _ = self.frontend_encoder(processed_signal=processed_signal_split, processed_signal_length=processed_signal_length_split)
-            trans_emb_seq, memories, aux_loss = self.compressive_transformer_encoder(emb_seq_split, memories=memories, mask=mask)
+            trans_emb_seq, memories = self.compressive_transformer_encoder(encoder_states=emb_seq_split, encoder_targets=targets_ats_split, encoder_mask=mask, encoder_mems_list=memories, return_mems=True)
             preds = self.sortformer_diarizer.forward_speaker_sigmoids(trans_emb_seq)
             targets_pil_split = self.sort_targets_with_preds(targets_split.clone(), preds)
             ats_loss = self.loss(probs=preds, labels=targets_ats_split, target_lens=target_lens_split)
             pil_loss = self.loss(probs=preds, labels=targets_pil_split, target_lens=target_lens_split)
-            loss = self.ats_weight * ats_loss + self.pil_weight * pil_loss +0.1*aux_loss
-            # loss = pil_loss
+            loss = self.ats_weight * ats_loss + self.pil_weight * pil_loss # + 0.1*aux_loss
+            losses.append(loss)
+
+            if (i+1) % self.truncated_bptt_size == 0 or i == grad_accum_every - 1:
+                opt.zero_grad()
+                losses = torch.mean(torch.stack(losses))
+                self.manual_backward(losses)
+                opt.step()
+
+                sch = self.lr_schedulers()
+                sch.step()
+                losses = []
+            # loss = ats_loss
             self.log('loss', loss, sync_dist=True)
             self.log('ats_loss', ats_loss, sync_dist=True)
             self.log('pil_loss', pil_loss, sync_dist=True)
-            self.log('aux_loss', aux_loss, sync_dist=True)
+            # self.log('aux_loss', aux_loss, sync_dist=True)
             self.log('learning_rate', self._optimizer.param_groups[0]['lr'], sync_dist=True)
 
             self.get_stats(preds, targets_pil_split, targets_ats_split, target_lens_split, suffix="_split")
+            # total_preds = torch.cat([total_preds, preds], dim=1)
+
+            # opt.zero_grad()
+            # self.manual_backward(loss / grad_accum_every)
+            # opt.step()
+
+            # sch = self.lr_schedulers()
+            # sch.step()
+        # return {'loss': loss / grad_accum_every}
+        # targets_pil = self.sort_targets_with_preds(targets.clone(), total_preds)
+        # self.get_stats(total_preds, targets_pil, targets_ats, target_lens, suffix="_total")
+
+        # self.clip_gradients(opt, gradient_clip_val=0.5, gradient_clip_algorithm="norm")
+
+    def validation_step(self, batch: list, batch_idx: int, dataloader_idx: int = 0):
+        audio_signal, audio_signal_length, targets, target_lens = batch
+        targets_ats = self.sort_probs_and_labels(targets.clone(), discrete=False, accum_frames=self.sort_accum_frames)
+
+        # 1. Split the batch for truncated BPTT
+        audio_signal_splits = self.split_batch(audio_signal, self.split_size*8*160)
+        targets_ats_splits = self.split_batch(targets_ats, self.split_size)
+        split_batches = list(zip(audio_signal_splits, targets_ats_splits))[:-1]
+        
+        memories, mask = None, None
+        loss, ats_loss, pil_loss, f1_acc, precision, recall, valid_f1_vad, valid_f1_ovl, f1_acc_ats, valid_f1_ovl_ats = 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        total_preds = torch.empty(audio_signal.shape[0], 0, 4).to(audio_signal.device)
+        # 3. start the training loop for BPTT
+        for i, sbatch in tqdm(enumerate(split_batches), total=len(split_batches), desc="BPTT loop", leave=False):
+            audio_signal_splits, targets_split = sbatch
+            audio_signal_length_split = (torch.ones(audio_signal_splits.shape[0], ).to(audio_signal_splits.device) * audio_signal_splits.shape[1]).int()
+            processed_signal_split, processed_signal_length_split = self.process_signal(audio_signal=audio_signal_splits, audio_signal_length=audio_signal_length_split)
+            processed_signal_length_split -= 1
+            processed_signal_split = processed_signal_split[:, :, :processed_signal_length_split.max()] # B x D x T
+            target_lens = (torch.ones(targets_split.shape[0], 1).to(targets_split.device) * targets_split.shape[1]).int()
+            
+            emb_seq_split, _ = self.frontend_encoder(processed_signal=processed_signal_split, processed_signal_length=processed_signal_length_split)
+            encoder_mask = self.length_to_mask(emb_seq_split)
+            trans_emb_seq, memories = self.compressive_transformer_encoder(encoder_states=emb_seq_split, encoder_targets=targets_split, encoder_mask=mask, encoder_mems_list=memories, return_mems=True)
+            preds = self.sortformer_diarizer.forward_speaker_sigmoids(trans_emb_seq)
+
+            torch.save(preds, 'test/preds%d.pt'%i)
+            torch.save(targets_split, 'test/targets%d.pt'%i)
+
             total_preds = torch.cat([total_preds, preds], dim=1)
+            # preds = total_preds
 
-            opt.zero_grad()
-            self.manual_backward(loss / grad_accum_every)
-            opt.step()
+            # Arrival-time sorted (ATS) targets
+            targets_ats = targets_split
+            # Optimally permuted targets for Permutation-Invariant Loss (PIL)
+            if self.use_new_pil:
+                targets_pil = self.sort_targets_with_preds_new(targets=targets_split.clone(), preds=preds, target_lens=target_lens)
+            else:
+                targets_pil = self.sort_targets_with_preds(targets_split.clone(), preds)
 
-        targets_pil = self.sort_targets_with_preds(targets.clone(), total_preds)
-        self.get_stats(total_preds, targets_pil, targets_ats, target_lens, suffix="_total")
+            ats_loss += self.loss(probs=preds, labels=targets_ats, target_lens=target_lens)
+            pil_loss += self.loss(probs=preds, labels=targets_pil, target_lens=target_lens)
+            loss += self.ats_weight * ats_loss + self.pil_weight * pil_loss
 
-        #self.clip_gradients(opt, gradient_clip_val=0.5, gradient_clip_algorithm="norm")
+            self._reset_valid_f1_accs()
+            preds_vad, preds_ovl, targets_vad, targets_ovl = self.compute_aux_f1(preds, targets_pil)
+            self._accuracy_valid_vad(preds_vad, targets_vad, target_lens)
+            valid_f1_vad += self._accuracy_valid_vad.compute()
+            self._accuracy_valid_ovl(preds_ovl, targets_ovl, target_lens)
+            valid_f1_ovl += self._accuracy_valid_ovl.compute()
+            self._accuracy_valid(preds, targets_pil, target_lens)
+            f1_acc += self._accuracy_valid.compute()
+            tprecision, trecall = self._accuracy_valid.compute_pr()
+            precision += tprecision
+            recall += trecall
+
+            self._reset_valid_f1_accs()
+            preds_vad, preds_ovl, targets_vad, targets_ovl = self.compute_aux_f1(preds, targets_ats)
+            self._accuracy_valid_vad(preds_vad, targets_vad, target_lens)
+            self._accuracy_valid_ovl(preds_ovl, targets_ovl, target_lens)
+            valid_f1_ovl_ats += self._accuracy_valid_ovl.compute()
+            self._accuracy_valid(preds, targets_ats, target_lens)
+            f1_acc_ats += self._accuracy_valid.compute()
+
+        n = len(targets_ats_splits)
+        metrics = {
+            'val_loss': loss/n,
+            'val_ats_loss': ats_loss/n,
+            'val_pil_loss': pil_loss/n,
+            'val_f1_acc': f1_acc/n,
+            'val_precision': precision/n,
+            'val_recall': recall/n,
+            'val_f1_vad_acc': valid_f1_vad/n,
+            'val_f1_ovl_acc': valid_f1_ovl/n,
+            'val_f1_acc_ats': f1_acc_ats/n,
+            'val_f1_ovl_acc_ats': valid_f1_ovl_ats/n
+        }
+
+        if isinstance(self.trainer.val_dataloaders, list) and len(self.trainer.val_dataloaders) > 1:
+            self.validation_step_outputs[dataloader_idx].append(metrics)
+        else:
+            self.validation_step_outputs.append(metrics)
+        return metrics
+    
+    def test_batch(self,):
+        self.preds_total_list, self.batch_f1_accs_list, self.batch_precision_list, self.batch_recall_list = [], [], [], []
+        self.batch_f1_accs_ats_list, self.batch_precision_ats_list, self.batch_recall_ats_list = [], [], []
+
+        with torch.no_grad():
+            
+            for batch_idx, batch in enumerate(tqdm(self._test_dl)):
+                audio_signal, audio_signal_length, targets, target_lens = batch
+                audio_signal = audio_signal.to(self.device)
+                audio_signal_length = audio_signal_length.to(self.device)
+                targets_ats = self.sort_probs_and_labels(targets.clone(), discrete=False, accum_frames=self.sort_accum_frames)
+
+                audio_signal_splits = self.split_batch(audio_signal, self.split_size*8*160)
+                targets_ats_splits = self.split_batch(targets_ats, self.split_size)
+                split_batches = list(zip(audio_signal_splits, targets_ats_splits))[:-1]
+
+                memories, mask, preds = None, None, None
+                total_preds = torch.empty(audio_signal.shape[0], 0, 4).to(audio_signal.device)
+                # 2. start the training loop for BPTT
+                for i, split_batches in tqdm(enumerate(split_batches), total=len(split_batches), desc="BPTT loop", leave=False):
+                    audio_signal_splits, targets_ats_split = split_batches
+                    audio_signal_length_split = (torch.ones(audio_signal_splits.shape[0], ).to(audio_signal_splits.device) * audio_signal_splits.shape[1]).int()
+                    processed_signal_split, processed_signal_length_split = self.process_signal(audio_signal=audio_signal_splits, audio_signal_length=audio_signal_length_split)
+                    processed_signal_length_split -= 1
+                    processed_signal_split = processed_signal_split[:, :, :processed_signal_length_split.max()] # B x D x T
+                    targets_ats_split = targets_ats_split.to(audio_signal_splits.device)
+                    target_lens_split = (torch.ones(targets_ats.shape[0], 1).to(targets_ats.device) * targets_ats_split.shape[1]).int()
+                    
+                    emb_seq_split, _ = self.frontend_encoder(processed_signal=processed_signal_split, processed_signal_length=processed_signal_length_split)
+                    if i == 0:
+                        trans_emb_seq, memories = self.compressive_transformer_encoder(encoder_states=emb_seq_split, encoder_targets=targets_ats_split, encoder_mask=mask, encoder_mems_list=memories, return_mems=True)
+                    else:
+                        trans_emb_seq, memories = self.compressive_transformer_encoder(encoder_states=emb_seq_split, encoder_targets=preds, encoder_mask=mask, encoder_mems_list=memories, return_mems=True)
+
+                    preds = self.sortformer_diarizer.forward_speaker_sigmoids(trans_emb_seq)
+
+                    total_preds = torch.cat([total_preds, preds], dim=1)
+
+                    preds = (preds > 0.5).float()
+                preds = total_preds
+                torch.save(preds, 'test/preds_infer_%d.pt'%batch_idx)
+                torch.save(targets_ats, 'test/targets_infer_%d.pt'%batch_idx)
+                # preds, encoder_states_list = self.forward(
+                #     audio_signal=audio_signal,
+                #     audio_signal_length=audio_signal_length,
+                # )
+                targets = targets[:, :preds.shape[1]]
+                preds = preds.detach().to('cpu')
+                if preds.shape[0] == 1: # Batch size = 1
+                    self.preds_total_list.append(preds)
+                else:
+                    self.preds_total_list.extend(torch.split(preds, [1] * preds.shape[0]))
+                torch.cuda.empty_cache()
+                # Batch-wise evaluation: Arrival-time sorted (ATS) targets
+                targets_ats = self.sort_probs_and_labels(targets.clone(), discrete=False, accum_frames=self.sort_accum_frames)
+                # Optimally permuted targets for Permutation-Invariant Loss (PIL)
+                if self.use_new_pil:
+                    targets_pil = self.sort_targets_with_preds_new(targets.clone(), preds, target_lens)
+                else:
+                    targets_pil = self.sort_targets_with_preds(targets.clone(), preds)
+                preds_vad, preds_ovl, targets_vad, targets_ovl = self.compute_aux_f1(preds, targets_pil)
+                self._accuracy_valid(preds, targets_pil, target_lens)
+                f1_acc = self._accuracy_valid.compute()
+                precision, recall = self._accuracy_valid.compute_pr()
+                self.batch_f1_accs_list.append(f1_acc)
+                self.batch_precision_list.append(precision)
+                self.batch_recall_list.append(recall)
+                logging.info(f"batch {batch_idx}: f1_acc={f1_acc}, precision={precision}, recall={recall}")
+
+                self._reset_valid_f1_accs()
+                self._accuracy_valid(preds, targets_ats, target_lens)
+                f1_acc = self._accuracy_valid.compute()
+                precision, recall = self._accuracy_valid.compute_pr()
+                self.batch_f1_accs_ats_list.append(f1_acc)
+                self.batch_precision_ats_list.append(precision)
+                self.batch_recall_ats_list.append(recall)
+                logging.info(f"batch {batch_idx}: f1_acc_ats={f1_acc}, precision_ats={precision}, recall_ats={recall}")
+                
+        logging.info(f"Batch F1Acc. MEAN: {torch.mean(torch.tensor(self.batch_f1_accs_list))}")
+        logging.info(f"Batch Precision MEAN: {torch.mean(torch.tensor(self.batch_precision_list))}")
+        logging.info(f"Batch Recall MEAN: {torch.mean(torch.tensor(self.batch_recall_list))}")
+        logging.info(f"Batch ATS F1Acc. MEAN: {torch.mean(torch.tensor(self.batch_f1_accs_ats_list))}")
+        logging.info(f"Batch ATS Precision MEAN: {torch.mean(torch.tensor(self.batch_precision_ats_list))}")
+        logging.info(f"Batch ATS Recall MEAN: {torch.mean(torch.tensor(self.batch_recall_ats_list))}")
+    

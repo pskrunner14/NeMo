@@ -1142,21 +1142,21 @@ class LibriSpeechMixGenerator():
         pass
 
     def generate(self, cuts):
+        import ipdb; ipdb.set_trace()
         cut_set = []
         for cut in tqdm(cuts):
             offsets = cut.delays
             durations = cut.durations
             wavs = cut.wavs
-            texts = cut.texts
+            # texts = cut.texts
             speakers = cut.speakers
 
             tracks = []
-            for i, (offset, duration, wav, text, speaker) in enumerate(zip(offsets, durations, wavs, texts, speakers)):
+            for i, (offset, duration, wav, speaker) in enumerate(zip(offsets, durations, wavs, speakers)):
                 wav_dur = soundfile.info(wav).duration
                 wav_samples = soundfile.info(wav).frames
                 custom = {
                     'speaker_id': speaker,
-                    'text': text,
                 }
                 cut_1spk = MonoCut(
                     id=wav.split('/')[-1].replace('.wav', ''),

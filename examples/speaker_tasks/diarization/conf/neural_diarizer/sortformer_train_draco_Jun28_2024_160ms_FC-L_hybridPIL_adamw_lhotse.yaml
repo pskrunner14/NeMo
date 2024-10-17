@@ -23,26 +23,27 @@ model:
         multiscale_weights: [1] # Weight for each scale. should be null (for single scale) or a list matched with window/shift scale count. ex) [0.33,0.33,0.33]
         save_embeddings: True # Save embeddings as pickle file for each audio input.
 
-  use_new_pil: False
-  pil_noise_level: 0.0 #add random noise of [0, pil_noise_level*min_permutation_loss) to loss values when looking for the optimal permutation
-  min_sample_duration: -1 #if > 0, will cut a random subsegment of [min_sample_duration, session_len_sec] seconds for each training batch
-  subsegment_check_frames: 5 #if use subsegmenting, will use this number of starting frames to ensure that the subsegment is good (no multiple speakers and no short segments)
-  sort_accum_frames: 1
-  sort_preds: False
+  # use_new_pil: False
+  # pil_noise_level: 0.0 #add random noise of [0, pil_noise_level*min_permutation_loss) to loss values when looking for the optimal permutation
+  # min_sample_duration: -1 #if > 0, will cut a random subsegment of [min_sample_duration, session_len_sec] seconds for each training batch
+  # subsegment_check_frames: 5 #if use subsegmenting, will use this number of starting frames to ensure that the subsegment is good (no multiple speakers and no short segments)
+  # sort_accum_frames: 1
+  # sort_preds: False
   pil_weight: 0.5
   ats_weight: 0.5
-  use_raw_encoder: True
-  use_raw_encoder_only: True
-  multi_scale_method: 'only_interpolate' # 'mean', 'attention', 'only_interpolate'
-  streaming_mode: False
-  use_positional_embedding: True
-  use_roformer: False
-  alpha: 0.5 # mix ratio between final pred and skip pred connections
-  sort_layer_on: pre # pre, post, False
-  sort_bin_order: False
+  # use_raw_encoder: True
+  # use_raw_encoder_only: True
+  # multi_scale_method: 'only_interpolate' # 'mean', 'attention', 'only_interpolate'
+  # streaming_mode: False
+  # use_positional_embedding: True
+  # use_roformer: False
+  # alpha: 0.5 # mix ratio between final pred and skip pred connections
+  # sort_layer_on: pre # pre, post, False
+  # sort_bin_order: False
   num_workers: ${num_workers}
-  heads: 8
-  inner: 768
+  # heads: 8
+  # inner: 768
+  d_model: 512
   max_num_of_spks: 4 # Number of speakers per model. This is currently fixed at 6.
   scale_n: 3 # Number of scales for MSDD model and initializing clustering.
   interpolated_scale: 0.16 # The length of the interpolated scale
@@ -51,14 +52,14 @@ model:
   soft_targets: False
   freeze_speaker_model: True # If True, speaker model is frozen and only MSDD module is trained.
   random_flip: True
-  restore_from: null
-  global_loss_ratio: 0 # Ratio of global loss weight against speaker loss weight
-  num_classes: 5000 
-  layer_arrival_time_sort: True
-  add_pil_loss: True # If True, adds permutation invariant loss to the loss function.
-  pil_loss_thres: 0.0 # Threshold for permutation invariant loss.
-  train_f1_acc_window_length: 25
-  train_f1_acc_thres_pil_shift: 0.0
+  # restore_from: null
+  # global_loss_ratio: 0 # Ratio of global loss weight against speaker loss weight
+  # num_classes: 5000 
+  # layer_arrival_time_sort: True
+  # add_pil_loss: True # If True, adds permutation invariant loss to the loss function.
+  # pil_loss_thres: 0.0 # Threshold for permutation invariant loss.
+  # train_f1_acc_window_length: 25
+  # train_f1_acc_thres_pil_shift: 0.0
 
   train_ds:
     manifest_filepath: ???
@@ -148,23 +149,24 @@ model:
     _target_: nemo.collections.asr.modules.sortformer_diarizer.SortformerDiarizer
     num_spks: ${model.max_num_of_spks} # Number of speakers per model. This is currently fixed at 2.
     hidden_size: 192 # Hidden layer size for linear layers in MSDD module
-    num_lstm_layers: 3 # Number of stacked LSTM layers
+    # num_lstm_layers: 3 # Number of stacked LSTM layers
     dropout_rate: 0.5 # Dropout rate
-    cnn_output_ch: 32 # Number of filters in a conv-net layer.
-    conv_repeat: 2 # Determins the number of conv-net layers. Should be greater or equal to 1.
+    # cnn_output_ch: 32 # Number of filters in a conv-net layer.
+    # conv_repeat: 2 # Determins the number of conv-net layers. Should be greater or equal to 1.
+    d_model: ${model.d_model}
     emb_dim: 192 # Dimension of the speaker embedding vectors
-    scale_n: ${model.scale_n} # Number of scales for multiscale segmentation input
-    weighting_scheme: 'attn_scale_weight' # Type of weighting algorithm. Options: ('conv_scale_weight', 'attn_scale_weight')
-    context_vector_type: 'cos_sim' # Type of context vector: options. Options: ('cos_sim', 'elem_prod')
-    use_amsl_layer: True
-    sort_final_layer_on: False
+    # scale_n: ${model.scale_n} # Number of scales for multiscale segmentation input
+    # weighting_scheme: 'attn_scale_weight' # Type of weighting algorithm. Options: ('conv_scale_weight', 'attn_scale_weight')
+    # context_vector_type: 'cos_sim' # Type of context vector: options. Options: ('cos_sim', 'elem_prod')
+    # use_amsl_layer: True
+    # sort_final_layer_on: False
 
   encoder:
     _target_: nemo.collections.asr.modules.ConformerEncoder
     feat_in: ${model.preprocessor.features}
     feat_out: -1
     n_layers: 18
-    d_model: 512
+    d_model: ${model.d_model}
 
     # Sub-sampling parameters
     subsampling: dw_striding # vggnet, striding, stacking or stacking_norm, dw_striding
@@ -208,32 +210,12 @@ model:
     hidden_size: 192
     max_sequence_length: 10000
 
-  sortformer_encoder:
-    _target_: nemo.collections.asr.modules.transformer.sortformer_encoders.SortformerEncoder
-    num_layers: 0
-    use_roformer: ${model.use_roformer} # Uses roformer (transformer+RoPE) instead of Sort-layer included sortformer
-    hidden_size: 192 # Needs to be multiple of num_attention_heads
-    inner_size: ${model.inner}
-    num_attention_heads: ${model.heads}
-    attn_score_dropout: 0.5
-    attn_layer_dropout: 0.5
-    ffn_dropout: 0.5
-    hidden_act: relu
-    pre_ln: False
-    pre_ln_final_layer_norm: True
-    unit_dim: 5
-    sort_layer_on: ${model.sort_layer_on}
-    sort_layer_type: "parallel"
-    seq_var_sort: False
-    sort_bin_order: ${model.sort_bin_order}
-    num_classes: ${model.max_num_of_spks}
-
   transformer_encoder:
     _target_: nemo.collections.asr.modules.transformer.transformer_encoders.TransformerEncoder
     num_layers: 18
     hidden_size: 192 # Needs to be multiple of num_attention_heads
-    inner_size: ${model.inner}
-    num_attention_heads: ${model.heads}
+    inner_size: 768
+    num_attention_heads: 8
     attn_score_dropout: 0.5
     attn_layer_dropout: 0.5
     ffn_dropout: 0.5
@@ -241,13 +223,13 @@ model:
     pre_ln: False
     pre_ln_final_layer_norm: True
   
-  speaker_decoder:
-    _target_: nemo.collections.asr.modules.SpeakerDecoder
-    feat_in: 3072
-    num_classes: 5000
-    pool_mode: 'attention'
-    emb_sizes: 192
-    angular: True
+  # speaker_decoder:
+  #   _target_: nemo.collections.asr.modules.SpeakerDecoder
+  #   feat_in: 3072
+  #   num_classes: 5000
+  #   pool_mode: 'attention'
+  #   emb_sizes: 192
+  #   angular: True
 
   loss: 
     _target_: nemo.collections.asr.losses.bce_loss.BCELoss
@@ -257,17 +239,6 @@ model:
     sorted_loss: False # If True, labels are sorted to make first-come first-serve order.
     sorted_preds: False # If True, labels are sorted to make first-come first-serve order.
     class_normalization: False # If True, loss is normalized by the quantity of each class.
-
-  affinity_loss: 
-    _target_: nemo.collections.asr.losses.affinity_loss.AffinityLoss
-    gamma: 0.0
-    negative_margin: 0.5
-    positive_margin: 0.05
-
-  global_loss:
-    _target_: nemo.collections.asr.losses.angularloss.AngularSoftmaxLoss # you could also use cross-entrophy loss
-    scale: 30
-    margin: 0.1
 
   lr: 0.0001
   optim:

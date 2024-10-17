@@ -29,31 +29,16 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from pyannote.core import Annotation, Segment
 from pyannote.metrics import detection
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import ParameterGrid
 from tqdm import tqdm
-
-# from nemo.collections.asr.models import EncDecClassificationModel, EncDecFrameClassificationModel
-from nemo.collections.asr.models.classification_models import (
-    ClassificationInferConfig,
-    EncDecClassificationModel,
-    EncDecFrameClassificationModel,
-)
+from nemo.collections.asr.parts.utils.speaker_utils import timestamps_to_pyannote_object
+from nemo.collections.asr.models import EncDecClassificationModel, EncDecFrameClassificationModel
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
 from nemo.utils import logging
-
-try:
-    from torch.cuda.amp import autocast
-except ImportError:
-    from contextlib import contextmanager
-
-    @contextmanager
-    def autocast(enabled=None):
-        yield
-
 
 """
 This file contains all the utility functions required for voice activity detection. 
@@ -593,7 +578,7 @@ def filtering(speech_segments: torch.Tensor, per_args: Dict[str, float]) -> torc
     """
     if speech_segments.shape == torch.Size([0]):
         return speech_segments
-
+    
     min_duration_on = per_args.get('min_duration_on', 0.0)
     min_duration_off = per_args.get('min_duration_off', 0.0)
     filter_speech_first = per_args.get('filter_speech_first', 1.0)
@@ -1134,7 +1119,7 @@ def generate_vad_frame_pred(
     status = get_vad_stream_status(data)
     for i, test_batch in enumerate(tqdm(vad_model.test_dataloader(), total=len(vad_model.test_dataloader()))):
         test_batch = [x.to(vad_model.device) for x in test_batch]
-        with autocast():
+        with torch.amp.autocast(vad_model.device.type):
             if use_feat:
                 log_probs = vad_model(processed_signal=test_batch[0], processed_signal_length=test_batch[1])
             else:
@@ -1726,3 +1711,49 @@ def frame_vad_eval_detection_error(
     auroc = roc_auc_score(y_true=all_labels, y_score=all_probs)
     report = metric.report(display=False)
     return auroc, report
+
+
+def ts_vad_post_processing(
+    ts_vad_binary_vec: torch.Tensor, 
+    cfg_vad_params: OmegaConf, 
+    unit_10ms_frame_count: int=8, 
+    bypass_postprocessing: bool = False
+    ):
+    """
+    Post-processing on diarization results using VAD style post-processing methods.
+    These post-processing methods are inspired by the following paper:
+    Medennikov, Ivan, et al. "Target-Speaker Voice Activity Detection: a Novel Approach for Multi-Speaker Diarization in a Dinner Party Scenario." (2020). 
+
+    Args:
+        ts_vad_binary_vec (Tensor): 
+            Sigmoid values of each frame and each speaker.
+            Dimension: (num_frames,)
+        cfg_vad_params (OmegaConf): 
+            Configuration (omega config) of VAD parameters.
+        unit_10ms_frame_count (int, optional): 
+            an integer indicating the number of 10ms frames in a unit.
+            For example, if unit_10ms_frame_count is 8, then each frame is 0.08 seconds.
+        bypass_postprocessing (bool, optional): 
+            If True, diarization post-processing will be bypassed.
+
+    Returns:
+        speech_segments (Tensor): 
+            start and end of each speech segment.
+            Dimension: (num_segments, 2)
+            
+            Example: 
+                tensor([[  0.0000,   3.0400],
+                        [  6.0000,   6.0800],
+                        ...
+                        [587.3600, 591.0400],
+                        [591.1200, 597.7600]])
+    """
+    ts_vad_binary_frames = torch.repeat_interleave(ts_vad_binary_vec, unit_10ms_frame_count)
+    if not bypass_postprocessing:
+        speech_segments = binarization(ts_vad_binary_frames, cfg_vad_params)
+        speech_segments = filtering(speech_segments, cfg_vad_params)
+    else:
+        cfg_vad_params.onset=0.5
+        cfg_vad_params.offset=0.5
+        speech_segments = binarization(ts_vad_binary_frames, cfg_vad_params)
+    return speech_segments

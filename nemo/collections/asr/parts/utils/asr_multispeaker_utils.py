@@ -59,9 +59,19 @@ def find_first_nonzero(mat: torch.Tensor, max_cap_val=-1, thres:float = 0.5) -> 
     mask_max_indices[mask_max_values == 0] = max_cap_val
     return mask_max_indices
 
-def find_best_permutation(match_score, speaker_permutations):
+def find_best_permutation(match_score: torch.Tensor, speaker_permutations: torch.Tensor) -> torch.Tensor:
     """
     Finds the best permutation indices based on the match score.
+
+    Args:
+        match_score (torch.Tensor): A tensor containing the match scores for each permutation.
+            Shape: (batch_size, num_permutations)
+        speaker_permutations (torch.Tensor): A tensor containing all possible speaker permutations.
+            Shape: (num_permutations, num_speakers)
+
+    Returns:
+        torch.Tensor: A tensor containing the best permutation indices for each batch.
+            Shape: (batch_size, num_speakers)
     """
     batch_best_perm = torch.argmax(match_score, axis=1)
     rep_speaker_permutations = speaker_permutations.repeat(batch_best_perm.shape[0], 1)
@@ -69,42 +79,97 @@ def find_best_permutation(match_score, speaker_permutations):
     global_inds_vec = torch.arange(0, perm_size * batch_best_perm.shape[0], perm_size).to(batch_best_perm.device) + batch_best_perm
     return rep_speaker_permutations[global_inds_vec.to(rep_speaker_permutations.device), :]
 
-def reconstruct_labels(labels: torch.Tensor, batch_perm_inds:torch.Tensor) -> torch.Tensor:
+def reconstruct_labels(labels: torch.Tensor, batch_perm_inds: torch.Tensor) -> torch.Tensor:
     """
-    Reconstructs the labels using the best permutation indices.
-    """
-    return torch.vstack([labels[k, :, batch_perm_inds[k]].unsqueeze(0) for k in range(batch_perm_inds.shape[0])])
+    Reconstructs the labels using the best permutation indices with matrix operations.
 
-def get_ats_targets(labels, preds, speaker_permutations, thres: float=0.5, tolerance: float=0):
-    """
-    Sorts labels and predictions to get optimal of all arrival-time ordered permutations
-    """
-    nonzero_ind = find_first_nonzero(mat=labels, max_cap_val=labels.shape[1], thres=thres)
-    sorted_values = torch.sort(nonzero_ind)[0] #indices of first speech frame for arrival-time ordered permutation (batch_size, max_num_of_spks)
+    Args:
+        labels (torch.Tensor): A tensor containing the original labels.
+            Shape: (batch_size, num_frames, num_speakers)
+        batch_perm_inds (torch.Tensor): A tensor containing the best permutation indices for each batch.
+            Shape: (batch_size, num_speakers)
 
-    perm_size = speaker_permutations.shape[0]
-    permed_labels = labels[:, :, speaker_permutations] #all possible permutations of discrete labels (batch_size, num_frames, perm_size, max_num_of_spks)
-    permed_nonzero_ind = find_first_nonzero(mat=permed_labels, max_cap_val=labels.shape[1]) #indices of first speech frame for all permutations (batch_size, perm_size, max_num_of_spks)
-    perm_compare = torch.abs(sorted_values.unsqueeze(1) - permed_nonzero_ind) <= tolerance #comparison with first speech frame indices of the ATS permutation (batch_size, perm_size, max_num_of_spks)
-    perm_mask = torch.all(perm_compare, dim=2).float() #binary mask for all permutation, 1 means permutation is arrival-time ordered (batch_size, perm_size)
-
-    preds_rep = torch.unsqueeze(preds, 2).repeat(1, 1, perm_size, 1)
-    match_score = torch.sum(permed_labels * preds_rep, axis=1).sum(axis=2) * perm_mask
-    batch_perm_inds = find_best_permutation(match_score, speaker_permutations)
-    max_score_permed_labels = reconstruct_labels(labels, batch_perm_inds)
-    return max_score_permed_labels
-
-def get_pil_targets(labels, preds, speaker_permutations):
+    Returns:
+        torch.Tensor: A tensor containing the reconstructed labels using the best permutation indices.
+            Shape: (batch_size, num_frames, num_speakers)
     """
-    Sorts labels and predictions to get optimal permutation
+    # Expanding batch_perm_inds to align with labels dimensions
+    batch_size, num_frames, num_speakers = labels.shape
+    batch_perm_inds_exp = batch_perm_inds.unsqueeze(1).expand(-1, num_frames, -1)
+
+    # Reconstructing the labels using advanced indexing
+    reconstructed_labels = torch.gather(labels, 2, batch_perm_inds_exp)
+    return reconstructed_labels
+
+def get_ats_targets(
+    labels: torch.Tensor, 
+    preds: torch.Tensor, 
+    speaker_permutations: torch.Tensor, 
+    thres: float = 0.5, 
+    tolerance: float = 0
+) -> torch.Tensor:
     """
-    perm_size = speaker_permutations.shape[0]
-    permed_labels = labels[:, :, speaker_permutations]
-    preds_rep = torch.unsqueeze(preds, 2).repeat(1,1, speaker_permutations.shape[0],1)
-    match_score = torch.sum(permed_labels * preds_rep, axis=1).sum(axis=2)
-    batch_perm_inds = find_best_permutation(match_score, speaker_permutations)
-    max_score_permed_labels = reconstruct_labels(labels, batch_perm_inds)
-    return max_score_permed_labels
+    Sorts labels and predictions to get the optimal of all arrival-time ordered permutations.
+
+    Args:
+        labels (torch.Tensor): A tensor containing the original labels.
+            Shape: (batch_size, num_frames, num_speakers)
+        preds (torch.Tensor): A tensor containing the predictions.
+            Shape: (batch_size, num_frames, num_speakers)
+        speaker_permutations (torch.Tensor): A tensor containing all possible speaker permutations.
+            Shape: (num_permutations, num_speakers)
+        thres (float): The threshold value for discretizing the matrix values. Default is 0.5.
+        tolerance (float): The tolerance for comparing the first speech frame indices. Default is 0.
+
+    Returns:
+        torch.Tensor: A tensor containing the reconstructed labels using the best permutation indices.
+            Shape: (batch_size, num_frames, num_speakers)
+    """
+    # Find the first nonzero frame index for each speaker in each batch
+    nonzero_ind = find_first_nonzero(mat=labels, max_cap_val=labels.shape[1], thres=thres)  # (batch_size, num_speakers)
+    
+    # Sort the first nonzero frame indices for arrival-time ordering
+    sorted_values = torch.sort(nonzero_ind)[0]  # (batch_size, num_speakers)
+    perm_size = speaker_permutations.shape[0]  # Scalar value (num_permutations)
+    permed_labels = labels[:, :, speaker_permutations]  # (batch_size, num_frames, num_permutations, num_speakers)
+    permed_nonzero_ind = find_first_nonzero(mat=permed_labels, max_cap_val=labels.shape[1])  # (batch_size, num_permutations, num_speakers)
+
+    # Compare the first frame indices of sorted labels with those of the permuted labels using tolerance
+    perm_compare = torch.abs(sorted_values.unsqueeze(1) - permed_nonzero_ind) <= tolerance  # (batch_size, num_permutations, num_speakers)
+    perm_mask = torch.all(perm_compare, dim=2).float()  # (batch_size, num_permutations)
+    preds_rep = torch.unsqueeze(preds, 2).repeat(1, 1, perm_size, 1)  # Exapnd the preds: (batch_size, num_frames, num_permutations, num_speakers)
+
+    # Compute the match score for each permutation by comparing permuted labels with preds
+    match_score = torch.sum(permed_labels * preds_rep, axis=1).sum(axis=2) * perm_mask  # (batch_size, num_permutations)
+    batch_perm_inds = find_best_permutation(match_score, speaker_permutations)  # (batch_size, num_speakers)
+    max_score_permed_labels = reconstruct_labels(labels, batch_perm_inds)  # (batch_size, num_frames, num_speakers)
+    return max_score_permed_labels  # (batch_size, num_frames, num_speakers)
+
+def get_pil_targets(labels: torch.Tensor, preds: torch.Tensor, speaker_permutations: torch.Tensor) -> torch.Tensor:
+    """
+    Sorts labels and predictions to get the optimal permutation based on the match score.
+
+    Args:
+        labels (torch.Tensor): A tensor containing the ground truth labels.
+            Shape: (batch_size, num_speakers, num_classes)
+        preds (torch.Tensor): A tensor containing the predicted values.
+            Shape: (batch_size, num_speakers, num_classes)
+        speaker_permutations (torch.Tensor): A tensor containing all possible speaker permutations.
+            Shape: (num_permutations, num_speakers)
+
+    Returns:
+        torch.Tensor: A tensor of permuted labels that best match the predictions.
+            Shape: (batch_size, num_speakers, num_classes)
+    """
+    perm_size = speaker_permutations.shape[0]  # Scalar value (num_permutations)
+    permed_labels = labels[:, :, speaker_permutations]  # (batch_size, num_classes, num_permutations, num_speakers)
+    # Repeat preds to match permutations for comparison
+    preds_rep = torch.unsqueeze(preds, 2).repeat(1, 1, speaker_permutations.shape[0], 1)  # (batch_size, num_speakers, num_permutations, num_classes)
+    match_score = torch.sum(permed_labels * preds_rep, axis=1).sum(axis=2)  # (batch_size, num_permutations)
+    batch_perm_inds = find_best_permutation(match_score, speaker_permutations)  # (batch_size, num_speakers)
+    # Reconstruct labels based on the best permutation for each batch
+    max_score_permed_labels = reconstruct_labels(labels, batch_perm_inds)  # (batch_size, num_speakers, num_classes)
+    return max_score_permed_labels  # (batch_size, num_speakers, num_classes)
 
 def apply_spk_mapping(diar_preds: torch.Tensor, spk_mappings: torch.Tensor) -> torch.Tensor:
     """ 

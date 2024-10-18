@@ -31,7 +31,7 @@ from nemo.collections.asr.metrics.multi_binary_acc import MultiBinaryAccuracy
 from nemo.collections.asr.models.asr_model import ExportableEncDecModel
 from nemo.collections.asr.models.label_models import EncDecSpeakerLabelModel
 from nemo.collections.asr.parts.preprocessing.features import WaveformFeaturizer
-from nemo.collections.asr.parts.utils.asr_multispeaker_utils import get_pil_target, get_ats_targets
+from nemo.collections.asr.parts.utils.asr_multispeaker_utils import get_pil_targets, get_ats_targets
 from nemo.core.classes import ModelPT
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.core.neural_types import AudioSignal, LengthsType, NeuralType
@@ -319,7 +319,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         # Arrival-time sorted (ATS) targets
         targets_ats = get_ats_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
         # Optimally permuted targets for Permutation-Invariant Loss (PIL)
-        targets_pil = get_pil_target(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
+        targets_pil = get_pil_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
         ats_loss = self.loss(probs=preds, labels=targets_ats, target_lens=target_lens)
         pil_loss = self.loss(probs=preds, labels=targets_pil, target_lens=target_lens)
         loss = self.ats_weight * ats_loss + self.pil_weight * pil_loss
@@ -363,7 +363,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
 
     def _get_aux_validation_evaluations(self, preds, targets, target_lens):
         targets_ats = get_ats_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
-        targets_pil = get_pil_target(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
+        targets_pil = get_pil_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
 
         val_ats_loss = self.loss(probs=preds, labels=targets_ats, target_lens=target_lens)
         val_pil_loss = self.loss(probs=preds, labels=targets_pil, target_lens=target_lens)
@@ -446,7 +446,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             audio_signal=audio_signal,
             audio_signal_length=audio_signal_length,
         )
-        targets_pil = get_pil_target(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
+        targets_pil = get_pil_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
         self._accuracy_test(preds, targets_pil, target_lens, cumulative=True)
         f1_acc, _, _ = self._accuracy_test.compute()
         batch_score_dict = {"f1_acc": f1_acc}
@@ -455,7 +455,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
 
     def _get_aux_test_batch_evaluations(self, batch_idx, preds, targets, target_lens):
         targets_ats = get_ats_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
-        targets_pil = get_pil_target(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
+        targets_pil = get_pil_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
         self._accuracy_test(preds, targets_pil, target_lens)
         f1_acc, precision, recall = self._accuracy_test.compute()
         self.batch_f1_accs_list.append(f1_acc)

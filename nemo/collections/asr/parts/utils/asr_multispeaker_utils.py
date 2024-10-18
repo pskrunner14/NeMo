@@ -94,7 +94,7 @@ def get_ats_targets(labels, preds, speaker_permutations, thres: float=0.5, toler
     max_score_permed_labels = reconstruct_labels(labels, batch_perm_inds)
     return max_score_permed_labels
 
-def get_pil_target(labels, preds, speaker_permutations):
+def get_pil_targets(labels, preds, speaker_permutations):
     """
     Sorts labels and predictions to get optimal permutation
     """

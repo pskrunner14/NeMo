@@ -150,7 +150,7 @@ model:
     stochastic_depth_drop_prob: 0.0
     stochastic_depth_mode: linear  # linear or uniform
     stochastic_depth_start_layer: 1
-  
+
   transformer_encoder:
     _target_: nemo.collections.asr.modules.transformer.transformer_encoders.TransformerEncoder
     num_layers: 18

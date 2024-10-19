@@ -24,7 +24,7 @@ from nemo.collections.asr.parts.utils.asr_multispeaker_utils import (
     get_hidden_length_from_sample_length, 
 )
 
-class LhotseSpeechToDiarizationLabelDataset(torch.utils.data.Dataset):
+class LhotseAudioToSpeechE2ESpkDiarDataset(torch.utils.data.Dataset):
     """
     This dataset is based on diarization datasets from audio_to_eesd_label.py.
     Unlike native NeMo datasets, Lhotse dataset defines only the mapping from

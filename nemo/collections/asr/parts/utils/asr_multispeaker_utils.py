@@ -39,10 +39,12 @@ from lhotse.utils import uuid4
 def find_first_nonzero(mat: torch.Tensor, max_cap_val=-1, thres:float = 0.5) -> torch.Tensor:
     """ 
     Finds the first nonzero value in the matrix, discretizing it to the specified maximum capacity.
+    
     Args:
         mat (Tensor): A torch tensor representing the matrix.
         max_cap_val (int): The maximum capacity to which the matrix values will be discretized.
         thres (float): The threshold value for discretizing the matrix values.
+    
     Returns:
         mask_max_indices (Tensor): A torch tensor representing the discretized matrix with the first nonzero value in each row.
     """
@@ -74,7 +76,7 @@ def find_best_permutation(match_score: torch.Tensor, speaker_permutations: torch
             Shape: (batch_size, num_speakers)
     """
     batch_best_perm = torch.argmax(match_score, axis=1)
-    rep_speaker_permutations = speaker_permutations.repeat(batch_best_perm.shape[0], 1)
+    rep_speaker_permutations = speaker_permutations.repeat(batch_best_perm.shape[0], 1).to(match_score.device)
     perm_size = speaker_permutations.shape[0]
     global_inds_vec = torch.arange(0, perm_size * batch_best_perm.shape[0], perm_size).to(batch_best_perm.device) + batch_best_perm
     return rep_speaker_permutations[global_inds_vec.to(rep_speaker_permutations.device), :]

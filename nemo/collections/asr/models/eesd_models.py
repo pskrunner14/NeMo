@@ -25,8 +25,8 @@ import itertools
 import random
 from nemo.collections.asr.parts.preprocessing.perturb import process_augmentations
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
-from nemo.collections.asr.data.audio_to_eesd_label_lhotse import LhotseSpeechToDiarizationLabelDataset
-from nemo.collections.asr.data.audio_to_eesd_label import AudioToSpeechMSDDTrainDataset
+from nemo.collections.asr.data.audio_to_diar_label_lhotse import LhotseAudioToSpeechE2ESpkDiarDataset
+from nemo.collections.asr.data.audio_to_diar_label import AudioToSpeechE2ESpkDiarDataset
 from nemo.collections.asr.metrics.multi_binary_acc import MultiBinaryAccuracy
 from nemo.collections.asr.models.asr_model import ExportableEncDecModel
 from nemo.collections.asr.models.label_models import EncDecSpeakerLabelModel
@@ -47,15 +47,9 @@ except ImportError:
     def autocast(enabled=None):
         yield
 
-
 torch.backends.cudnn.enabled = False 
 
-__all__ = ['EncDecDiarLabelModel']
-
-def init_weights(m):
-    if isinstance(m, nn.Linear):
-        torch.nn.init.xavier_uniform(m.weight)
-        m.bias.data.fill_(0.01)
+__all__ = ['SortformerEncLabelModel']
 
 class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
     """
@@ -81,7 +75,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
         """
-        Initialize an MSDD model and the specified speaker embedding model. 
+        Initialize an Sortformer Diarizer model and a pretrained NEST encoder.
         In this init function, training and validation datasets are prepared.
         """
         random.seed(42)
@@ -156,7 +150,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
                 config,
                 global_rank=self.global_rank,
                 world_size=self.world_size,
-                dataset=LhotseSpeechToDiarizationLabelDataset(cfg=config),
+                dataset=LhotseAudioToSpeechE2ESpkDiarDataset(cfg=config),
             )
 
         featurizer = WaveformFeaturizer(
@@ -175,10 +169,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             global_rank = 0
         time_flag = time.time()
         logging.info("AAB: Starting Dataloader Instance loading... Step A")
-        AudioToSpeechDiarTrainDataset = AudioToSpeechMSDDTrainDataset
         
         preprocessor = EncDecSpeakerLabelModel.from_config_dict(self._cfg.preprocessor)
-        dataset = AudioToSpeechDiarTrainDataset(
+        dataset = AudioToSpeechE2ESpkDiarDataset(
             manifest_filepath=config.manifest_filepath,
             preprocessor=preprocessor,
             soft_label_thres=config.soft_label_thres,
@@ -197,7 +190,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         dataloader_instance = torch.utils.data.DataLoader(
             dataset=dataset,
             batch_size=config.batch_size,
-            collate_fn=self.collate_ds.msdd_train_collate_fn,
+            collate_fn=self.collate_ds.eesd_train_collate_fn,
             drop_last=config.get('drop_last', False),
             shuffle=False,
             num_workers=config.get('num_workers', 1),

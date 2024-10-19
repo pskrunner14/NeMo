@@ -1019,12 +1019,14 @@ class LibriSpeechMixSimulator():
         min_delay: float = 0.5,
         max_num_speakers: int = 4,
         speaker_count_distribution: List[float] = [0, 2, 3, 4],
+        delay_factor: int = 4
     ):
         """
         """
         super().__init__()
         self.data_type = data_type
         self.min_delay = min_delay
+        self.delay_factor = delay_factor
         self.max_num_speakers = max_num_speakers
         self.speaker_count_distribution = speaker_count_distribution
         assert len(speaker_count_distribution) == max_num_speakers, f"Length of speaker_count_distribution {len(speaker_count_distribution)} must be equal to max_num_speakers {max_num_speakers}"
@@ -1047,38 +1049,46 @@ class LibriSpeechMixSimulator():
 
     def _create_mixture(self, n_speakers: int) -> MixedCut:
         sampled_speaker_ids = random.sample(self.speaker_ids, n_speakers)
-        tracks = []
-        offset = 0.0
-
+        
+        mono_cuts = []
         for speaker_id in sampled_speaker_ids:
             cut_id = random.choice(self.speaker_id2cut_ids[speaker_id])
             cut = self.id2cuts[cut_id]
-            custom = {
-                    'pnc': 'no',
-                    'source_lang': 'en',
-                    'target_lang': 'en',
-                    'task': 'asr'
-                }
-            cut.custom.update(custom)
-            tracks.append(MixTrack(cut=deepcopy(cut), type=type(cut), offset=offset))
-            offset += random.uniform(self.min_delay, cut.duration)
+            mono_cuts.append(cut)
+
+        mixed_cuts = []
+        for i in range(self.delay_factor):
+            tracks = []
+            offset = 0.0
+            for mono_cut in mono_cuts:
+                custom = {
+                        'pnc': 'no',
+                        'source_lang': 'en',
+                        'target_lang': 'en',
+                        'task': 'asr'
+                    }
+                mono_cut.custom.update(custom)
+                tracks.append(MixTrack(cut=deepcopy(mono_cut), type=type(mono_cut), offset=offset))
+                offset += random.uniform(self.min_delay, cut.duration)
         
-        cut = MixedCut(id='lsmix_' + '_'.join([track.cut.id for track in tracks]), tracks=tracks)
+            mixed_cut = MixedCut(id='lsmix_' + '_'.join([track.cut.id for track in tracks]), tracks=tracks)
+            
+            if self.data_type == "msasr":
+                text = self.get_text(mixed_cut)
+                sup = SupervisionSegment(id=mixed_cut.id, recording_id=mixed_cut.id, start=0, duration=mixed_cut.duration, text=text)
+                mixed_cut.tracks[0].cut.supervisions = [sup]
 
-        if self.data_type == "msasr":
-            text = self.get_text(cut)
-            sup = SupervisionSegment(id=cut.id, recording_id=cut.id, start=0, duration=cut.duration, text=text)
-            cut.tracks[0].cut.supervisions.append(sup)
+            if self.data_type == "tsasr":
+                query_speaker_id = random.choice(sampled_speaker_ids)
+                query_audio_path = random.choice(self.speaker_id2cut_ids[query_speaker_id])
+                pass # TODO: need to implement the query audio path
 
-        if self.data_type == "tsasr":
-            query_speaker_id = random.choice(sampled_speaker_ids)
-            query_audio_path = random.choice(self.speaker_id2cut_ids[query_speaker_id])
-            pass # TODO: need to implement the query audio path
+            if self.data_type == "diar":
+                pass # TODO: need to implement the diar data type
 
-        if self.data_type == "diar":
-            pass # TODO: need to implement the diar data type
+            mixed_cuts.append(mixed_cut)
 
-        return cut
+        return mixed_cuts
     
     # TODO: text is necessary for msasr and tsasr, but not for diar
     def get_text(self, cut: MixedCut, speaker_token_style='<|spltoken*|>', speaker_token_position='sot') -> str:
@@ -1129,7 +1139,7 @@ class LibriSpeechMixSimulator():
             if n_mt <= 0:
                 continue
             for i in tqdm(range(n_mt), desc=f"Simulating {n_speakers}-speaker mixtures", ncols=128):
-                cut_set.append(self._create_mixture(n_speakers=n_speakers))
+                cut_set.extend(self._create_mixture(n_speakers=n_speakers))
 
         return CutSet.from_cuts(cut_set)
 

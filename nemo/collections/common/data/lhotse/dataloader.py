@@ -226,6 +226,7 @@ def get_lhotse_dataloader_from_config(
                     min_delay=0.5,
                     max_num_speakers=simulator_config.max_num_speakers,
                     speaker_count_distribution=simulator_config.speaker_count_distribution,
+                    delay_factor=simulator_config.delay_factor,
                 )
                 simulated_cuts += simulator.simulate(cuts_for_simulation, num_meetings=simulator_config.num_meetings, num_jobs=1, seed=global_rank*world_size+local_rank+seed)
 

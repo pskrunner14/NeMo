@@ -30,51 +30,47 @@ from torch.utils.data import DataLoader
 from nemo.collections.asr.data.audio_to_diar_label import AudioToSpeechE2ESpkDiarDataset
 from nemo.collections.asr.parts.preprocessing.features import WaveformFeaturizer
 from nemo.collections.asr.modules import AudioToMelSpectrogramPreprocessor
+from nemo.collections.asr.parts.utils.speaker_utils import read_rttm_lines, get_offset_and_duration, get_vad_out_from_rttm_line
 
-class TestUtilityFunctions:
-    pass
+def is_rttm_length_too_long(rttm_file_path, wav_len_in_sec): 
+    """ 
+    Check if the maximum RTTM duration exceeds the length of the provided audio file.
+
+    Args:
+        rttm_file_path (str): Path to the RTTM file.
+        wav_len_in_sec (float): Length of the audio file in seconds.
+
+    Returns:
+        bool: True if the maximum RTTM duration is less than or equal to the length of the audio file, False otherwise.
+    """
+    rttm_lines = read_rttm_lines(rttm_file_path)
+    max_rttm_sec = 0
+    for line in rttm_lines:
+        start, dur = get_vad_out_from_rttm_line(line)
+        max_rttm_sec = max(max_rttm_sec, start + dur)
+    return max_rttm_sec <= wav_len_in_sec
 
 class TestAudioToSpeechE2ESpkDiarDataset:
 
-    # @pytest.mark.unit
-    # def test_mismatch_in_model_dataloader_config(self, caplog):
-    #     logging._logger.propagate = True
-    #     caplog.set_level(logging.WARNING)
-
-    #     model_cfg = OmegaConf.create(dict(labels=OmegaConf.create(["a", "b", "c"])))
-    #     dataloader_cfg = OmegaConf.create(dict(labels=copy.deepcopy(self.labels)))
-
-    #     inject_dataloader_value_from_model_config(model_cfg, dataloader_cfg, key='labels')
-
-    #     assert (
-    #         """`labels` is explicitly provided to the data loader, and is different from the `labels` provided at the model level config."""
-    #         in caplog.text
-    #     )
-
-    #     logging._logger.propagate = False
-
-
     @pytest.mark.unit
     def test_e2e_speaker_diar_dataset(self, test_data_dir):
-        manifest_path = os.path.abspath(os.path.join(test_data_dir, 'asr/diarizer/an4_manifest.json'))
+        manifest_path = os.path.abspath(os.path.join(test_data_dir, 'asr/diarizer/lsm_val.json'))
 
-        num_samples = 1
-        batch_size = 1
+        batch_size = 4
+        num_samples = 8
+    
         device = 'gpu' if torch.cuda.is_available() else 'cpu'
-        texts, rttms = [], []
+        data_dict_list = []
         with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8') as f:
             with open(manifest_path, 'r', encoding='utf-8') as mfile:
                 for ix, line in enumerate(mfile):
                     if ix >= num_samples:
                         break
 
-                    # line = line.replace("tests/data/", "tests/.data/").replace("\n", "")
-                    line = line.replace("tests/data/", f"{test_data_dir}/tests/.data/").replace("\n", "")
+                    line = line.replace("tests/data/", "tests/.data/").replace("\n", "")
                     f.write(f"{line}\n")
-
-                    data = json.loads(line)
-                    texts.append(data['text'])
-                    rttms.append(data['rttm_filepath'])
+                    data_dict = json.loads(line)
+                    data_dict_list.append(data_dict)
 
             f.seek(0)
             featurizer = WaveformFeaturizer(sample_rate=16000, int_values=False, augmentor=None)
@@ -83,7 +79,7 @@ class TestAudioToSpeechE2ESpkDiarDataset:
                                                             sample_rate=16000,
                                                             window_stride=0.01,
                                                             window="hann",
-                                                            features=80,
+                                                            features=128,
                                                             n_fft=512,
                                                             frame_splicing=1,
                                                             dither=0.00001
@@ -100,6 +96,30 @@ class TestAudioToSpeechE2ESpkDiarDataset:
                 global_rank=0,
                 soft_targets=False,
                 )
-            import ipdb; ipdb.set_trace()
-
-          
+            
+            dataloader_instance = torch.utils.data.DataLoader(
+                dataset=dataset,
+                batch_size=batch_size,
+                collate_fn=dataset.eesd_train_collate_fn,
+                drop_last=False,
+                shuffle=False,
+                num_workers=1,
+                pin_memory=False,
+            )
+            assert len(dataloader_instance) == (num_samples / batch_size)  # Check if the number of batches is correct
+            batch_counts = len(dataloader_instance)
+            
+            deviation_thres_rate = 0.01  # 1% deviation allowed
+            for batch_index, batch in enumerate(dataloader_instance):
+                if batch_index != batch_counts - 1:
+                    assert len(batch) == batch_size, "Batch size does not match the expected value"
+                audio_signals, audio_signal_len, targets, target_lens = batch
+                for sample_index in range(audio_signals.shape[0]):
+                    dataloader_audio_in_sec = audio_signal_len[sample_index].item()
+                    data_dur_in_sec = abs(data_dict_list[batch_size*batch_index + sample_index]['duration'] * featurizer.sample_rate - dataloader_audio_in_sec) 
+                    assert data_dur_in_sec <= deviation_thres_rate * dataloader_audio_in_sec, "Duration deviation exceeds 1%"
+                assert not torch.isnan(audio_signals).any(), "audio_signals tensor contains NaN values"
+                assert not torch.isnan(audio_signal_len).any(), "audio_signal_len tensor contains NaN values"
+                assert not torch.isnan(targets).any(), "targets tensor contains NaN values"
+                assert not torch.isnan(target_lens).any(), "target_lens tensor contains NaN values"
+            

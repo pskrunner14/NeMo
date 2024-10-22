@@ -23,7 +23,7 @@ from nemo.collections.asr.parts.utils.offline_clustering import get_argmin_mat
 from nemo.collections.asr.parts.utils.asr_multispeaker_utils import find_first_nonzero
 from nemo.collections.asr.parts.utils.speaker_utils import convert_rttm_line, prepare_split_data, get_subsegments
 from nemo.collections.common.parts.preprocessing.collections import DiarizationSpeechLabel
-from nemo.collections.common.parts.preprocessing.collections_eesd import DiarizationSpeechLabel as End2EndDiarizationSpeechLabel
+from nemo.collections.common.parts.preprocessing.collections_eesd import EndtoEndDiarizationSpeechLabel
 from nemo.core.classes import Dataset
 from nemo.core.neural_types import AudioSignal, EncodedRepresentation, LengthsType, NeuralType, ProbsType
 
@@ -1031,11 +1031,9 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         subsampling_factor: int = 8,
     ):
         super().__init__()
-        self.collection = End2EndDiarizationSpeechLabel(
+        self.collection = EndtoEndDiarizationSpeechLabel(
             manifests_files=manifest_filepath.split(','),
-            emb_dict=None,
-            clus_label_dict=None,
-            pairwise_infer=True,
+            round_digits=round_digits,
         )
         self.preprocessor = preprocessor
         self.featurizer = featurizer

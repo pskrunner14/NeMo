@@ -200,6 +200,7 @@ class TestSortingUtils:
 class TestTargetGenerators:
 
     @pytest.mark.parametrize("labels, preds, num_speakers, expected_output", [
+        # Test 1: Basic case with simple permutations
         (
             torch.tensor([
                 [[0.9, 0.1, 0.0], [0.1, 0.8, 0.0], [0.0, 0.1, 0.9]],  # Batch 1
@@ -214,7 +215,24 @@ class TestTargetGenerators:
                 [[0.9, 0.1, 0.0], [0.1, 0.8, 0.0], [0.0, 0.1, 0.9]],  # Expected labels for Batch 1
                 [[0.9, 0.0, 0.0], [0.1, 0.9, 0.0], [0.0, 0.1, 0.9]]   # Expected labels for Batch 2
             ])
+        ),
+
+        # Test 2: Ambiguous case
+        (
+            torch.tensor([[[0.9, 0.8, 0.7], [0.2, 0.8, 0.7], [0.2, 0.3, 0.9]]]),  # Labels
+            torch.tensor([[[0.6, 0.7, 0.2], [0.9, 0.4, 0.0], [0.1, 0.7, 0.1]]]),  # Preds
+            3,                             # Number of speakers
+            torch.tensor([[[0.8, 0.7, 0.9], [0.8, 0.7, 0.2], [0.3, 0.9, 0.2]]])   # Expected output
+        ),
+
+        # Test 3: Ambiguous case
+        (
+            torch.tensor([[[0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 0, 1], [0, 0, 0, 0]]]),  # Labels
+            torch.tensor([[[0.6, 0.6, 0.1, 0.9], [0.7, 0.7, 0.2, 0.8], [0.4, 0.6, 0.2, 0.7], [0.1, 0.1, 0.1, 0.7]]]),  # Preds
+            4,                             # Number of speakers
+            torch.tensor([[[1, 1, 0, 0], [1, 1, 0, 0], [0, 1, 0, 0], [0, 0, 0, 0]]])   # Expected output
         )
+
     ])
     def test_get_ats_targets(self, labels, preds, num_speakers, expected_output):
         # Generate all permutations for the given number of speakers
@@ -229,29 +247,40 @@ class TestTargetGenerators:
 
     @pytest.mark.unit
     @pytest.mark.parametrize(
-        "labels, preds, speaker_permutations, expected",
+        "labels, preds, num_speakers, expected_output",
         [
             # Test 1: Basic case with simple permutations
             (
-                torch.tensor([[[1, 0], [0, 1]], [[1, 0], [0, 1]]]),  # labels (batch_size=2, num_speakers=2, num_classes=2)
-                torch.tensor([[[1, 0], [0, 1]], [[0, 1], [1, 0]]]),  # preds (batch_size=2, num_speakers=2, num_classes=2)
-                torch.tensor([[0, 1], [1, 0]]),  # speaker_permutations (num_permutations=2, num_speakers=2)
-                torch.tensor([[[1, 0], [0, 1]], [[0, 1], [1, 0]]])  # expected max_score_permed_labels
+                torch.tensor([[[1, 0], [0, 1]], [[1, 0], [0, 1]]]),  # Labels (batch_size=2, num_speakers=2, num_classes=2)
+                torch.tensor([[[1, 0], [0, 1]], [[0, 1], [1, 0]]]),  # Preds (batch_size=2, num_speakers=2, num_classes=2)
+                2,                                                   # Number of speakers
+                torch.tensor([[[1, 0], [0, 1]], [[0, 1], [1, 0]]])   # expected max_score_permed_labels
             ),
 
             # Test 2: Batch size 1 with more complex permutations
             (
-                torch.tensor([[[0.8, 0.2], [0.3, 0.7]]]),  # labels
-                torch.tensor([[[0.9, 0.1], [0.2, 0.8]]]),  # preds
-                torch.tensor([[0, 1], [1, 0]]),  # speaker_permutations
-                torch.tensor([[[0.8, 0.2], [0.3, 0.7]]])  # expected output (labels remain the same as preds are close)
+                torch.tensor([[[0.8, 0.2], [0.3, 0.7]]]),  # Labels
+                torch.tensor([[[0.9, 0.1], [0.2, 0.8]]]),  # Preds
+                2,                                         # Number of speakers
+                torch.tensor([[[0.8, 0.2], [0.3, 0.7]]])   # expected output (labels remain the same as preds are close)
             ),
 
+            # Test 3: Ambiguous case
+            (
+                torch.tensor([[[0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 0, 1], [0, 0, 0, 0]]]),  # Labels
+                torch.tensor([[[0.61, 0.6, 0.1, 0.9], [0.7, 0.7, 0.2, 0.8], [0.4, 0.6, 0.2, 0.7], [0.1, 0.1, 0.1, 0.7]]]),  # Preds
+                4, # Number of speakers
+                torch.tensor([[[1, 0, 0, 1], [1, 0, 0, 1], [0, 0, 0, 1], [0, 0, 0, 0]]])   # Expected output
+            )
         ]
     )
-    def test_get_pil_targets(self, labels, preds, speaker_permutations, expected):
+    def test_get_pil_targets(self, labels, preds, num_speakers, expected_output):
+        # Generate all permutations for the given number of speakers
+        speaker_inds = list(range(num_speakers))
+        speaker_permutations = torch.tensor(list(itertools.permutations(speaker_inds)))
+
         result = get_pil_targets(labels, preds, speaker_permutations)
-        assert torch.equal(result, expected), f"Expected {expected} but got {result}"
+        assert torch.equal(result, expected_output), f"Expected {expected_output} but got {result}"
 
 
 class TestGetHiddenLengthFromSampleLength:

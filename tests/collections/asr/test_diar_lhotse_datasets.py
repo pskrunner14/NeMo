@@ -107,9 +107,9 @@ class TestLhotseAudioToSpeechE2ESpkDiarDataset:
     "batch_size, num_workers, split",
     [
         (4, 8, 'train'),        # Example 1
-        (4, 0, 'train'),        # Example 1
-        (2, 4, 'validation'),   # Example 2
-        (8, 2, 'test')          # Example 3
+        (4, 0, 'train'),        # Example 2
+        (2, 4, 'validation'),   # Example 3
+        (8, 2, 'test')          # Example 4
     ]
     )
     def test_e2e_speaker_diar_lhotse_dataset(self, test_data_dir, batch_size, num_workers, split):

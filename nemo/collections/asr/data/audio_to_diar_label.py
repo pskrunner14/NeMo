@@ -22,8 +22,8 @@ import numpy as np
 from nemo.collections.asr.parts.utils.offline_clustering import get_argmin_mat
 from nemo.collections.asr.parts.utils.asr_multispeaker_utils import find_first_nonzero
 from nemo.collections.asr.parts.utils.speaker_utils import convert_rttm_line, prepare_split_data, get_subsegments
-from nemo.collections.common.parts.preprocessing.collections import DiarizationSpeechLabel
-from nemo.collections.common.parts.preprocessing.collections_eesd import EndtoEndDiarizationSpeechLabel
+from nemo.collections.common.parts.preprocessing.collections import DiarizationSpeechLabel, EndtoEndDiarizationSpeechLabel
+# from nemo.collections.common.parts.preprocessing.collections_eesd import EndtoEndDiarizationSpeechLabel
 from nemo.core.classes import Dataset
 from nemo.core.neural_types import AudioSignal, EncodedRepresentation, LengthsType, NeuralType, ProbsType
 

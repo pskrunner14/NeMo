@@ -133,7 +133,7 @@ def score_labels(
     AUDIO_RTTM_MAP, 
     all_reference, 
     all_hypothesis,  
-    all_uem: List[List[float]], 
+    all_uem: List[List[float]]=None, 
     collar:float=0.25, 
     ignore_overlap: bool=True, 
     verbose: bool = True

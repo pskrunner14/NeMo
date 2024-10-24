@@ -34,7 +34,7 @@ class TestNeuralDiarizerInference:
     )
     @pytest.mark.parametrize("num_speakers", [None, 1])
     @pytest.mark.parametrize("max_num_speakers", [4])
-    def test_diar_inference(self, tmpdir, test_data_dir, device, num_speakers, max_num_speakers):
+    def test_msdd_diar_inference(self, tmpdir, test_data_dir, device, num_speakers, max_num_speakers):
         """
         Test to ensure diarization inference works correctly.
             - Ensures multiple audio files can be diarized sequentially
@@ -69,3 +69,6 @@ class TestNeuralDiarizerInference:
             # assert only 1 speaker & segment
             assert len(annotation.labels()) == 1
             assert len(list(annotation.itersegments())) == 1
+            
+    class TestSortformerDiarizerInference:
+        #TODO: This test can only be implemented once SortformerDiarizer model is uploaded.

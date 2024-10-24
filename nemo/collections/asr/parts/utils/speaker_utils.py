@@ -22,6 +22,7 @@ from typing import Dict, List, Tuple, Union
 
 import numpy as np
 from omegaconf import OmegaConf
+from omegaconf.listconfig import ListConfig 
 import soundfile as sf
 import torch
 from pyannote.core import Annotation, Segment, Timeline
@@ -147,7 +148,7 @@ def parse_scale_configs(window_lengths_in_sec, shift_lengths_in_sec, multiscale_
     """
     check_float_config = [isinstance(var, float) for var in (window_lengths_in_sec, shift_lengths_in_sec)]
     check_list_config = [
-        isinstance(var, (omegaconf.listconfig.ListConfig, list, tuple))
+        isinstance(var, (ListConfig, list, tuple))
         for var in (window_lengths_in_sec, shift_lengths_in_sec, multiscale_weights)
     ]
     if all(check_list_config) or all(check_float_config):

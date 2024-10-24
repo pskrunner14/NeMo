@@ -221,7 +221,7 @@ class TestTargetGenerators:
         (
             torch.tensor([[[0.9, 0.8, 0.7], [0.2, 0.8, 0.7], [0.2, 0.3, 0.9]]]),  # Labels
             torch.tensor([[[0.6, 0.7, 0.2], [0.9, 0.4, 0.0], [0.1, 0.7, 0.1]]]),  # Preds
-            3,                             # Number of speakers
+            3, # Number of speakers
             torch.tensor([[[0.8, 0.7, 0.9], [0.8, 0.7, 0.2], [0.3, 0.9, 0.2]]])   # Expected output
         ),
 
@@ -229,7 +229,7 @@ class TestTargetGenerators:
         (
             torch.tensor([[[0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 0, 1], [0, 0, 0, 0]]]),  # Labels
             torch.tensor([[[0.6, 0.6, 0.1, 0.9], [0.7, 0.7, 0.2, 0.8], [0.4, 0.6, 0.2, 0.7], [0.1, 0.1, 0.1, 0.7]]]),  # Preds
-            4,                             # Number of speakers
+            4, # Number of speakers
             torch.tensor([[[1, 1, 0, 0], [1, 1, 0, 0], [0, 1, 0, 0], [0, 0, 0, 0]]])   # Expected output
         )
 

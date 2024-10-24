@@ -1243,6 +1243,239 @@ class DiarizationSpeechLabel(DiarizationLabel):
         return item
 
 
+
+class EndtoEndDiarizationLabel(_Collection):
+    """List of diarization audio-label correspondence with preprocessing."""
+
+    OUTPUT_TYPE = collections.namedtuple(
+        typename='DiarizationLabelEntity',
+        field_names='audio_file uniq_id duration rttm_file offset',
+    )
+
+    def __init__(
+        self,
+        audio_files: List[str],
+        uniq_ids: List[str],
+        durations: List[float],
+        rttm_files: List[str],
+        offsets: List[float],
+        max_number: Optional[int] = None,
+        do_sort_by_duration: bool = False,
+        index_by_file_id: bool = False,
+    ):
+        """Instantiates audio-label manifest with filters and preprocessing.
+
+        Args:
+            audio_files:
+                List of audio file paths.
+            durations:
+                List of float durations.
+            rttm_files:
+                List of RTTM files (Groundtruth diarization annotation file).
+            offsets:
+                List of offsets or None.
+            target_spks (tuple):
+                List of tuples containing the two indices of targeted speakers for evaluation.
+                Example: [[(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)], [(0, 1), (1, 2), (0, 2)], ...]
+            sess_spk_dict (Dict):
+                List of Mapping dictionaries between RTTM speakers and speaker labels in the clustering result.
+            clus_spk_digits (tuple):
+                List of Tuple containing all the speaker indices from the clustering result.
+                Example: [(0, 1, 2, 3), (0, 1, 2), ...]
+            rttm_spkr_digits (tuple):
+                List of tuple containing all the speaker indices in the RTTM file.
+                Example: (0, 1, 2), (0, 1), ...]
+            max_number: Maximum number of samples to collect
+            do_sort_by_duration: True if sort samples list by duration
+            index_by_file_id: If True, saves a mapping from filename base (ID) to index in data.
+        """
+
+        if index_by_file_id:
+            self.mapping = {}
+        output_type = self.OUTPUT_TYPE
+        data, duration_filtered = [], 0.0
+
+        zipped_items = zip(
+            audio_files, uniq_ids, durations, rttm_files, offsets
+        )
+        for (
+            audio_file,
+            uniq_id,
+            duration,
+            rttm_file,
+            offset,
+        ) in zipped_items:
+
+            if duration is None:
+                duration = 0
+
+            data.append(
+                output_type(
+                    audio_file,
+                    uniq_id,
+                    duration,
+                    rttm_file,
+                    offset,
+                )
+            )
+
+            if index_by_file_id:
+                if isinstance(audio_file, list):
+                    if len(audio_file) == 0:
+                        raise ValueError(f"Empty audio file list: {audio_file}")
+                    audio_file_name = sorted(audio_file)[0]
+                else:
+                    audio_file_name = audio_file
+                file_id, _ = os.path.splitext(os.path.basename(audio_file))
+                self.mapping[file_id] = len(data) - 1
+
+            # Max number of entities filter.
+            if len(data) == max_number:
+                break
+
+        if do_sort_by_duration:
+            if index_by_file_id:
+                logging.warning("Tried to sort dataset by duration, but cannot since index_by_file_id is set.")
+            else:
+                data.sort(key=lambda entity: entity.duration)
+
+        logging.info(
+            "Filtered duration for loading collection is %f.", duration_filtered,
+        )
+        logging.info(f"Total {len(data)} session files loaded accounting to # {len(audio_files)} audio clips")
+
+        super().__init__(data)
+
+
+class EndtoEndDiarizationSpeechLabel(EndtoEndDiarizationLabel):
+    """`DiarizationLabel` diarization data sample collector from structured json files."""
+
+    def __init__(
+        self,
+        manifests_files: Union[str, List[str]],
+        round_digits=2,
+        *args,
+        **kwargs,
+    ):
+        """
+        Parse lists of audio files, durations, RTTM (Diarization annotation) files. Since diarization model infers only
+        two speakers, speaker pairs are generated from the total number of speakers in the session.
+
+        Args:
+            manifest_filepath (str):
+                Path to input manifest json files.
+            clus_label_dict (Dict):
+                Segment-level speaker labels from clustering results.
+            round_digit (int):
+                Number of digits to be rounded.
+            seq_eval_mode (bool):
+                If True, F1 score will be calculated for each speaker pair during inference mode.
+            pairwise_infer (bool):
+                If True, this dataset class operates in inference mode. In inference mode, a set of speakers in the input audio
+                is split into multiple pairs of speakers and speaker tuples (e.g. 3 speakers: [(0,1), (1,2), (0,2)]) and then
+                fed into the diarization system to merge the individual results.
+            *args: Args to pass to `SpeechLabel` constructor.
+            **kwargs: Kwargs to pass to `SpeechLabel` constructor.
+        """
+        self.round_digits = round_digits
+        audio_files, uniq_ids, durations, rttm_files, offsets = (
+            [],
+            [],
+            [],
+            [],
+            [],
+        )
+
+        for item in manifest.item_iter(manifests_files, parse_func=self.__parse_item_rttm):
+            # Training mode
+            rttm_labels = []
+            with open(item['rttm_file'], 'r') as f:
+                for index, line in enumerate(f.readlines()):
+                    start, end, speaker = self.split_rttm_line(line, decimals=3)
+                    rttm_labels.append('{} {} {}'.format(start, end, speaker))
+            audio_files.append(item['audio_file'])
+            uniq_ids.append(item['uniq_id'])
+            durations.append(item['duration'])
+            rttm_files.append(item['rttm_file'])
+            offsets.append(item['offset'])
+
+        super().__init__(
+            audio_files,
+            uniq_ids,
+            durations,
+            rttm_files,
+            offsets,
+            *args,
+            **kwargs,
+        )
+
+    def split_rttm_line(self, rttm_line: str, decimals: int = 3):
+        """
+        Convert a line in RTTM file to speaker label, start and end timestamps.
+
+        An example line of `rttm_line`:
+            SPEAKER abc_dev_0123 1 146.903 1.860 <NA> <NA> speaker543 <NA> <NA>
+
+        The above example RTTM line contains the following information:
+            session name: abc_dev_0123
+            segment start time: 146.903
+            segment duration: 1.860
+            speaker label: speaker543
+
+        Args:
+            rttm_line (str):
+                A line in RTTM formatted file containing offset and duration of each segment.
+            decimals (int):
+                Number of digits to be rounded.
+
+        Returns:
+            start (float):
+                Start timestamp in floating point number.
+            end (float):
+                End timestamp in floating point number.
+            speaker (str):
+                speaker string in RTTM lines.
+        """
+        rttm = rttm_line.strip().split()
+        start = round(float(rttm[3]), decimals)
+        end = round(float(rttm[4]), decimals) + round(float(rttm[3]), decimals)
+        speaker = rttm[7]
+        return start, end, speaker
+
+    def __parse_item_rttm(self, line: str, manifest_file: str) -> Dict[str, Any]:
+        """Parse each rttm file and save it to in Dict format"""
+        item = json.loads(line)
+        if 'audio_filename' in item:
+            item['audio_file'] = item.pop('audio_filename')
+        elif 'audio_filepath' in item:
+            item['audio_file'] = item.pop('audio_filepath')
+        else:
+            raise ValueError(
+                f"Manifest file has invalid json line " f"structure: {line} without proper audio file key."
+            )
+        if isinstance(item['audio_file'], list): 
+            item['audio_file'] = [os.path.expanduser(audio_file_path) for audio_file_path in item['audio_file']]
+        else:
+            item['audio_file'] = os.path.expanduser(item['audio_file'])
+
+        if not isinstance(item['audio_file'], list): 
+            if 'uniq_id' not in item:
+                item['uniq_id'] = os.path.splitext(os.path.basename(item['audio_file']))[0]
+        elif 'uniq_id' not in item:
+            raise ValueError(f"Manifest file has invalid json line " f"structure: {line} without proper uniq_id key.")
+
+        if 'duration' not in item:
+            raise ValueError(f"Manifest file has invalid json line " f"structure: {line} without proper duration key.")
+        item = dict(
+            audio_file=item['audio_file'],
+            uniq_id=item['uniq_id'],
+            duration=item['duration'],
+            rttm_file=item['rttm_filepath'],
+            offset=item.get('offset', None),
+        )
+        return item
+
+
 class Audio(_Collection):
     """Prepare a list of all audio items, filtered by duration."""
 

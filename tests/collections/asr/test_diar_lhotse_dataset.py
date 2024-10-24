@@ -31,26 +31,9 @@ from nemo.collections.asr.data.audio_to_diar_label import AudioToSpeechE2ESpkDia
 from nemo.collections.asr.parts.preprocessing.features import WaveformFeaturizer
 from nemo.collections.asr.modules import AudioToMelSpectrogramPreprocessor
 from nemo.collections.asr.parts.utils.speaker_utils import read_rttm_lines, get_offset_and_duration, get_vad_out_from_rttm_line
+from nemo.tests.collections.asr.test_diar_datasets import is_rttm_length_too_long
 
-def is_rttm_length_too_long(rttm_file_path, wav_len_in_sec): 
-    """ 
-    Check if the maximum RTTM duration exceeds the length of the provided audio file.
-
-    Args:
-        rttm_file_path (str): Path to the RTTM file.
-        wav_len_in_sec (float): Length of the audio file in seconds.
-
-    Returns:
-        bool: True if the maximum RTTM duration is less than or equal to the length of the audio file, False otherwise.
-    """
-    rttm_lines = read_rttm_lines(rttm_file_path)
-    max_rttm_sec = 0
-    for line in rttm_lines:
-        start, dur = get_vad_out_from_rttm_line(line)
-        max_rttm_sec = max(max_rttm_sec, start + dur)
-    return max_rttm_sec <= wav_len_in_sec
-
-class TestAudioToSpeechE2ESpkDiarDataset:
+class TestLhotseAudioToSpeechE2ESpkDiarDataset:
 
     @pytest.mark.unit
     def test_e2e_speaker_diar_dataset(self, test_data_dir):
@@ -85,27 +68,14 @@ class TestAudioToSpeechE2ESpkDiarDataset:
                                                             dither=0.00001
                                                         )
 
-            dataset = AudioToSpeechE2ESpkDiarDataset(
-                manifest_filepath=f.name,
-                preprocessor=preprocessor,
-                soft_label_thres=0.5,
-                session_len_sec=90,
-                num_spks=4,
-                featurizer=featurizer,
-                window_stride=0.01,
-                global_rank=0,
-                soft_targets=False,
-                )
             
-            dataloader_instance = torch.utils.data.DataLoader(
-                dataset=dataset,
-                batch_size=batch_size,
-                collate_fn=dataset.eesd_train_collate_fn,
-                drop_last=False,
-                shuffle=False,
-                num_workers=1,
-                pin_memory=False,
+            dataloader_instance = get_lhotse_dataloader_from_config(
+                config,
+                global_rank=self.global_rank,
+                world_size=self.world_size,
+                dataset=LhotseAudioToSpeechE2ESpkDiarDataset(cfg=config),
             )
+
             assert len(dataloader_instance) == (num_samples / batch_size)  # Check if the number of batches is correct
             batch_counts = len(dataloader_instance)
             

@@ -443,7 +443,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         self._accuracy_test(preds, targets_pil, target_lens, cumulative=True)
         f1_acc, _, _ = self._accuracy_test.compute()
         batch_score_dict = {"f1_acc": f1_acc}
-        cum_score_dict = self._cumulative_test_set_eval(score_dict=batch_score_dict, batch_idx=batch_idx, sample_count=len(sequence_lengths))
         return self.preds_all
 
     def _get_aux_test_batch_evaluations(self, batch_idx, preds, targets, target_lens):

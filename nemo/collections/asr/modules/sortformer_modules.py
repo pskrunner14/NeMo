@@ -72,8 +72,10 @@ class SortformerModules(NeuralModule, Exportable):
         use_memory_pe: bool = False,
         step_left_context: int = 0,
         step_right_context: int = 0,
+        mem_sil_frames_per_spk: int = 5,
     ):
         super().__init__()
+        self.mem_sil_frames_per_spk = mem_sil_frames_per_spk
         self.step_left_context = step_left_context
         self.step_right_context = step_right_context
         self.use_memory_pe = use_memory_pe

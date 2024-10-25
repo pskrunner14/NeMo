@@ -423,7 +423,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         B, n_frames, n_spk = preds.shape
         emb_dim = emb_seq.shape[2]
         mem_len_per_spk = self.sortformer_modules.mem_len // n_spk
-        last_n_sil_per_spk = 5
+        last_n_sil_per_spk = self.sortformer_modules.mem_sil_frames_per_spk
 
         #condition for frame being silence
         is_sil = preds.sum(dim=2) < 0.1 # Shape: (B, n_frames)
@@ -454,7 +454,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
 
         #cumsum-normalized scores: this is to avoid speakers appearing in memory buffer before their block
         # as a result, for speaker i={0,1,2,...,n_spk-1}, scores_csnorm_i = 2*scores_i - sum_{j=i}^{n_spk-1}(scores_j)
-        scores_csnorm = 2*scores - scores.flip(dims=[2]).cumsum(dim=2).flip(dims=[2])
+        #scores_csnorm = 2*scores - scores.flip(dims=[2]).cumsum(dim=2).flip(dims=[2]) 
+        scores_csnorm = 2*scores - scores.cpu().flip(dims=[2]).cumsum(dim=2).flip(dims=[2]).to(preds.device) #ugly hack to ensure deterministic behavior
 #        logging.info(f"MC scores cumsum-normalized: {scores_csnorm[0,:,:]}")
 
         #scores thresholding: set -inf if cumsum-normalized score is less than 0.5.

@@ -265,23 +265,16 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         logging.info(f"feat_len={feat_len}, num_chunks={num_chunks}")
         stt_feat = 0
         for step_idx in range(num_chunks):
-            if step_idx == 0:
-                left_offset = 0
-            else:
-                left_offset = self.sortformer_modules.step_left_context * self.encoder.subsampling_factor
-            if step_idx == num_chunks - 1:
-                right_offset = 0
-            else:
-                right_offset = self.sortformer_modules.step_right_context * self.encoder.subsampling_factor
-
-            end_feat = stt_feat + self.sortformer_modules.step_len * self.encoder.subsampling_factor
+            left_offset = min(self.sortformer_modules.step_left_context * self.encoder.subsampling_factor, stt_feat)
+            end_feat = min(stt_feat + self.sortformer_modules.step_len * self.encoder.subsampling_factor, feat_len)
+            right_offset = min(self.sortformer_modules.step_right_context * self.encoder.subsampling_factor, feat_len-end_feat)
             chunk_feat_seq = feat_seq[:, :, stt_feat-left_offset:end_feat+right_offset]
             stt_feat = end_feat
 
             feat_lengths = torch.tensor(chunk_feat_seq.shape[-1]).repeat(chunk_feat_seq.shape[0])
             chunk_feat_seq_t = torch.transpose(chunk_feat_seq, 1, 2)
             logging.info(f"step_idx: {step_idx}, chunk_feat_seq_t shape: {chunk_feat_seq_t.shape}")
-            yield step_idx, chunk_feat_seq_t, feat_lengths
+            yield step_idx, chunk_feat_seq_t, feat_lengths, left_offset, right_offset
     
     def frontend_encoder(self, processed_signal, processed_signal_length, pre_encode_input=False):
         """ 
@@ -353,7 +346,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         """
         processed_signal, processed_signal_length = self.process_signal(audio_signal=audio_signal, audio_signal_length=audio_signal_length)
         processed_signal = processed_signal[:, :, :processed_signal_length.max()]
-        if self._cfg.get("streaming_mode", False):
+        if self.streaming_mode:
             preds = self.forward_streaming(processed_signal, processed_signal_length)
         else:
             emb_seq, _ = self.frontend_encoder(processed_signal=processed_signal, processed_signal_length=processed_signal_length, pre_encode_input=False)
@@ -367,45 +360,39 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
     ):
         batch_size = processed_signal.shape[0]
         total_pred_list = []
-        memory_buff = None
-        current_mem_len = 0
+        memory_buff = torch.empty(batch_size, 0, self.encoder.d_model).to(self.device)
 
-        for (step_idx, chunk_feat_seq_t, feat_lengths) in self._streaming_feat_loader(feat_seq=processed_signal):
+        for (step_idx, chunk_feat_seq_t, feat_lengths, left_offset, right_offset) in self._streaming_feat_loader(feat_seq=processed_signal):
             #get pre_encode embs for current chunk
             chunk_pre_encode_embs, _ = self.encoder.pre_encode(x=chunk_feat_seq_t, lengths=feat_lengths)
 #            logging.info(f"step_idx: {step_idx}, chunk_pre_encode_embs shape: {chunk_pre_encode_embs.shape}")
 
             #get (mem+chunk) pre_encode embs
-            if step_idx == 0:
-                mem_chunk_pre_encode_embs = chunk_pre_encode_embs
-            else:
-#                memory_buff = memory_buff.detach()
-                mem_chunk_pre_encode_embs = torch.cat([memory_buff, chunk_pre_encode_embs], dim=1)
+            #memory_buff = memory_buff.detach()
+            mem_chunk_pre_encode_embs = torch.cat([memory_buff, chunk_pre_encode_embs], dim=1)
             logging.info(f"step_idx: {step_idx}, mem_chunk_pre_encode_embs shape: {mem_chunk_pre_encode_embs.shape}")
 
             #get preds for (mem+chunk)
+            lc = round(left_offset / self.encoder.subsampling_factor)
+            rc = round(right_offset / self.encoder.subsampling_factor)
             mem_chunk_len = mem_chunk_pre_encode_embs.shape[1]
+            current_mem_len = memory_buff.shape[1]
+            chunk_len = mem_chunk_len - current_mem_len - lc - rc
+
             org_feat_lengths = torch.tensor(mem_chunk_len*self.encoder.subsampling_factor).repeat(batch_size).to(self.device)
             mem_chunk_encoder_embs, _ = self.frontend_encoder(processed_signal=mem_chunk_pre_encode_embs, processed_signal_length=org_feat_lengths, pre_encode_input=True)
             logging.info(f"step_idx: {step_idx}, mem_chunk_encoder_embs shape: {mem_chunk_encoder_embs.shape}")
 
             mem_chunk_preds = self.forward_infer(mem_chunk_encoder_embs)
 
-            #append chunk preds to the list
-            if step_idx == 0:
-                mem_chunk_preds = mem_chunk_preds[:, :self.sortformer_modules.step_len]  #drop right context
-                mem_chunk_pre_encode_embs = mem_chunk_pre_encode_embs[:, :self.sortformer_modules.step_len]  #drop right context
-                total_pred_list.append(mem_chunk_preds)
-            else:
-                current_mem_len = memory_buff.shape[1]
-                mem_preds = mem_chunk_preds[:, :current_mem_len]
-                chunk_preds = mem_chunk_preds[:, current_mem_len+self.sortformer_modules.step_left_context:current_mem_len+self.sortformer_modules.step_left_context+self.sortformer_modules.step_len] #drop left and right context
-                mem_chunk_preds = torch.cat([mem_preds, chunk_preds], dim=1)
-                mem_chunk_pre_encode_embs = torch.cat([memory_buff, chunk_pre_encode_embs[:, self.sortformer_modules.step_left_context:self.sortformer_modules.step_left_context+self.sortformer_modules.step_len]], dim=1) #drop left and right context
-                total_pred_list.append(chunk_preds)
+            mem_preds = mem_chunk_preds[:, :current_mem_len, :]
+            chunk_preds = mem_chunk_preds[:, current_mem_len+lc:current_mem_len+lc+chunk_len, :] #drop left and right context
+            total_pred_list.append(chunk_preds) #append chunk preds to the list
 
             #update memory buffer
-            if mem_chunk_len <= self.sortformer_modules.mem_len:
+            mem_chunk_preds = torch.cat([mem_preds, chunk_preds], dim=1)
+            mem_chunk_pre_encode_embs = torch.cat([memory_buff, chunk_pre_encode_embs[:, lc:lc+chunk_len, :]], dim=1) #drop left and right context
+            if current_mem_len + chunk_len <= self.sortformer_modules.mem_len:
                 memory_buff = mem_chunk_pre_encode_embs
             else:
                 memory_buff = self._compress_memory(emb_seq=mem_chunk_pre_encode_embs, preds=mem_chunk_preds)

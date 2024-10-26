@@ -48,6 +48,9 @@ from tqdm import tqdm
 import pytorch_lightning as pl
 import torch
 import logging
+import optuna
+import tempfile
+
 from omegaconf import OmegaConf
 from nemo.core.config import hydra_runner
 
@@ -78,12 +81,11 @@ class DiarizationConfig:
     audio_dir: Optional[str] = None  # Path to a directory which contains audio files
     dataset_manifest: Optional[str] = None  # Path to dataset's JSON manifest
     
-    audio_key: str = 'audio_filepath'  # Used to override the default audio key in dataset_manifest
     postprocessing_yaml: Optional[str] = None  # Path to a yaml file for postprocessing configurations
-    eval_mode: bool = True
+    # eval_mode: bool = True
     no_der: bool = False
     out_rttm_dir: Optional[str] = None
-    opt_style: Optional[str] = None
+    # opt_style: Optional[str] = None
     
     # General configs
     session_len_sec: float = -1 # End-to-end diarization session length in seconds
@@ -103,13 +105,14 @@ class DiarizationConfig:
 
     # If `cuda` is a negative number, inference will be on CPU only.
     cuda: Optional[int] = None
-    allow_mps: bool = False  # allow to select MPS device (Apple Silicon M-series GPU)
     matmul_precision: str = "highest"  # Literal["highest", "high", "medium"]
 
     # Optuna Config
-    optuna_study_name: str = "diar_study"
-    storage: str = f"sqlite:///{optuna_study_name}.db"
-    output_log_file: str = f"{optuna_study_name}.log"
+    launch_pp_optim: bool = False # If True, launch optimization process for postprocessing parameters
+    optuna_study_name: str = "optim_postprocessing"
+    optuna_temp_dir: str = "/tmp/optuna"
+    optuna_storage: str = f"sqlite:///{optuna_study_name}.db"
+    optuna_log_file: str = f"{optuna_study_name}.log"
     optuna_n_trials: int = 100000
 
 def load_postprocessing_from_yaml(postprocessing_yaml):
@@ -138,6 +141,122 @@ def load_postprocessing_from_yaml(postprocessing_yaml):
                 if hasattr(postprocessing_params, key):
                     setattr(postprocessing_params, key, value)
     return postprocessing_params
+
+def optuna_suggest_params(postprocessing_cfg: PostProcessingParams, trial: optuna.Trial) -> PostProcessingParams:
+    """
+    Suggests hyperparameters for postprocessing using Optuna.
+
+    Args:
+        postprocessing_cfg (PostProcessingParams): The current postprocessing configuration.
+        trial (optuna.Trial): The Optuna trial object used to suggest hyperparameters.
+
+    Returns:
+        PostProcessingParams: The updated postprocessing configuration with suggested hyperparameters.
+    """
+    postprocessing_cfg.onset = trial.suggest_float("onset", 0.4, 0.75, step=0.01)
+    postprocessing_cfg.offset = trial.suggest_float("offset", 0.4, 0.75, step=0.01)
+    postprocessing_cfg.pad_onset = trial.suggest_float("pad_onset", 0.1, 0.3, step=0.01)
+    postprocessing_cfg.pad_offset = trial.suggest_float("pad_offset", 0.0, 0.2, step=0.01)
+    postprocessing_cfg.min_duration_on = trial.suggest_float("min_duration_on", 0.05, 0.4, step=0.01)
+    postprocessing_cfg.min_duration_off = trial.suggest_float("min_duration_off", 0.1, 0.4, step=0.01)
+    return postprocessing_cfg
+
+def get_tensor_path(cfg: DiarizationConfig) -> str:
+    """
+    Constructs the file path for saving or loading prediction tensors based on the configuration.
+
+    Args:
+        cfg (DiarizationConfig): The configuration object containing model and dataset details.
+
+    Returns:
+        str: The constructed file path for the prediction tensor.
+    """
+    tensor_filename = os.path.basename(cfg.dataset_manifest).replace("manifest.", "").replace(".json", "")
+    model_base_path = os.path.dirname(cfg.model_path)
+    model_id = os.path.basename(cfg.model_path).replace(".ckpt", "").replace(".nemo", "")
+    bpath = f"{model_base_path}/pred_tensors"
+    if not os.path.exists(bpath):
+        os.makedirs(bpath)
+    tensor_path = f"{bpath}/__{model_id}__{tensor_filename}.pt"
+    return tensor_path
+
+def diarization_objective(
+    trial: optuna.Trial, 
+    postprocessing_cfg: PostProcessingParams, 
+    temp_out_dir: str, 
+    infer_audio_rttm_dict: Dict[str, Dict[str, str]], 
+    diar_model_preds_total_list: List[torch.Tensor], 
+    collar: float = 0.25, 
+    ignore_overlap: bool = False
+) -> float:
+    """
+    Objective function for Optuna hyperparameter optimization in speaker diarization.
+
+    This function evaluates the diarization performance using a set of postprocessing parameters
+    suggested by Optuna. It converts prediction matrices to time-stamp segments, scores the 
+    diarization results, and returns the Diarization Error Rate (DER) as the optimization metric.
+
+    Args:
+        trial (optuna.Trial): The Optuna trial object used to suggest hyperparameters.
+        postprocessing_cfg (PostProcessingParams): The current postprocessing configuration.
+        temp_out_dir (str): Temporary directory for storing intermediate outputs.
+        infer_audio_rttm_dict (Dict[str, Dict[str, str]]): Dictionary containing audio file paths,
+            offsets, durations, and RTTM file paths.
+        diar_model_preds_total_list (List[torch.Tensor]): List of prediction matrices containing
+            sigmoid values for each speaker. Dimension: [(1, frames, num_speakers), ..., (1, frames, num_speakers)]
+        collar (float, optional): Collar in seconds for DER calculation. Defaults to 0.25.
+        ignore_overlap (bool, optional): If True, DER will be calculated only for non-overlapping segments.
+            Defaults to False.
+
+    Returns:
+        float: The Diarization Error Rate (DER) for the given set of postprocessing parameters.
+    """
+    with tempfile.TemporaryDirectory(dir=temp_out_dir, prefix="Diar_PostProcessing_") as local_temp_out_dir:
+        if trial is not None:
+            postprocessing_cfg = optuna_suggest_params(postprocessing_cfg, trial) 
+        all_hyps, all_refs, all_uems = convert_pred_mat_to_segments(audio_rttm_map_dict=infer_audio_rttm_dict, 
+                                                                    postprocessing_cfg=postprocessing_cfg, 
+                                                                    batch_preds_list=diar_model_preds_total_list, 
+                                                                    unit_10ms_frame_count=8,
+                                                                    bypass_postprocessing=False)
+        metric, mapping_dict, itemized_errors = score_labels(AUDIO_RTTM_MAP=infer_audio_rttm_dict, 
+                                                            all_reference=all_refs, 
+                                                            all_hypothesis=all_hyps, 
+                                                            all_uem=all_uems, 
+                                                            collar=collar, 
+                                                            ignore_overlap=ignore_overlap
+                                                            )
+        der = abs(metric)
+    return der
+
+def run_optuna_hyperparam_search(
+    cfg: DiarizationConfig,  # type: DiarizationConfig
+    postprocessing_cfg: PostProcessingParams,
+    infer_audio_rttm_dict: Dict[str, Dict[str, str]], 
+    preds_list: List[torch.Tensor], 
+    temp_out_dir: str, 
+    ):
+    worker_function = lambda trial: diarization_objective(
+        trial=trial,
+        postprocessing_cfg=postprocessing_cfg,
+        temp_out_dir=temp_out_dir,
+        infer_audio_rttm_dict=infer_audio_rttm_dict, 
+        diar_model_preds_total_list=preds_list,
+    )
+    study = optuna.create_study(
+        direction="minimize", 
+        study_name=cfg.optuna_study_name, 
+        storage=cfg.optuna_storage, 
+        load_if_exists=True
+    )
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)  # Setup the root logger.
+    if cfg.optuna_log_file is not None:
+        logger.addHandler(logging.FileHandler(cfg.optuna_log_file, mode="a"))
+    logger.addHandler(logging.StreamHandler())
+    optuna.logging.enable_propagation()  # Propagate logs to the root logger.
+    study.optimize(worker_function, n_trials=cfg.optuna_n_trials)  
+
 
 def convert_pred_mat_to_segments(
     audio_rttm_map_dict: Dict[str, Dict[str, str]], 
@@ -212,10 +331,6 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             device = [0]  # use 0th CUDA device
             accelerator = 'gpu'
             map_location = torch.device('cuda:0')
-        elif cfg.allow_mps and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            device = [0]
-            accelerator = 'mps'
-            map_location = torch.device('mps')
         else:
             device = 1
             accelerator = 'cpu'
@@ -227,7 +342,6 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
 
     if cfg.model_path.endswith(".ckpt"):
         diar_model = SortformerEncLabelModel.load_from_checkpoint(checkpoint_path=cfg.model_path, map_location=map_location, strict=False)
-        import ipdb; ipdb.set_trace()
     elif cfg.model_path.endswith(".nemo"):
         diar_model = SortformerEncLabelModel.restore_from(restore_path=cfg.model_path, map_location=map_location)
     else:
@@ -251,16 +365,30 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     diar_model.sortformer_modules.step_len = cfg.step_len
     diar_model.sortformer_modules.mem_len = cfg.mem_len
     
-    # Save the list of tensors
-    diar_model.test_batch()
-    diar_model_preds_total_list = diar_model.preds_total_list
-
-    if cfg.out_rttm_dir is not None and not os.path.exists(cfg.out_rttm_dir):
-        os.mkdir(cfg.out_rttm_dir)
-
     postprocessing_cfg = load_postprocessing_from_yaml(cfg.postprocessing_yaml)
+    tensor_path = get_tensor_path(cfg)
+    
+    if os.path.exists(tensor_path):
+        logging.info(f"A saved prediction tensor has been found. Loading the saved prediction tensors from {tensor_path}...")
+        diar_model_preds_total_list = torch.load(tensor_path)
+    else:
+        logging.info(f"No saved prediction tensors found. Running inference on the dataset...")
+        diar_model.test_batch()
+        diar_model_preds_total_list = diar_model.preds_total_list
+        torch.save(diar_model.preds_total_list, tensor_path)
+    
+    if cfg.launch_pp_optim:
+        # Launch a hyperparameter optimization process if launch_pp_optim is True
+        run_optuna_hyperparam_search(cfg=cfg, 
+                                     postprocessing_cfg=postprocessing_cfg, 
+                                     infer_audio_rttm_dict=infer_audio_rttm_dict, 
+                                     preds_list=diar_model_preds_total_list, 
+                                     temp_out_dir=cfg.optuna_temp_dir)
+
     # Evaluation
     if not cfg.no_der:
+        if cfg.out_rttm_dir is not None and not os.path.exists(cfg.out_rttm_dir):
+            os.mkdir(cfg.out_rttm_dir)
         all_hyps, all_refs, all_uems = convert_pred_mat_to_segments(infer_audio_rttm_dict,
                                                                     postprocessing_cfg=postprocessing_cfg, 
                                                                     batch_preds_list=diar_model_preds_total_list, 
@@ -276,7 +404,25 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
                                                             collar=cfg.collar, 
                                                             ignore_overlap=cfg.ignore_overlap
                                                             )
-        print("PostProcessingParams:", postprocessing_cfg)
+        logging.info("PostProcessingParams:", postprocessing_cfg)
 
 if __name__ == '__main__':
     main()
+# Unused variables in the main() function:
+# - cfg.eval_mode
+# - cfg.opt_style
+# - cfg.random_seed (it is checked but not used further)
+# - cfg.streaming_mode (it is assigned to diar_model.streaming_mode but not used further)
+# - cfg.matmul_precision (it is used to set the precision but not used further)
+# - cfg.allow_mps (it is checked but not used further)
+# - cfg.optuna_study_name (it is used in run_optuna_hyperparam_search but not directly in main)
+# - cfg.optuna_temp_dir (it is used in run_optuna_hyperparam_search but not directly in main)
+# - cfg.optuna_storage (it is used in run_optuna_hyperparam_search but not directly in main)
+# - cfg.optuna_log_file (it is used in run_optuna_hyperparam_search but not directly in main)
+# - cfg.optuna_n_trials (it is used in run_optuna_hyperparam_search but not directly in main)
+# - cfg.mem_len (it is assigned to diar_model.sortformer_modules.mem_len but not used further)
+# - cfg.step_len (it is assigned to diar_model.sortformer_modules.step_len but not used further)
+# - cfg.cuda (it is used to set the device but not used further)
+# - cfg.bypass_postprocessing (it is used in convert_pred_mat_to_segments but not directly in main)
+# - cfg.collar (it is used in score_labels but not directly in main)
+# - cfg.ignore_overlap (it is used in score_labels but not directly in main)

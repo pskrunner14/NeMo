@@ -153,12 +153,12 @@ def optuna_suggest_params(postprocessing_cfg: PostProcessingParams, trial: optun
     Returns:
         PostProcessingParams: The updated postprocessing configuration with suggested hyperparameters.
     """
-    postprocessing_cfg.onset = trial.suggest_float("onset", 0.4, 0.75, step=0.01)
-    postprocessing_cfg.offset = trial.suggest_float("offset", 0.4, 0.75, step=0.01)
-    postprocessing_cfg.pad_onset = trial.suggest_float("pad_onset", 0.1, 0.3, step=0.01)
+    postprocessing_cfg.onset = trial.suggest_float("onset", 0.4, 0.8, step=0.01)
+    postprocessing_cfg.offset = trial.suggest_float("offset", 0.4, 0.9, step=0.01)
+    postprocessing_cfg.pad_onset = trial.suggest_float("pad_onset", 0.1, 0.5, step=0.01)
     postprocessing_cfg.pad_offset = trial.suggest_float("pad_offset", 0.0, 0.2, step=0.01)
-    postprocessing_cfg.min_duration_on = trial.suggest_float("min_duration_on", 0.05, 0.4, step=0.01)
-    postprocessing_cfg.min_duration_off = trial.suggest_float("min_duration_off", 0.1, 0.4, step=0.01)
+    postprocessing_cfg.min_duration_on = trial.suggest_float("min_duration_on", 0.0, 0.75, step=0.01)
+    postprocessing_cfg.min_duration_off = trial.suggest_float("min_duration_off", 0.0, 0.75, step=0.01)
     return postprocessing_cfg
 
 def get_tensor_path(cfg: DiarizationConfig) -> str:
@@ -408,21 +408,3 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
 
 if __name__ == '__main__':
     main()
-# Unused variables in the main() function:
-# - cfg.eval_mode
-# - cfg.opt_style
-# - cfg.random_seed (it is checked but not used further)
-# - cfg.streaming_mode (it is assigned to diar_model.streaming_mode but not used further)
-# - cfg.matmul_precision (it is used to set the precision but not used further)
-# - cfg.allow_mps (it is checked but not used further)
-# - cfg.optuna_study_name (it is used in run_optuna_hyperparam_search but not directly in main)
-# - cfg.optuna_temp_dir (it is used in run_optuna_hyperparam_search but not directly in main)
-# - cfg.optuna_storage (it is used in run_optuna_hyperparam_search but not directly in main)
-# - cfg.optuna_log_file (it is used in run_optuna_hyperparam_search but not directly in main)
-# - cfg.optuna_n_trials (it is used in run_optuna_hyperparam_search but not directly in main)
-# - cfg.mem_len (it is assigned to diar_model.sortformer_modules.mem_len but not used further)
-# - cfg.step_len (it is assigned to diar_model.sortformer_modules.step_len but not used further)
-# - cfg.cuda (it is used to set the device but not used further)
-# - cfg.bypass_postprocessing (it is used in convert_pred_mat_to_segments but not directly in main)
-# - cfg.collar (it is used in score_labels but not directly in main)
-# - cfg.ignore_overlap (it is used in score_labels but not directly in main)

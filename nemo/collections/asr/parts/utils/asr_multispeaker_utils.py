@@ -1071,7 +1071,7 @@ class LibriSpeechMixSimulator():
                 tracks.append(MixTrack(cut=deepcopy(mono_cut), type=type(mono_cut), offset=offset))
                 offset += random.uniform(self.min_delay, cut.duration)
         
-            mixed_cut = MixedCut(id='lsmix_' + '_'.join([track.cut.id for track in tracks]), tracks=tracks)
+            mixed_cut = MixedCut(id='lsmix_' + '_'.join([track.cut.id for track in tracks]) + '_' + str(uuid4()), tracks=tracks)
             
             if self.data_type == "msasr":
                 text = self.get_text(mixed_cut)
@@ -1141,7 +1141,7 @@ class LibriSpeechMixSimulator():
             for i in tqdm(range(n_mt), desc=f"Simulating {n_speakers}-speaker mixtures", ncols=128):
                 cut_set.extend(self._create_mixture(n_speakers=n_speakers))
 
-        return CutSet.from_cuts(cut_set)
+        return CutSet.from_cuts(cut_set).shuffle()
 
 class LibriSpeechMixGenerator():
     def __init__(self):

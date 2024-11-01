@@ -28,36 +28,22 @@ from nemo.core.config import hydra_runner
 from nemo.collections.asr.metrics.der import score_labels
 from hydra.core.config_store import ConfigStore
 
-
 import os
 import yaml
 from dataclasses import dataclass, is_dataclass
 from typing import Optional, Union, List, Tuple, Dict
 
-from pyannote.core import Segment, Timeline
-from nemo.collections.asr.parts.utils.speaker_utils import audio_rttm_map as get_audio_rttm_map
-from nemo.collections.asr.parts.utils.vad_utils import ts_vad_post_processing, timestamps_to_pyannote_object
-from nemo.collections.asr.parts.utils.speaker_utils import (
-labels_to_pyannote_object,
-generate_diarization_output_lines,
-rttm_to_labels,
-get_uem_object,
-)
+from nemo.collections.asr.parts.utils.speaker_utils import audio_rttm_map, timestamps_to_pyannote_object
+from nemo.collections.asr.parts.utils.vad_utils import ts_vad_post_processing
 
 from tqdm import tqdm
-import pytorch_lightning as pl
 import torch
 import logging
 import optuna
 import tempfile
 
-from omegaconf import OmegaConf
-from nemo.core.config import hydra_runner
-
-
 seed_everything(42)
 torch.backends.cudnn.deterministic = True
-
 
 @dataclass
 class PostProcessingParams:
@@ -82,10 +68,8 @@ class DiarizationConfig:
     dataset_manifest: Optional[str] = None  # Path to dataset's JSON manifest
     
     postprocessing_yaml: Optional[str] = None  # Path to a yaml file for postprocessing configurations
-    # eval_mode: bool = True
     no_der: bool = False
     out_rttm_dir: Optional[str] = None
-    # opt_style: Optional[str] = None
     
     # General configs
     session_len_sec: float = -1 # End-to-end diarization session length in seconds
@@ -97,11 +81,6 @@ class DiarizationConfig:
     # Eval Settings: (0.25, False) should be default setting for sortformer eval.
     collar: float = 0.25 # Collar in seconds for DER calculation
     ignore_overlap: bool = False # If True, DER will be calculated only for non-overlapping segments
-    
-    # Streaming diarization configs
-    streaming_mode: bool = False # If True, streaming diarization will be used. For long-form audio, set mem_len=step_len
-    mem_len: int = 100
-    step_len: int = 100
 
     # If `cuda` is a negative number, inference will be on CPU only.
     cuda: Optional[int] = None
@@ -304,6 +283,7 @@ def convert_pred_mat_to_segments(
                                                                                 all_hypothesis, 
                                                                                 all_reference, 
                                                                                 all_uems,
+                                                                                out_rttm_dir,
                                                                                )
         batch_pred_ts_segs.append(spk_ts) 
     return all_hypothesis, all_reference, all_uems
@@ -353,17 +333,12 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     
     diar_model = diar_model.eval()
     diar_model._cfg.test_ds.manifest_filepath = cfg.dataset_manifest
-    infer_audio_rttm_dict = get_audio_rttm_map(cfg.dataset_manifest)
+    infer_audio_rttm_dict = audio_rttm_map(cfg.dataset_manifest)
     diar_model._cfg.test_ds.batch_size = cfg.batch_size
     
     # Model setup for inference 
     diar_model._cfg.test_ds.num_workers = cfg.num_workers
     diar_model.setup_test_data(test_data_config=diar_model._cfg.test_ds)    
-    
-    # Steaming mode setup 
-    diar_model.streaming_mode = cfg.streaming_mode
-    diar_model.sortformer_modules.step_len = cfg.step_len
-    diar_model.sortformer_modules.mem_len = cfg.mem_len
     
     postprocessing_cfg = load_postprocessing_from_yaml(cfg.postprocessing_yaml)
     tensor_path = get_tensor_path(cfg)

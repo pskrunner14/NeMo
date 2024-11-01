@@ -332,6 +332,7 @@ class ConcatenationMeetingSimulator():
         max_num_speakers: int = 4,
         speaker_count_distribution: List[float] = [0, 2, 3, 4],
         skip_long_segments: bool = True,
+        valid_dataset_ids: List[str] = [],
     ):
         """
         :param intra_session_concat_prob: the probability of concatenating segments from the same
@@ -362,6 +363,8 @@ class ConcatenationMeetingSimulator():
         else:
             self.skip_duration = max_duration
 
+        self.valid_dataset_ids = valid_dataset_ids
+
     def fit(self, cuts) -> CutSet:
         """
         Read the manifest file and return a CutSet object. 
@@ -380,6 +383,8 @@ class ConcatenationMeetingSimulator():
             if cut.duration > self.skip_duration:
                 continue
             if not hasattr(cut, 'dataset_id') or cut.dataset_id is None:
+                continue
+            if self.valid_dataset_ids and cut.dataset_id not in self.valid_dataset_ids:
                 continue
             if cut.dataset_id not in self.data2num_spk2cut_ids:
                 self.data2num_spk2cut_ids[cut.dataset_id] = defaultdict(list)
@@ -687,6 +692,7 @@ class MixMeetingSimulator():
         max_duration: float = 100.0,
         max_num_speakers: int = 4,
         speaker_count_distribution: List[float] = [0, 0, 0.1, 4],
+        valid_dataset_ids: List[str] = [],
     ):
         """
         :param intra_session_mix_prob: the probability of concatenating segments from the same
@@ -710,6 +716,7 @@ class MixMeetingSimulator():
         self.max_duration = max_duration
         self.max_num_speakers = max_num_speakers
         self.speaker_count_distribution = speaker_count_distribution
+        self.valid_dataset_ids = valid_dataset_ids
         assert len(speaker_count_distribution) == max_num_speakers, f"Length of speaker_count_distribution {len(speaker_count_distribution)} must be equal to max_num_speakers {max_num_speakers}"
 
     def fit(self, cuts) -> CutSet:
@@ -730,6 +737,8 @@ class MixMeetingSimulator():
             if not self.min_duration <= cut.duration <= self.max_duration:
                 continue
             if not hasattr(cut, 'dataset_id') or cut.dataset_id is None:
+                continue
+            if self.valid_dataset_ids and cut.dataset_id not in self.valid_dataset_ids:
                 continue
             if cut.dataset_id not in self.data2num_spk2cut_ids:
                 self.data2num_spk2cut_ids[cut.dataset_id] = defaultdict(list)
@@ -1010,12 +1019,14 @@ class LibriSpeechMixSimulator():
         min_delay: float = 0.5,
         max_num_speakers: int = 4,
         speaker_count_distribution: List[float] = [0, 2, 3, 4],
+        delay_factor: int = 4
     ):
         """
         """
         super().__init__()
         self.data_type = data_type
         self.min_delay = min_delay
+        self.delay_factor = delay_factor
         self.max_num_speakers = max_num_speakers
         self.speaker_count_distribution = speaker_count_distribution
         assert len(speaker_count_distribution) == max_num_speakers, f"Length of speaker_count_distribution {len(speaker_count_distribution)} must be equal to max_num_speakers {max_num_speakers}"
@@ -1038,58 +1049,53 @@ class LibriSpeechMixSimulator():
 
     def _create_mixture(self, n_speakers: int) -> MixedCut:
         sampled_speaker_ids = random.sample(self.speaker_ids, n_speakers)
-        tracks = []
-        offset = 0.0
+        
+        mono_cuts = []
         for speaker_id in sampled_speaker_ids:
             cut_id = random.choice(self.speaker_id2cut_ids[speaker_id])
             cut = self.id2cuts[cut_id]
-            tracks.append(MixTrack(cut=deepcopy(cut), type=type(cut), offset=offset))
-            offset += random.uniform(self.min_delay, cut.duration)
+            mono_cuts.append(cut)
+
+        mixed_cuts = []
+        for i in range(self.delay_factor):
+            tracks = []
+            offset = 0.0
+            for mono_cut in mono_cuts:
+                custom = {
+                        'pnc': 'no',
+                        'source_lang': 'en',
+                        'target_lang': 'en',
+                        'task': 'asr'
+                    }
+                mono_cut.custom.update(custom)
+                tracks.append(MixTrack(cut=deepcopy(mono_cut), type=type(mono_cut), offset=offset))
+                offset += random.uniform(self.min_delay, cut.duration)
         
-        cut = MixedCut(id='lsmix_' + '_'.join([track.cut.id for track in tracks]), tracks=tracks)
+            mixed_cut = MixedCut(id='lsmix_' + '_'.join([track.cut.id for track in tracks]) + '_' + str(uuid4()), tracks=tracks)
+            
+            if self.data_type == "msasr":
+                text = self.get_text(mixed_cut)
+                sup = SupervisionSegment(id=mixed_cut.id, recording_id=mixed_cut.id, start=0, duration=mixed_cut.duration, text=text)
+                mixed_cut.tracks[0].cut.supervisions = [sup]
 
-        if self.data_type == "msasr":
-            text = self.get_text(cut)
-            sup = SupervisionSegment(id=cut.id, recording_id=cut.id, start=0, duration=cut.duration, text=text)
-            cut.tracks[0].cut.supervisions.insert(0, sup)
+            if self.data_type == "tsasr":
+                query_speaker_id = random.choice(sampled_speaker_ids)
+                query_audio_path = random.choice(self.speaker_id2cut_ids[query_speaker_id])
+                pass # TODO: need to implement the query audio path
 
-        if self.data_type == "tsasr":
-            query_speaker_id = random.choice(sampled_speaker_ids)
-            query_audio_path = random.choice(self.speaker_id2cut_ids[query_speaker_id])
-            pass # TODO: need to implement the query audio path
+            if self.data_type == "diar":
+                pass # TODO: need to implement the diar data type
 
-        if self.data_type == "diar":
-            pass # TODO: need to implement the diar data type
+            mixed_cuts.append(mixed_cut)
 
-        return cut
+        return mixed_cuts
     
     # TODO: text is necessary for msasr and tsasr, but not for diar
     def get_text(self, cut: MixedCut, speaker_token_style='<|spltoken*|>', speaker_token_position='sot') -> str:
         text = ''
         stt_words_spks = []
         if speaker_token_position == 'word':
-            SSP = SyllableTokenizer()
-            for i, track in enumerate(cut.tracks):
-                stt_time, end_time = track.offset, track.offset + track.cut.duration
-                word_seq = track.cut.text
-                word_list = word_seq.split()
-                syllab_word_list = [[] for _ in range(len(word_list))]
-                syllab_list = []
-                for idx,word in enumerate(word_list):
-                    syllables = SSP.tokenize(word)
-                    syllab_word_list[idx].extend(syllables)
-                    syllab_list.extend(syllables)
-                avg_sylllable_dur = (end_time - stt_time) / len(syllab_list)
-                offset = stt_time
-                stt_times, end_times = [], []
-                for word, syllabs in zip(word_list, syllab_word_list):
-                    stt_times.append(round(offset, 3))
-                    end_time = round(offset + avg_sylllable_dur * len(syllabs), 3)
-                    end_times.append(end_time)
-                    offset = end_time
-                    stt_words_spks.append([stt_times[-1], word, speaker_token_style.replace('*', str(i))])
-            stt_words_spks = sorted(stt_words_spks, key=lambda x: x[0])
-            text += ' '.join([f'{spk} {word}' for stt_time, word, spk in stt_words_spks])
+            pass
         elif speaker_token_position == 'segments':
             pass
         elif speaker_token_position == 'sot':
@@ -1133,30 +1139,34 @@ class LibriSpeechMixSimulator():
             if n_mt <= 0:
                 continue
             for i in tqdm(range(n_mt), desc=f"Simulating {n_speakers}-speaker mixtures", ncols=128):
-                cut_set.append(self._create_mixture(n_speakers=n_speakers))
+                cut_set.extend(self._create_mixture(n_speakers=n_speakers))
 
-        return CutSet.from_cuts(cut_set)
+        return CutSet.from_cuts(cut_set).shuffle()
 
 class LibriSpeechMixGenerator():
     def __init__(self):
         pass
 
     def generate(self, cuts):
-        import ipdb; ipdb.set_trace()
         cut_set = []
         for cut in tqdm(cuts):
             offsets = cut.delays
             durations = cut.durations
             wavs = cut.wavs
-            # texts = cut.texts
+            texts = cut.texts
             speakers = cut.speakers
 
             tracks = []
-            for i, (offset, duration, wav, speaker) in enumerate(zip(offsets, durations, wavs, speakers)):
+            for i, (offset, duration, wav, text, speaker) in enumerate(zip(offsets, durations, wavs, texts, speakers)):
                 wav_dur = soundfile.info(wav).duration
                 wav_samples = soundfile.info(wav).frames
                 custom = {
                     'speaker_id': speaker,
+                    'text': text,
+                    'pnc': 'no',
+                    'source_lang': 'en',
+                    'target_lang': 'en',
+                    'task': 'asr'
                 }
                 cut_1spk = MonoCut(
                     id=wav.split('/')[-1].replace('.wav', ''),

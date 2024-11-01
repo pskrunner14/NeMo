@@ -74,7 +74,7 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
         # cuts, spk_mappings = shuffle_spk_mapping(cuts=cuts, num_speakers=self.num_speakers, shuffle_spk_mapping=self.
         # shuffle_spk_mapping, pattern=self.spk_token_pattern)
         
-        spk_mappings = torch.arange(self.num_speakers).unsqueeze(0).repeat(len(cuts),1)
+        spk_mappings = torch.arange(self.num_speakers).unsqueeze(0).repeat(len(cuts),1) 
         # if cuts[0].dataset_id == "training_list":
             # cuts = self.cuts2mixcuts(cuts)
         if self.inference_mode:

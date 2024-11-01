@@ -137,7 +137,7 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
         """
 
         model_path = self.cfg.diar_model_path
-        # model_path = '/home/jinhanw/workdir/scripts/dataloader/pipeline/checkpoints/sortformer/im303a-ft7_epoch6-19.nemo'
+        # model_path = '/home/jinhanw/workdir/workdir_nemo_speaker_asr/dataloader/pipeline/checkpoints/sortformer/im303a-ft7_epoch6-19.nemo'
 
         if model_path.endswith('.nemo'):
             pretrained_diar_model = SortformerEncLabelModel.restore_from(model_path, map_location="cpu")
@@ -303,6 +303,7 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
             encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
         else:
             encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+        
 
         encoded = torch.transpose(encoded, 1, 2) # B * D * T -> B * T * D
 
@@ -327,6 +328,8 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
                 diar_preds = self._get_probablistic_mix(diar_preds=diar_preds, spk_targets=spk_targets, rttm_mix_prob=float(self.cfg.rttm_mix_prob))
             else:
                 raise ValueError(f"Invalid RTTM strategy {self.cfg.spk_supervision_strategy} is not supported.")
+            
+            del signal
         
             # Speaker mapping shuffling to equalize the speaker label's distributions
             if self.cfg.shuffle_spk_mapping:

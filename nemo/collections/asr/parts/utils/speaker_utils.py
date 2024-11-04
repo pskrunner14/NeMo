@@ -1630,8 +1630,9 @@ def timestamps_to_pyannote_object(speaker_timestamps: List[Tuple[float, float]],
                                   uniq_id: str, 
                                   audio_rttm_values: Dict[str, str], 
                                   all_hypothesis: List[Tuple[str, Timeline]], 
-                                  all_reference, 
-                                  all_uems
+                                  all_reference: List[Tuple[str, Timeline]], 
+                                  all_uems: List[Tuple[str, Timeline]],
+                                  out_rttm_dir: str | None
                                 ):
     """ 
     Convert speaker timestamps to pyannote.core.Timeline object.
@@ -1649,6 +1650,8 @@ def timestamps_to_pyannote_object(speaker_timestamps: List[Tuple[float, float]],
             List of reference in pyannote.core.Timeline object.
         all_uems (List[Tuple[str, pyannote.core.Timeline]]):
             List of uems in pyannote.core.Timeline object.
+        out_rttm_dir (str | None):
+            Directory to save RTTMs
             
     Returns:
         all_hypothesis (List[Tuple[str, pyannote.core.Timeline]]):
@@ -1661,6 +1664,9 @@ def timestamps_to_pyannote_object(speaker_timestamps: List[Tuple[float, float]],
     offset, dur = float(audio_rttm_values.get('offset', None)), float(audio_rttm_values.get('duration', None))
     hyp_labels = generate_diarization_output_lines(speaker_timestamps=speaker_timestamps, model_spk_num=len(speaker_timestamps))
     hypothesis = labels_to_pyannote_object(hyp_labels, uniq_name=uniq_id)
+    if out_rttm_dir is not None and os.path.exists(out_rttm_dir):
+        with open(f'{out_rttm_dir}/{uniq_id}.rttm','w') as f:
+            hypothesis.write_rttm(f)
     all_hypothesis.append([uniq_id, hypothesis])
     rttm_file = audio_rttm_values.get('rttm_filepath', None)
     if rttm_file is not None and os.path.exists(rttm_file):

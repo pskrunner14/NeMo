@@ -53,13 +53,14 @@ __all__ = ['SortformerEncLabelModel']
 
 class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
     """
-    Encoder decoder class for multiscale diarization decoder (MSDD). Model class creates training, validation methods for setting
-    up data performing model forward pass.
+    Encoder class for Sortformer diarization model.
+    Model class creates training, validation methods for setting up data performing model forward pass.
 
     This model class expects config dict for:
         * preprocessor
         * Transformer Encoder
         * FastConformer Encoder
+        * Sortformer Modules
     """
 
     @classmethod
@@ -170,10 +171,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         time_flag = time.time()
         logging.info("AAB: Starting Dataloader Instance loading... Step A")
         
-        preprocessor = EncDecSpeakerLabelModel.from_config_dict(self._cfg.preprocessor)
         dataset = AudioToSpeechE2ESpkDiarDataset(
             manifest_filepath=config.manifest_filepath,
-            preprocessor=preprocessor,
+            preprocessor=self.preprocessor,
             soft_label_thres=config.soft_label_thres,
             session_len_sec=config.session_len_sec,
             num_spks=config.num_spks,
@@ -342,17 +342,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         self._reset_train_metrics()
         self.log_dict(train_metrics, sync_dist=True, on_step=True, on_epoch=False, logger=True)
         return {'loss': train_metrics['loss']}
-        
-    def _cumulative_test_set_eval(self, score_dict: Dict[str, float], batch_idx: int, sample_count: int):
-        if batch_idx == 0:
-            self.total_sample_counts = 0
-            self.cumulative_f1_acc_sum = 0
-            
-        self.total_sample_counts += sample_count
-        self.cumulative_f1_acc_sum += score_dict['f1_acc'] * sample_count
-        
-        cumulative_f1_acc = self.cumulative_f1_acc_sum / self.total_sample_counts
-        return {"cum_test_f1_acc": cumulative_f1_acc}
 
     def _get_aux_validation_evaluations(self, preds, targets, target_lens):
         targets_ats = get_ats_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
@@ -419,31 +408,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             'val_f1_acc_ats': val_f1_acc_ats_mean,
         }
         return {'log': multi_val_metrics}
-    
-    def multi_test_epoch_end(self, outputs: List[Dict[str, torch.Tensor]], dataloader_idx: int = 0):
-        test_loss_mean = torch.stack([x['test_loss'] for x in outputs]).mean()
-        f1_acc, _, _ = self._accuracy_test.compute()
-        self._accuracy_test.reset()
-        multi_test_metrics = {
-            'test_loss': test_loss_mean,
-            'test_f1_acc': f1_acc,
-        }
-        self.log_dict(multi_test_metrics, sync_dist=True, on_step=True, on_epoch=False, logger=True)
-        return multi_test_metrics
-   
-    def test_step(self, batch: list, batch_idx: int, dataloader_idx: int = 0):
-        audio_signal, audio_signal_length, targets, target_lens = batch
-        batch_size = audio_signal.shape[0]
-        target_lens = self.target_lens.unsqueeze(0).repeat(batch_size, 1).to(audio_signal.device)
-        preds = self.forward(
-            audio_signal=audio_signal,
-            audio_signal_length=audio_signal_length,
-        )
-        targets_pil = get_pil_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
-        self._accuracy_test(preds, targets_pil, target_lens, cumulative=True)
-        f1_acc, _, _ = self._accuracy_test.compute()
-        batch_score_dict = {"f1_acc": f1_acc}
-        return self.preds_all
 
     def _get_aux_test_batch_evaluations(self, batch_idx, preds, targets, target_lens):
         targets_ats = get_ats_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)

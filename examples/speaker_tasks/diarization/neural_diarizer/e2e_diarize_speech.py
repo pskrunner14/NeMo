@@ -242,6 +242,7 @@ def run_optuna_hyperparam_search(
         temp_out_dir=temp_out_dir,
         infer_audio_rttm_dict=infer_audio_rttm_dict, 
         diar_model_preds_total_list=preds_list,
+        collar=cfg.collar,
     )
     study = optuna.create_study(
         direction="minimize", 

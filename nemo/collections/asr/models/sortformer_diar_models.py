@@ -173,7 +173,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         
         dataset = AudioToSpeechE2ESpkDiarDataset(
             manifest_filepath=config.manifest_filepath,
-            preprocessor=self.preprocessor,
             soft_label_thres=config.soft_label_thres,
             session_len_sec=config.session_len_sec,
             num_spks=config.num_spks,

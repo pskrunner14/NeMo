@@ -26,10 +26,8 @@ import torch.cuda
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
-
 from nemo.collections.asr.data.audio_to_diar_label import AudioToSpeechE2ESpkDiarDataset
 from nemo.collections.asr.parts.preprocessing.features import WaveformFeaturizer
-from nemo.collections.asr.modules import AudioToMelSpectrogramPreprocessor
 from nemo.collections.asr.parts.utils.speaker_utils import read_rttm_lines, get_offset_and_duration, get_vad_out_from_rttm_line
 
 def is_rttm_length_too_long(rttm_file_path, wav_len_in_sec): 
@@ -74,20 +72,9 @@ class TestAudioToSpeechE2ESpkDiarDataset:
 
             f.seek(0)
             featurizer = WaveformFeaturizer(sample_rate=16000, int_values=False, augmentor=None)
-            preprocessor = AudioToMelSpectrogramPreprocessor(normalize="per_feature",
-                                                            window_size=0.025,
-                                                            sample_rate=16000,
-                                                            window_stride=0.01,
-                                                            window="hann",
-                                                            features=128,
-                                                            n_fft=512,
-                                                            frame_splicing=1,
-                                                            dither=0.00001
-                                                        )
 
             dataset = AudioToSpeechE2ESpkDiarDataset(
                 manifest_filepath=f.name,
-                preprocessor=preprocessor,
                 soft_label_thres=0.5,
                 session_len_sec=90,
                 num_spks=4,

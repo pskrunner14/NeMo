@@ -1017,7 +1017,6 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         self,
         *,
         manifest_filepath: str,
-        preprocessor,
         soft_label_thres: float,
         session_len_sec: float,
         num_spks: int,
@@ -1035,7 +1034,6 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
             manifests_files=manifest_filepath.split(','),
             round_digits=round_digits,
         )
-        self.preprocessor = preprocessor
         self.featurizer = featurizer
         self.round_digits = round_digits
         self.feat_per_sec = int(1 / window_stride)
@@ -1275,8 +1273,6 @@ class AudioToSpeechE2ESpkDiarDataset(_AudioToSpeechE2ESpkDiarDataset):
     Args:
         manifest_filepath (str):
             Path to the input manifest JSON file containing paths to audio and RTTM files.
-        preprocessor:
-            Preprocessor instance for processing the raw audio data.
         soft_label_thres (float):
             Threshold for assigning soft labels to segments based on RTTM file information.
         session_len_sec (float):
@@ -1301,7 +1297,6 @@ class AudioToSpeechE2ESpkDiarDataset(_AudioToSpeechE2ESpkDiarDataset):
         self,
         *,
         manifest_filepath: str,
-        preprocessor,
         soft_label_thres: float,
         session_len_sec: float,
         num_spks: int,
@@ -1312,7 +1307,6 @@ class AudioToSpeechE2ESpkDiarDataset(_AudioToSpeechE2ESpkDiarDataset):
     ):
         super().__init__(
             manifest_filepath=manifest_filepath,
-            preprocessor=preprocessor,
             soft_label_thres=soft_label_thres,
             session_len_sec=session_len_sec,
             num_spks=num_spks,

@@ -2,8 +2,40 @@ Models
 ======
 
 This section gives a brief overview of the supported speaker diarization models in NeMo's ASR collection.
+NeMo Speaker diarization provides two types of speaker diarization framework: Modular (pipelined) Diarization system and End-to-end Diarization system.
 
-Currently speaker diarization pipeline in NeMo involves `MarbleNet <../speech_classification/models.html#marblenet-vad>`__ model for Voice Activity Detection (VAD) and `TitaNet <../speaker_recognition/models.html#titanet>`__ models for speaker embedding extraction and `Multi-scale Diarizerion Decoder` for neural diarizer,  which will be explained in this page.
+1. End-to-end Diarization system:
+
+Sortformer Diarizer `Sortformer Diarizer` performs Voice Activity Detection (VAD), speaker assignment in a single neural model.
+
+2. Modular (pipelined) Diarization system:
+
+Currently speaker diarization pipeline in NeMo involves `MarbleNet <../speech_classification/models.html#marblenet-vad>`__ model for VAD and `TitaNet <../speaker_recognition/models.html#titanet>`__ models for speaker embedding extraction and `Multi-scale Diarizerion Decoder` for neural diarizer,  which will be explained in this page.
+
+
+Speaker Diarization Models
+----------------
+
+.. _Sortformer_Diarizer:
+
+Sortformer Diarizer
+--------------------
+
+.. image:: images/intro_comparison.png
+        :align: center
+        :width: 400px
+        :alt: Sortformer architecture
+
+Sortformer is a Transformer-based architecture that is trained on sort-loss and generates speaker labels in terms of arrival-time order.
+Sortformer resolves permutation problem in diarization following the arrival-time order of the speech segments from each speaker.
+
+.. image:: images/sortformer.png
+        :align: center
+        :width: 400px
+        :alt: Sortformer architecture
+
+Sortformer includes NEST encoder
+
 
 .. _Multi_Scale_Diarization_Decoder:
 

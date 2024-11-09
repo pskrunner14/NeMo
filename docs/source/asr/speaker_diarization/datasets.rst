@@ -5,7 +5,6 @@ This page is about formatting a dataset for diarization training and inference. 
 
 * To train or fine-tune a speaker embedding extractor model separately, please go check out these pages: :doc:`Speech Classification Datasets <../speech_classification/datasets>` and :doc:`Speaker Recognition Datasets <../speaker_recognition/datasets>` for preparing datasets for training and validating VAD and speaker embedding models respectively.   
 
-
 * To train or fine-tune speaker embedding extractor and neural diarizer together, please follow the dataset preparation process in this page.
 
 Data Preparation for Training 
@@ -215,50 +214,50 @@ The following are descriptions about each field in an input manifest JSON file.
    TS3012d.Mix-Headset 1 13.203 0.24 yeah NA lex MTD046ID
 
 
-Evaluation on Benchmark Datasets
---------------------------------
+.. Evaluation on Benchmark Datasets
+.. --------------------------------
 
-The following instructions can help one to reproduce the expected diarization performance on two benchmark English dialogue datasets. The following results are evaluations based on 0.25 second collar without evaluating overlapped speech. The evaluation is based on oracle VAD results from RTTM files. Therefore, diarization error rate (DER) is equal to confusion error rate since oracle VAD has no miss detection or false alarm.
+.. The following instructions can help one to reproduce the expected diarization performance on two benchmark English dialogue datasets. The following results are evaluations based on 0.25 second collar without evaluating overlapped speech. The evaluation is based on oracle VAD results from RTTM files. Therefore, diarization error rate (DER) is equal to confusion error rate since oracle VAD has no miss detection or false alarm.
 
-AMI Meeting Corpus
-~~~~~~~~~~~~~~~~~~
+.. AMI Meeting Corpus
+.. ~~~~~~~~~~~~~~~~~~
 
-The following are the suggested parameters for reproducing the diarization performance for `AMI <https://groups.inf.ed.ac.uk/ami/corpus/>`_ test set. This setting is based on meeting domain configuration in  ``<NeMo_git_root>/examples/speaker_tasks/diarization/conf/inference/diar_infer_meeting.yaml``
+.. The following are the suggested parameters for reproducing the diarization performance for `AMI <https://groups.inf.ed.ac.uk/ami/corpus/>`_ test set. This setting is based on meeting domain configuration in  ``<NeMo_git_root>/examples/speaker_tasks/diarization/conf/inference/diar_infer_meeting.yaml``
 
-.. code-block:: bash
+.. .. code-block:: bash
 
-  diarizer.manifest_filepath="/path/to/AMItest_input_manifest.json"
-  diarizer.oracle_num_speakers=null # Performing unknown number of speaker case 
-  diarizer.oracle_vad=True # Use oracle VAD extracted from RTTM files.
-  diarizer.collar=0.25
-  diarizer.ignore_overlap=True 
-  diarizer.speaker_embeddings.model_path="titanet_large"
+..   diarizer.manifest_filepath="/path/to/AMItest_input_manifest.json"
+..   diarizer.oracle_num_speakers=null # Performing unknown number of speaker case 
+..   diarizer.oracle_vad=True # Use oracle VAD extracted from RTTM files.
+..   diarizer.collar=0.25
+..   diarizer.ignore_overlap=True 
+..   diarizer.speaker_embeddings.model_path="titanet_large"
 
-We provide a helper script to download the dataset and format it into a NeMo manifest.
+.. We provide a helper script to download the dataset and format it into a NeMo manifest.
 
-.. code-block:: bash
+.. .. code-block:: bash
 
-    python scripts/data_processing/speaker_tasks/get_ami_data.py --manifest_filepath AMItest_input_manifest.json
-
-
-CallHome American English Speech (CHAES), LDC97S42
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-We use the CH109 set which is a subset of the CHAES dataset which has only two speakers in one session. 
-The following are the suggested parameters for reproducing the diarization performance for the CH109 set and this setting is based on telephonic domain configuration in ``<NeMo_git_root>/examples/speaker_tasks/diarization/conf/inference/diar_infer_telephonic.yaml``
-
-.. code-block:: bash
-
-  diarizer.manifest_filepath="/path/to/ch109_input_manifest.json"
-  diarizer.oracle_vad=True # Use oracle VAD extracted from RTTM files.
-  diarizer.collar=0.25
-  diarizer.ignore_overlap=True 
-  diarizer.speaker_embeddings.model_path="titanet_large"
+..     python scripts/data_processing/speaker_tasks/get_ami_data.py --manifest_filepath AMItest_input_manifest.json
 
 
-To evaluate the performance on AMI Meeting Corpus, the following instructions can help.
-  - Download CHAES Meeting Corpus at LDC website `LDC97S42 <https://catalog.ldc.upenn.edu/LDC97S42>`_ (CHAES is not publicly available).
-  - Download the CH109 filename list (whitelist) from `CH109 whitelist <https://raw.githubusercontent.com/tango4j/diarization_annotation/main/CH109/ch109_whitelist.txt>`_.
-  - Download RTTM files for CH109 set from `CH109 RTTM files <https://raw.githubusercontent.com/tango4j/diarization_annotation/main/CH109/split_rttms.tar.gz>`_.
-  - Generate an input manifest file using ``<NeMo_git_root>/scripts/speaker_tasks/pathfiles_to_diarize_manifest.py``
+.. CallHome American English Speech (CHAES), LDC97S42
+.. ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. We use the CH109 set which is a subset of the CHAES dataset which has only two speakers in one session. 
+.. The following are the suggested parameters for reproducing the diarization performance for the CH109 set and this setting is based on telephonic domain configuration in ``<NeMo_git_root>/examples/speaker_tasks/diarization/conf/inference/diar_infer_telephonic.yaml``
+
+.. .. code-block:: bash
+
+..   diarizer.manifest_filepath="/path/to/ch109_input_manifest.json"
+..   diarizer.oracle_vad=True # Use oracle VAD extracted from RTTM files.
+..   diarizer.collar=0.25
+..   diarizer.ignore_overlap=True 
+..   diarizer.speaker_embeddings.model_path="titanet_large"
+
+
+.. To evaluate the performance on AMI Meeting Corpus, the following instructions can help.
+..   - Download CHAES Meeting Corpus at LDC website `LDC97S42 <https://catalog.ldc.upenn.edu/LDC97S42>`_ (CHAES is not publicly available).
+..   - Download the CH109 filename list (whitelist) from `CH109 whitelist <https://raw.githubusercontent.com/tango4j/diarization_annotation/main/CH109/ch109_whitelist.txt>`_.
+..   - Download RTTM files for CH109 set from `CH109 RTTM files <https://raw.githubusercontent.com/tango4j/diarization_annotation/main/CH109/split_rttms.tar.gz>`_.
+..   - Generate an input manifest file using ``<NeMo_git_root>/scripts/speaker_tasks/pathfiles_to_diarize_manifest.py``
 

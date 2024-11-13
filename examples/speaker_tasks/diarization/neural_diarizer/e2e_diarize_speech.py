@@ -380,7 +380,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
                                                             collar=cfg.collar, 
                                                             ignore_overlap=cfg.ignore_overlap
                                                             )
-        logging.info("PostProcessingParams:", postprocessing_cfg)
+        logging.info(f"PostProcessingParams: {postprocessing_cfg}")
 
 if __name__ == '__main__':
     main()

@@ -26,6 +26,7 @@ from nemo.collections.common.parts.preprocessing.collections import DiarizationS
 # from nemo.collections.common.parts.preprocessing.collections_eesd import EndtoEndDiarizationSpeechLabel
 from nemo.core.classes import Dataset
 from nemo.core.neural_types import AudioSignal, EncodedRepresentation, LengthsType, NeuralType, ProbsType
+from nemo.utils import logging
 
 def get_scale_mapping_list(uniq_timestamps):
     """
@@ -249,15 +250,16 @@ def get_frame_targets_from_rttm(
     sorted_speakers = sorted(list(set(speaker_list)))
     total_fr_len = int(duration * feat_per_sec)
     if len(sorted_speakers) > max_spks:
-        raise ValueError(f"Number of speakers in RTTM file {len(sorted_speakers)} exceeds the maximum number of speakers: {max_spks}")
+        logging.warning(f"Number of speakers in RTTM file {len(sorted_speakers)} exceeds the maximum number of speakers: {max_spks}! Only {max_spks} first speakers remain, and this will affect frame metrics!")
     feat_level_target = torch.zeros(total_fr_len, max_spks) 
     for count, (stt, end, spk_rttm_key) in enumerate(zip(stt_list, end_list, speaker_list)):
         if end < offset or stt > offset + duration:
             continue
         stt, end = max(offset, stt), min(offset + duration, end)
         spk = spk_rttm_key
-        stt_fr, end_fr = int((stt - offset) * feat_per_sec), int((end - offset)* feat_per_sec)
-        feat_level_target[stt_fr:end_fr, spk] = 1
+        if spk < max_spks:
+            stt_fr, end_fr = int((stt - offset) * feat_per_sec), int((end - offset)* feat_per_sec)
+            feat_level_target[stt_fr:end_fr, spk] = 1
     return feat_level_target
 
 

@@ -9,6 +9,15 @@ Both training and inference of speaker diarization is configured by ``.yaml`` fi
   for other applications such as possible integration with ASR, have a look at ``<NeMo_git_root>/tutorials/speaker_tasks/ASR_with_SpeakerDiarization.ipynb``.
 
 
+Modular Speaker Diarization
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+
+
+Modular Speaker Diarization
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 Hydra Configurations for Diarization Training 
 =============================================
 

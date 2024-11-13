@@ -7,6 +7,26 @@ In speaker diarization, the diarizer loads checkpoints that are passed through t
 Loading Local Checkpoints
 ---------------------------
 
+
+End-to-end speaker Diarization
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+Load VAD models
+
+.. code-block:: bash
+
+  pretrained_vad_model='/path/to/vad_multilingual_marblenet.nemo' # local .nemo or pretrained vad model name
+  ...
+  # pass with hydra config
+  config.diarizer.vad.model_path=pretrained_vad_model
+
+
+
+
+Modular Speaker Diarization
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 Load VAD models
 
 .. code-block:: bash

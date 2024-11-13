@@ -1015,19 +1015,28 @@ class LibriSpeechMixSimulator():
 
     def __init__(
         self,
-        data_type: str = "diar",
+        data_type: str = "msasr",
         min_delay: float = 0.5,
         max_num_speakers: int = 4,
+        speaker_token_position: str = 'sot',
         speaker_count_distribution: List[float] = [0, 2, 3, 4],
-        delay_factor: int = 4
+        delay_factor: int = 1
     ):
         """
+        Args:
+        data_type: the type of data to simulate. Either 'msasr', 'tsasr' or 'diar'. [Default: 'msasr']
+        min_delay: the minimum delay between the segments. [Default: 0.5]
+        max_num_speakers: the maximum number of speakers in the meeting. [Default: 4]
+        speaker_token_position: the position of the speaker token in the text. Either 'sot', 'word', or 'segments'. [Default: 'sot']
+        speaker_count_distribution: the speaker count distribution for the simulated meetings. [Default: [0, 2, 3, 4]]
+        delay_factor: the number of times to repeat the meeting with the same speakers. [Default: 1]
         """
         super().__init__()
         self.data_type = data_type
         self.min_delay = min_delay
         self.delay_factor = delay_factor
         self.max_num_speakers = max_num_speakers
+        self.speaker_token_position = speaker_token_position
         self.speaker_count_distribution = speaker_count_distribution
         assert len(speaker_count_distribution) == max_num_speakers, f"Length of speaker_count_distribution {len(speaker_count_distribution)} must be equal to max_num_speakers {max_num_speakers}"
 
@@ -1074,7 +1083,7 @@ class LibriSpeechMixSimulator():
             mixed_cut = MixedCut(id='lsmix_' + '_'.join([track.cut.id for track in tracks]) + '_' + str(uuid4()), tracks=tracks)
             
             if self.data_type == "msasr":
-                text = self.get_text(mixed_cut)
+                text = self.get_text(mixed_cut, speaker_token_position=self.speaker_token_position)
                 sup = SupervisionSegment(id=mixed_cut.id, recording_id=mixed_cut.id, start=0, duration=mixed_cut.duration, text=text)
                 mixed_cut.tracks[0].cut.supervisions = [sup]
 
@@ -1094,16 +1103,43 @@ class LibriSpeechMixSimulator():
     def get_text(self, cut: MixedCut, speaker_token_style='<|spltoken*|>', speaker_token_position='sot') -> str:
         text = ''
         stt_words_spks = []
-        if speaker_token_position == 'word':
-            pass
-        elif speaker_token_position == 'segments':
-            pass
+        if speaker_token_position == 'word' or speaker_token_position == 'segment':
+            SSP = SyllableTokenizer()
+            for i, track in enumerate(cut.tracks):
+                stt_time, end_time = track.offset, track.offset + track.cut.duration
+                word_seq = track.cut.text
+                word_list = word_seq.split()
+                syllab_word_list = [[] for _ in range(len(word_list))]
+                syllab_list = []
+                for idx,word in enumerate(word_list):
+                    syllables = SSP.tokenize(word)
+                    syllab_word_list[idx].extend(syllables)
+                    syllab_list.extend(syllables)
+                avg_sylllable_dur = (end_time - stt_time) / len(syllab_list)
+                offset = stt_time
+                stt_times, end_times = [], []
+                for word, syllabs in zip(word_list, syllab_word_list):
+                    stt_times.append(round(offset, 3))
+                    end_time = round(offset + avg_sylllable_dur * len(syllabs), 3)
+                    end_times.append(end_time)
+                    offset = end_time
+                    stt_words_spks.append([offset, word, speaker_token_style.replace('*', str(i))])
+            stt_words_spks = sorted(stt_words_spks, key=lambda x: x[0])
+            if speaker_token_position == 'word':
+                text += ' '.join([f'{spk} {word}' for stt_time, word, spk in stt_words_spks])   
+            elif speaker_token_position == 'segment':
+                pre_spk = ''
+                for stt_time, word, spk in stt_words_spks:
+                    if pre_spk != spk:
+                        text += spk + ' '
+                        pre_spk = spk
+                    text += word + ' '
         elif speaker_token_position == 'sot':
-            text = ''
             for i, track in enumerate(cut.tracks):
                 cut = track.cut
                 text += speaker_token_style.replace('*', str(i)) + ' ' + cut.text + ' '
-
+        else:
+            raise ValueError(f"speaker_token_position must be either 'sot', 'word', or 'segments', but got {speaker_token_position}")
         return text
     
     def apply_speaker_distribution(self, num_meetings: int, speaker_count_distribution) -> Dict[int, int]:

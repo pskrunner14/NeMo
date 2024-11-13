@@ -225,6 +225,7 @@ def get_lhotse_dataloader_from_config(
                     data_type=simulator_config.ms_data_type,
                     min_delay=0.5,
                     max_num_speakers=simulator_config.max_num_speakers,
+                    speaker_token_position=simulator_config.speaker_token_position,
                     speaker_count_distribution=simulator_config.speaker_count_distribution,
                     delay_factor=simulator_config.delay_factor,
                 )

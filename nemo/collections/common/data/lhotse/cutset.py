@@ -128,7 +128,6 @@ def read_dataset_config(config) -> tuple[CutSet, bool]:
         "text_field": config.text_field,
         "lang_field": config.lang_field,
         "metadata_only": config.metadata_only,
-        "force_finite": config.force_finite,
         "max_open_streams": config.max_open_streams,
     }
     input_cfg = config.input_cfg
@@ -245,7 +244,7 @@ def parse_and_combine_datasets(
             weights=weights if weights else None,
             max_open_streams=propagate_attrs["max_open_streams"],
             seed=propagate_attrs["shard_seed"],
-            force_finite=propagate_attrs["force_finite"] or propagate_attrs["metadata_only"],
+            metadata_only=propagate_attrs["metadata_only"],
         )
     else:
         (cuts,) = cuts
@@ -270,7 +269,6 @@ def read_lhotse_manifest(config, is_tarred: bool) -> CutSet:
         #   This is mostly useful for unit testing or debugging.
         shard_seed = config.shard_seed
         metadata_only = config.metadata_only
-        force_finite = config.force_finite
         if config.get("cuts_path") is not None:
             warnings.warn("Note: lhotse.cuts_path will be ignored because lhotse.shar_path was provided.")
         if isinstance(config.shar_path, (str, Path)):
@@ -278,7 +276,7 @@ def read_lhotse_manifest(config, is_tarred: bool) -> CutSet:
             cuts = CutSet.from_shar(
                 **_resolve_shar_inputs(config.shar_path, metadata_only), shuffle_shards=True, seed=shard_seed
             )
-            if not metadata_only and not force_finite:
+            if not metadata_only:
                 cuts = cuts.repeat()
         else:
             # Multiple datasets in Lhotse Shar format: we will dynamically multiplex them
@@ -315,7 +313,7 @@ def read_lhotse_manifest(config, is_tarred: bool) -> CutSet:
                 weights=weights,
                 max_open_streams=config.max_open_streams,
                 seed=config.shard_seed,
-                force_finite=force_finite,
+                metadata_only=metadata_only,
             )
     else:
         # Regular Lhotse manifest points to individual audio files (like native NeMo manifest).
@@ -395,7 +393,6 @@ def read_nemo_manifest(config, is_tarred: bool) -> CutSet:
     # and other data statistics.
     notar_kwargs = {"metadata_only": config.metadata_only}
     metadata_only = config.metadata_only
-    force_finite = config.force_finite
     if isinstance(config.manifest_filepath, (str, Path)):
         logging.info(f"Initializing Lhotse CutSet from a single NeMo manifest (tarred): '{config.manifest_filepath}'")
         if is_tarred and not metadata_only:
@@ -405,9 +402,7 @@ def read_nemo_manifest(config, is_tarred: bool) -> CutSet:
                     tar_paths=config.tarred_audio_filepaths,
                     **common_kwargs,
                 )
-            )
-            if not force_finite:
-                cuts = cuts.repeat()
+            ).repeat()
         else:
             cuts = CutSet(LazyNeMoIterator(config.manifest_filepath, **notar_kwargs, **common_kwargs))
     else:
@@ -473,7 +468,7 @@ def read_nemo_manifest(config, is_tarred: bool) -> CutSet:
             weights=weights,
             max_open_streams=config.max_open_streams,
             seed=config.shard_seed,
-            force_finite=force_finite or metadata_only,
+            metadata_only=metadata_only,
         )
     return cuts
 
@@ -483,7 +478,7 @@ def mux(
     weights: list[int | float],
     max_open_streams: int | None = None,
     seed: str | int = "trng",
-    force_finite: bool = False,
+    metadata_only: bool = False,
 ) -> CutSet:
     """
     Helper function to call the right multiplexing method flavour in lhotse.
@@ -491,10 +486,10 @@ def mux(
     it will select a more appropriate multiplexing strategy.
     """
     if max_open_streams is not None:
-        assert not force_finite, "max_open_streams and metadata_only/force_finite options are not compatible"
+        assert not metadata_only, "max_open_streams and metadata_only options are not compatible"
         cuts = CutSet.infinite_mux(*cutsets, weights=weights, seed=seed, max_open_streams=max_open_streams)
     else:
-        if not force_finite:
+        if not metadata_only:
             cutsets = [cs.repeat() for cs in cutsets]
         cuts = CutSet.mux(*cutsets, weights=weights, seed=seed)
     return cuts

@@ -86,7 +86,6 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
         tokens = [torch.as_tensor(self.tokenizer(c.supervisions[0].text, c.supervisions[0].language)) for c in cuts]
         token_lens = torch.tensor([t.size(0) for t in tokens], dtype=torch.long)
         tokens = collate_vectors(tokens, padding_value=0)
-
         return audio, audio_lens, tokens, token_lens, spk_targets, spk_mappings
 
     def cuts2mixcuts(self, cuts):

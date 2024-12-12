@@ -550,15 +550,7 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
 
     def conformer_stream_step(
         self,
-        audio_signal: torch.Tensor,
         processed_signal: torch.Tensor,
-        spk_targets: torch.Tensor,
-        global_mapping: dict,
-        text_idx: int,
-        token_idx: int,
-        raw_texts: str,
-        prev_spk: str,
-        audio_signal_lengths: torch.Tensor = None,
         processed_signal_length: torch.Tensor = None,
         cache_last_channel: torch.Tensor = None,
         cache_last_time: torch.Tensor = None,
@@ -569,6 +561,11 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
         drop_extra_pre_encoded: int = None,
         return_transcription: bool = True,
         return_log_probs: bool = False,
+        mem_last_time: torch.Tensor = None,
+        fifo_last_time: torch.Tensor = None,
+        left_offset: torch.Tensor = None,
+        right_offset: torch.Tensor = None,
+        pad_and_drop_preencoded: bool = False,
     ):
         """
         For detailed usage, please refer to ASRModuleMixin.conformer_stream_step
@@ -602,30 +599,23 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
             drop_extra_pre_encoded=drop_extra_pre_encoded,
         )
         encoded = torch.transpose(encoded, 1, 2) # B * D * T -> B * T * D
-
-        if self.diar == True:
-            if self.cfg.spk_supervision_strategy == 'rttm':
-                if spk_targets is not None:
-                    diar_preds = spk_targets 
-                else:
-                    raise ValueError("`spk_targets` is required for speaker supervision strategy 'rttm'")
-            elif self.cfg.spk_supervision_strategy == 'diar':
-                with torch.set_grad_enabled(not self.cfg.freeze_diar):
-                    diar_preds, _preds, attn_score_stack, total_memory_list, encoder_states_list = self.forward_diar(audio_signal, audio_signal_lengths)
-                    if self.binarize_diar_preds_threshold:
-                        diar_preds = torch.where(diar_preds > self.binarize_diar_preds_threshold, torch.tensor(1), torch.tensor(0)).to(encoded.device)
-                    if diar_preds is None:
-                        raise ValueError("`diar_pred`is required for speaker supervision strategy 'diar'")
-            elif self.cfg.spk_supervision_strategy == 'mix':
-                with torch.set_grad_enabled(not self.cfg.freeze_diar):
-                    diar_preds, _preds, attn_score_stack, total_memory_list, encoder_states_list = self.forward_diar(audio_signal, audio_signal_lengths)
-                    if self.binarize_diar_preds_threshold:
-                        diar_preds = torch.where(diar_preds > self.binarize_diar_preds_threshold, torch.tensor(1), torch.tensor(0)).to(encoded.device)
-                    diar_preds = self.fix_diar_output(diar_preds, spk_targets.shape[1])
-                diar_preds = self._get_probablistic_mix(diar_preds=diar_preds, spk_targets=spk_targets, rttm_mix_prob=float(self.cfg.rttm_mix_prob))
-            else:
-                raise ValueError(f"Invalid RTTM strategy {self.cfg.spk_supervision_strategy} is not supported.")
+        (
+            mem_last_time,
+            fifo_last_time,
+            mem_preds,
+            fifo_preds,
+            diar_pred_out_stream
+        ) = self.diar_model.forward_streaming_step(
+            processed_signal=processed_signal.transpose(1, 2),
+            processed_signal_length=processed_signal_length,
+            mem_last_time=mem_last_time,
+            fifo_last_time=fifo_last_time,
+            previous_pred_out=diar_pred_out_stream,
+            left_offset=left_offset,
+            right_offset=right_offset,
+        )
         
+        if self.diar == True:
             # Speaker mapping shuffling to equalize the speaker label's distributions
             if self.cfg.shuffle_spk_mapping:
                 diar_preds = apply_spk_mapping(diar_preds, spk_mappings)
@@ -714,186 +704,6 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
             greedy_predictions = [hyp.y_sequence for hyp in best_hyp]
             if all_hyp_or_transcribed_texts is None:
                 all_hyp_or_transcribed_texts = best_hyp
-
-        '''
-        spk mapping recovery from global rttm mapping
-        '''
-
-        # processing_text = all_hyp_or_transcribed_texts[0].text[text_idx:]
-        # elements = processing_text.split()
-        # output = []
-        # for element in elements:
-        #     if element == '<|spltoken0|>' and 0 in global_mapping.keys():
-        #         element = f'<|spltoken{global_mapping[0]}|>'
-        #     elif element == '<|spltoken1|>' and 1 in global_mapping.keys():
-        #         element = f'<|spltoken{global_mapping[1]}|>'
-        #     elif element == '<|spltoken2|>' and 2 in global_mapping.keys():
-        #         element = f'<|spltoken{global_mapping[2]}|>'
-        #     elif element == '<|spltoken3|>' and 3 in global_mapping.keys():
-        #         element = f'<|spltoken{global_mapping[3]}|>'
-        #     output.append(element)
-        # if not raw_texts:
-        #     raw_texts = ' '.join(output)
-        # else:
-        #     raw_texts = raw_texts +  ' ' + ' '.join(output)
-
-        # merged_output = []
-        # prev_spk = 'kkkk'
-        # for i in range(len(output)):
-        #     element = output[i]
-        #     if element.find('spltoken') != -1:
-        #         if element == prev_spk:
-        #             continue
-        #         else:
-        #             prev_spk = element
-        #     merged_output.append(element)
-        # print(' '.join(merged_output))
-
-        # import pdb; pdb.set_trace()
-        # kkkkk = raw_texts.split()
-        # kkkkk_sub = []
-        # prev_spk = 'kkkkk'
-        # for i in range(len(kkkkk)):
-        #     element = kkkkk[i]
-        #     if element.find('spltoken') != -1:
-        #         if element == prev_spk:
-        #             continue
-        #         else:
-        #             prev_spk = element
-        #     kkkkk_sub.append(element)
-        # print(' '.join(kkkkk_sub))
-        # import pdb; pdb.set_trace()             
-
-        '''
-        spk mapping recovery from alignment
-        '''
-
-        # assert len(all_hyp_or_transcribed_texts[0].y_sequence[token_idx:]) == len(all_hyp_or_transcribed_texts[0].timestep)
-
-        # #get all speaker token in y_sequence
-        # spk_token_idx = []
-        # for i in range(len(all_hyp_or_transcribed_texts[0].y_sequence[token_idx:])):
-        #     if all_hyp_or_transcribed_texts[0].y_sequence[token_idx + i] in [1, 2, 3, 4]:
-        #         spk_token_idx.append(i)
-
-        # processing_text = all_hyp_or_transcribed_texts[0].text[text_idx:]
-        # processing_time_step = all_hyp_or_transcribed_texts[0].timestep
-
-        # spk_token_elements = []
-
-        # for element in processing_text.split():
-        #     if element.find('<|spltoken') != -1:
-        #         spk_token_elements.append(element)
-        # assert len(spk_token_idx) == len(spk_token_elements)
-        # new_spk_token = []
-        # for i in range(len(spk_token_idx)):
-        #     spk_time_step = processing_time_step[spk_token_idx[i]]
-        #     spk_tensor_hidden = spk_targets[0,spk_time_step, :]
-        #     local_spk_token = torch.argmax(spk_tensor_hidden)# 0, 1, 2, 3
-        #     try:
-        #         new_spk_token.append(f'<|spltoken{global_mapping[int(local_spk_token.cpu().numpy())]}|>')
-        #     except:
-        #         new_spk_token.append(f'<|spltoken0|>')
-
-        # output = []
-        # j = 0
-        # for element in processing_text.split():
-        #     if element.find('<|spltoken') != -1:
-        #         output.append(new_spk_token[j])
-        #         j += 1
-        #     else:
-        #         output.append(element)
-        # if not raw_texts:
-        #     raw_texts = ' '.join(output)
-        # else:
-        #     raw_texts = raw_texts + ' ' + ' '.join(output)
-
-        '''
-        spk mapping recovery from alignment oracle
-        '''
-        assert len(all_hyp_or_transcribed_texts[0].y_sequence[token_idx:]) == len(all_hyp_or_transcribed_texts[0].timestep)
-
-        #get all speaker token in y_sequence
-        spk_token_idx = []
-        for i in range(len(all_hyp_or_transcribed_texts[0].y_sequence[token_idx:])):
-            if all_hyp_or_transcribed_texts[0].y_sequence[token_idx + i] in [1, 2, 3, 4]:
-                spk_token_idx.append(i)
-
-        processing_text = all_hyp_or_transcribed_texts[0].text[text_idx:]
-        processing_time_step = all_hyp_or_transcribed_texts[0].timestep
-        new_spk_token = []
-        for i in range(len(spk_token_idx)):
-            spk_time_step = processing_time_step[spk_token_idx[i]]
-            spk_time_step_next = processing_time_step[spk_token_idx[i+1]] if i < len(spk_token_idx) - 1 else spk_targets.shape[1]
-            spk_tensor_hidden = spk_targets[0,spk_time_step:spk_time_step_next+1,:]
-            #get the most probable spk_token
-
-
-            # #not considering overlap, always local spk0
-            # local_spk_token = torch.argmax(torch.sum(spk_tensor_hidden, dim = 0))# 0, 1, 2, 3
-            # try:
-            #     new_spk_token.append(f'<|spltoken{global_mapping[int(local_spk_token.cpu().numpy())]}|>')
-            # except:
-            #     #because too long rttm segments
-            #     import pdb; pdb.set_trace()
-            #     new_spk_token.append(f'<|spltoken0|>')
-
-            #if overlapped spk targets, use preceeding speaker
-            spk_tensor_hidden_sum = torch.sum(spk_tensor_hidden, dim = 0)
-            max_value = torch.max(spk_tensor_hidden_sum)
-            local_spk_token = (spk_tensor_hidden_sum == max_value).nonzero(as_tuple=True)[0]
-            assign_new_speaker = False
-
-            if len(local_spk_token) > 1:
-                k = processing_time_step[spk_token_idx[i]] - 1
-                assign_new_speaker = True
-                # import pdb; pdb.set_trace()
-                while k >= 0 and len(local_spk_token)>1:
-                    max_value = torch.max(spk_targets[0,k,:])
-                    local_spk_token = (spk_targets[0,k,:] == max_value).nonzero(as_tuple=True)[0]
-                    k -= 1
-                if k>=0:
-                    assign_new_speaker = False
-                else:
-                    assigned_spk = prev_spk
-            if not assign_new_speaker:
-                new_spk_token.append(f'<|spltoken{global_mapping[int(local_spk_token.cpu().numpy())]}|>')
-            else:
-                # import pdb; pdb.set_trace()
-                new_spk_token.append(assigned_spk)
-            prev_spk = new_spk_token[-1]
-
-        output = []
-        j = 0
-        for element in processing_text.split():
-            if element.find('<|spltoken') != -1:
-                output.append(new_spk_token[j])
-                j += 1
-            else:
-                output.append(element)
-        if not raw_texts:
-            raw_texts = ' '.join(output)
-        else:
-            raw_texts = raw_texts + ' ' + ' '.join(output)
-            
-        if len(new_spk_token) == 0:
-            new_spk_token.append(prev_spk)
-        # import pdb; pdb.set_trace()
-        result = [
-            greedy_predictions,
-            all_hyp_or_transcribed_texts,
-            raw_texts,
-            cache_last_channel_next,
-            cache_last_time_next,
-            cache_last_channel_next_len,
-            best_hyp,
-            len(all_hyp_or_transcribed_texts[0].text),
-            len(all_hyp_or_transcribed_texts[0].y_sequence),
-            new_spk_token[-1],
-        ]
-        if return_log_probs:
-            result.append(log_probs)
-            result.append(encoded_len)
 
         return tuple(result)
 

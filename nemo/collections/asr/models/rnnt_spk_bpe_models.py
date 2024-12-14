@@ -301,7 +301,7 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
     def train_val_forward(self, batch, batch_nb):
 
         signal, signal_len, transcript, transcript_len, spk_targets, spk_mappings = batch
-
+        logging.info("ASR step")
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
             encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
@@ -310,7 +310,7 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
         
 
         encoded = torch.transpose(encoded, 1, 2) # B * D * T -> B * T * D
-
+        logging.info("Diar Step")
         if self.diar == True:
             if self.cfg.spk_supervision_strategy == 'rttm':
                 if spk_targets is not None:
@@ -548,8 +548,9 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
 
         return tensorboard_logs
 
-    def conformer_stream_step(
+    def diar_conformer_stream_step(
         self,
+        step_num: float,
         processed_signal: torch.Tensor,
         processed_signal_length: torch.Tensor = None,
         cache_last_channel: torch.Tensor = None,
@@ -563,13 +564,10 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
         return_log_probs: bool = False,
         mem_last_time: torch.Tensor = None,
         fifo_last_time: torch.Tensor = None,
-        left_offset: torch.Tensor = None,
-        right_offset: torch.Tensor = None,
-        pad_and_drop_preencoded: bool = False,
+        previous_diar_pred_out: torch.Tensor = None,
+        left_offset: torch.Tensor = 0,
+        right_offset: torch.Tensor = 0,
     ):
-        """
-        For detailed usage, please refer to ASRModuleMixin.conformer_stream_step
-        """
         if not isinstance(self, asr_models.EncDecRNNTModel) and not isinstance(self, asr_models.EncDecCTCModel):
             raise NotImplementedError(f"stream_step does not support {type(self)}!")
 
@@ -583,6 +581,7 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
 
         if not isinstance(self, asr_models.EncDecCTCModel) and return_log_probs is True:
             logging.info("return_log_probs can only be True for CTC models.")
+        logging.info("ASR step")
         (
             encoded,
             encoded_len,
@@ -598,60 +597,81 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
             keep_all_outputs=keep_all_outputs,
             drop_extra_pre_encoded=drop_extra_pre_encoded,
         )
+        # import ipdb; ipdb.set_trace()
         encoded = torch.transpose(encoded, 1, 2) # B * D * T -> B * T * D
+        # import ipdb; ipdb.set_trace()
+        # if step_num > 0:
+        #     left_offset = 8
+        #     processed_signal = processed_signal[..., 1:]
+        #     processed_signal_length -= 1
+
+    # if self.diar == True:
+        logging.info("Diar Step")
         (
             mem_last_time,
             fifo_last_time,
             mem_preds,
             fifo_preds,
             diar_pred_out_stream
-        ) = self.diar_model.forward_streaming_step(
+        ) = self.diarization_model.forward_streaming_step(
             processed_signal=processed_signal.transpose(1, 2),
             processed_signal_length=processed_signal_length,
             mem_last_time=mem_last_time,
             fifo_last_time=fifo_last_time,
-            previous_pred_out=diar_pred_out_stream,
+            previous_pred_out=previous_diar_pred_out,
             left_offset=left_offset,
             right_offset=right_offset,
         )
+        # import ipdb; ipdb.set_trace()
+        diar_preds = diar_pred_out_stream[:,mem_preds.shape[1] + fifo_preds.shape[1]:,:]
+        if(diar_preds.shape[1]!=encoded.shape[1]):
+        # KD duct-tape solution for extending the speaker predictions 
+            asr_frame_count = encoded.shape[1]
+            diar_preds = self.fix_diar_output(diar_preds, asr_frame_count)
+
+        # Normalize the features
+        if self.norm == 'ln':
+            diar_preds = self.diar_norm(diar_preds)
+            encoded = self.asr_norm(encoded)
+        elif self.norm == 'l2':
+            diar_preds = torch.nn.functional.normalize(diar_preds, p=2, dim=-1)
+            encoded = torch.nn.functional.normalize(encoded, p=2, dim=-1)
         
-        if self.diar == True:
-            # Speaker mapping shuffling to equalize the speaker label's distributions
-            if self.cfg.shuffle_spk_mapping:
-                diar_preds = apply_spk_mapping(diar_preds, spk_mappings)
+        if diar_preds.shape[1] > encoded.shape[1]:
+            diar_preds = diar_preds[:, :encoded.shape[1], :]
 
-            if(diar_preds.shape[1]!=encoded.shape[1]):
-            # KD duct-tape solution for extending the speaker predictions 
-                asr_frame_count = encoded.shape[1]
-                diar_preds = self.fix_diar_output(diar_preds, asr_frame_count)
-
-            # Normalize the features
-            if self.norm == 'ln':
-                diar_preds = self.diar_norm(diar_preds)
-                encoded = self.asr_norm(encoded)
-            elif self.norm == 'l2':
-                diar_preds = torch.nn.functional.normalize(diar_preds, p=2, dim=-1)
-                encoded = torch.nn.functional.normalize(encoded, p=2, dim=-1)
-            
-            if diar_preds.shape[1] > encoded.shape[1]:
-                diar_preds = diar_preds[:, :encoded.shape[1], :]
-
-            if self.diar_kernel_type == 'sinusoidal':
-                speaker_infusion_asr = torch.matmul(diar_preds, self.diar_kernel.to(diar_preds.device))
-                if self.kernel_norm == 'l2':
-                    speaker_infusion_asr = torch.nn.functional.normalize(speaker_infusion_asr, p=2, dim=-1)
-                encoded = speaker_infusion_asr + encoded
-            elif self.diar_kernel_type == 'metacat':
-                concat_enc_states = encoded.unsqueeze(2) * diar_preds.unsqueeze(3)
-                concat_enc_states = concat_enc_states.flatten(2,3)
-                encoded = self.joint_proj(concat_enc_states)
-            else:
-                concat_enc_states = torch.cat([encoded, diar_preds], dim=-1)
-                encoded = self.joint_proj(concat_enc_states)
+        if self.diar_kernel_type == 'sinusoidal':
+            speaker_infusion_asr = torch.matmul(diar_preds, self.diar_kernel.to(diar_preds.device))
+            if self.kernel_norm == 'l2':
+                speaker_infusion_asr = torch.nn.functional.normalize(speaker_infusion_asr, p=2, dim=-1)
+            encoded = speaker_infusion_asr + encoded
+        elif self.diar_kernel_type == 'metacat':
+            concat_enc_states = encoded.unsqueeze(2) * diar_preds.unsqueeze(3)
+            concat_enc_states = concat_enc_states.flatten(2,3)
+            encoded = self.joint_proj(concat_enc_states)
+        elif self.diar_kernel_type == 'metacat_residule':
+            #only pick speaker 0
+            concat_enc_states = encoded.unsqueeze(2) * diar_preds[:,:,:1].unsqueeze(3)
+            concat_enc_states = concat_enc_states.flatten(2,3)
+            encoded = encoded + self.joint_proj(concat_enc_states)    
+        elif self.diar_kernel_type == 'metacat_residule_early':
+            #only pick speaker 0
+            concat_enc_states = encoded.unsqueeze(2) * diar_preds[:,:,:1].unsqueeze(3)
+            concat_enc_states = concat_enc_states.flatten(2,3)
+            encoded = self.joint_proj(encoded + concat_enc_states)
+        elif self.diar_kernel_type == 'metacat_residule_projection':
+            #only pick speaker 0 and add diar_preds
+            concat_enc_states = encoded.unsqueeze(2) * diar_preds[:,:,:1].unsqueeze(3)
+            concat_enc_states = concat_enc_states.flatten(2,3)
+            encoded = encoded + concat_enc_states
+            concat_enc_states = torch.cat([encoded, diar_preds], dim = -1)
+            encoded = self.joint_proj(concat_enc_states)
         else:
-            encoded = encoded
-        
-        encoded = torch.transpose(encoded, 1, 2) # B * T * 
+            concat_enc_states = torch.cat([encoded, diar_preds], dim=-1)
+            encoded = self.joint_proj(concat_enc_states)
+        # import ipdb; ipdb.set_trace()
+        encoded = torch.transpose(encoded, 1, 2) # B * T * D -> B * D * T
+
         if isinstance(self, asr_models.EncDecCTCModel) or (
             isinstance(self, asr_models.EncDecHybridRNNTCTCModel) and self.cur_decoder == "ctc"
         ):
@@ -661,6 +681,7 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
             else:
                 decoding = self.decoding
                 decoder = self.decoder
+
             log_probs = decoder(encoder_output=encoded)
             predictions_tensor = log_probs.argmax(dim=-1, keepdim=False)
 
@@ -699,11 +720,28 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
                 encoded_lengths=encoded_len,
                 return_hypotheses=True,
                 partial_hypotheses=previous_hypotheses,
-                # partial_hypotheses=None,
             )
             greedy_predictions = [hyp.y_sequence for hyp in best_hyp]
+
             if all_hyp_or_transcribed_texts is None:
                 all_hyp_or_transcribed_texts = best_hyp
+
+        result = [
+            greedy_predictions,
+            all_hyp_or_transcribed_texts,
+            cache_last_channel_next,
+            cache_last_time_next,
+            cache_last_channel_next_len,
+            best_hyp,
+            mem_last_time,
+            fifo_last_time,
+            mem_preds,
+            fifo_preds,
+            diar_pred_out_stream,
+        ]
+        if return_log_probs:
+            result.append(log_probs)
+            result.append(encoded_len)
 
         return tuple(result)
 

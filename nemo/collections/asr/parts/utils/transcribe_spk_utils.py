@@ -79,6 +79,8 @@ def setup_model(cfg: DictConfig, map_location: torch.device) -> Tuple[ASRModel, 
             asr_model = imported_class.restore_from(
                 restore_path=cfg.model_path, strict = False, map_location=map_location, override_config_path=new_config
             )
+            asr_model._init_diar_model()
+            asr_model.diarization_model.to(asr_model.device)
         else:
             asr_model = imported_class.restore_from(
                 restore_path=cfg.model_path,map_location=map_location,

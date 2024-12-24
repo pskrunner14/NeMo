@@ -146,6 +146,9 @@ def setup_model(cfg: DictConfig, map_location: torch.device) -> Tuple[ASRModel, 
                         orig_config.binarize_diar_preds_threshold = cfg.binarize_diar_preds_threshold
             if 'diar_model_path' in cfg:
                 orig_config.diar_model_path = cfg.diar_model_path
+            if 'disable_preprocessor_norm' in cfg:
+                if cfg.disable_preprocessor_norm:
+                    orig_config.preprocessor.normalize = 'NA'
             new_config = orig_config
             asr_model = imported_class.restore_from(
                 restore_path=cfg.model_path, strict = False, map_location=map_location, override_config_path=new_config

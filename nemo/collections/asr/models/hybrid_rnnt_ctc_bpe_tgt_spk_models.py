@@ -46,6 +46,13 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
         super().__init__(cfg=cfg, trainer=trainer)
+        # import numpy as np
+        # import pickle
+        # with open("/home/jinhanw/Dataset/local/speaker_asr/TS_ASR_manifest_random_query_length/sample_mean.pickle",'rb') as f:
+        #     self.sample_mean_list = pickle.load(f)
+        # with open("/home/jinhanw/Dataset/local/speaker_asr/TS_ASR_manifest_random_query_length/sample_std.pickle",'rb') as f:
+        #     self.sample_std_list = pickle.load(f)
+        # self.sample_index = 0
         if 'diar_model_path' in self.cfg:
             self.diar = True
             # Initialize the speaker branch
@@ -222,8 +229,18 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
     def train_val_forward(self, batch, batch_nb):
 
         signal, signal_len, transcript, transcript_len, spk_targets, spk_mappings = batch
-
         # forward() only performs encoder forward
+        #use actual signal len 
+        # import ipdb; ipdb.set_trace()
+        
+        # import pickle
+        # import numpy as np
+        # with open('/home/jinhanw/workdir/workdir_nemo_speaker_asr/dataloader/pipeline/temp_dir/sample_len.pickle','rb') as f:
+        #     sample_len_list = pickle.load(f)
+        # signal_len[0] = sample_len_list[self.sample_index]
+        # self.sample_index += 1
+
+        
         if (isinstance(batch, DALIOutputs) and batch.has_processed_signal) or signal.shape[1] == 80:
             encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
         else:
@@ -617,3 +634,34 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
         results = []
 
         return results
+    
+    def forward(
+        self, input_signal=None, input_signal_length=None, processed_signal=None, processed_signal_length=None
+    ):
+        has_input_signal = input_signal is not None and input_signal_length is not None
+        has_processed_signal = processed_signal is not None and processed_signal_length is not None
+        if (has_input_signal ^ has_processed_signal) is False:
+            raise ValueError(
+                f"{self} Arguments ``input_signal`` and ``input_signal_length`` are mutually exclusive "
+                " with ``processed_signal`` and ``processed_signal_len`` arguments."
+            )
+
+        # import ipdb; ipdb.set_trace()
+
+        if not has_processed_signal:
+            processed_signal, processed_signal_length = self.preprocessor(
+                input_signal=input_signal,
+                length=input_signal_length,
+            )
+
+        # # import ipdb; ipdb.set_trace()
+        # processed_signal = (torch.transpose(processed_signal, 1,2) - self.sample_mean_list[self.sample_index]) / self.sample_std_list[self.sample_index]
+        # self.sample_index += 1
+        # processed_signal = torch.transpose(processed_signal,1,2)
+
+        # Spec augment is not applied during evaluation/testing
+        if self.spec_augmentation is not None and self.training:
+            processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
+
+        encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
+        return encoded, encoded_len

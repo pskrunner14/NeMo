@@ -41,6 +41,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from nemo.collections.common.data.lhotse.cutset import guess_parse_cutset, read_cutset_from_config
 from nemo.collections.common.prompts.fn import get_prompt_format_fn
+from nemo.collections.asr.parts.utils.asr_multispeaker_utils import ConcatenationMeetingSimulator, MixMeetingSimulator, LibriSpeechMixGenerator, LibriSpeechMixSimulator, LibriSpeechMixGenerator_tgt
 from nemo.utils import logging
 
 
@@ -187,6 +188,15 @@ def get_lhotse_dataloader_from_config(
 
     # 1. Load a manifest as a Lhotse CutSet.
     cuts, is_tarred = read_cutset_from_config(config)
+
+    # librimixgenerator
+    if hasattr(cuts[0], 'delays'):
+        if hasattr(cuts[0],'query_audio_filepath'):
+            generator = LibriSpeechMixGenerator_tgt()
+            cuts = generator.generate(cuts)
+        else:                
+            generator = LibriSpeechMixGenerator()
+            cuts = generator.generate(cuts)    
 
     # Apply channel selector
     if config.channel_selector is not None:

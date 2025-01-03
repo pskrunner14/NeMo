@@ -1322,3 +1322,94 @@ class LibriSpeechMixGenerator():
             cut_set.append(cut_multi_spk)
         
         return CutSet.from_cuts(cut_set)
+    
+class LibriSpeechMixGenerator_tgt():
+    def __init__(self):
+        pass
+
+    def generate(self, cuts):
+        cut_set = []
+        for cut in cuts:
+            offsets = cut.delays
+            durations = cut.durations
+            wavs = cut.wavs
+            text = cut.text
+            query_audio_filepath = cut.query_audio_filepath
+            query_speaker_id = cut.query_speaker_id
+            query_offset = cut.query_offset
+            query_duration = cut.query_duration
+            rttm_filepath = cut.rttm_filepath
+            # speakers = cut.speakers
+
+            tracks = []
+            for i, (offset, duration, wav) in enumerate(zip(offsets, durations, wavs)):
+                custom = {
+                        'query_audio_filepath': query_audio_filepath,
+                        'query_speaker_id': query_speaker_id,
+                        'query_offset': query_offset,
+                        'query_duration': query_duration,
+                        'rttm_filepath': rttm_filepath,
+                        'custom': None
+                    }
+                # custom = {'custom': custom}
+                wav_dur = soundfile.info(wav).duration
+                wav_samples = soundfile.info(wav).frames
+                if i == 0:
+                    cut_1spk = MonoCut(
+                        id=wav.split('/')[-1].replace('.wav', ''),
+                        start=0,
+                        duration=duration,
+                        channel=0,
+                        supervisions=[],
+                        recording=Recording(
+                            id=wav.split('/')[-1].replace('.wav', ''),
+                            sources=[
+                                AudioSource(
+                                    type='file',
+                                    channels=[0],
+                                    source=wav
+                                )
+                            ],
+                            sampling_rate=16000, 
+                            num_samples=wav_samples,
+                            duration=wav_dur
+                        ),
+                        custom = custom
+                    )
+                else:
+                    cut_1spk = MonoCut(
+                        id=wav.split('/')[-1].replace('.wav', ''),
+                        start=0,
+                        duration=duration,
+                        channel=0,
+                        supervisions=[],
+                        recording=Recording(
+                            id=wav.split('/')[-1].replace('.wav', ''),
+                            sources=[
+                                AudioSource(
+                                    type='file',
+                                    channels=[0],
+                                    source=wav
+                                )
+                            ],
+                            sampling_rate=16000, 
+                            num_samples=wav_samples,
+                            duration=wav_dur
+                        ),
+                    )
+                # cut_1spk.custom.update(custom)
+                tracks.append(MixTrack(cut=cut_1spk, type=type(cut_1spk), offset=offset))
+
+            cut_multi_spk = MixedCut(id=cut.rttm_filepath.split('/')[-1][:-5], tracks=tracks)
+            sup = SupervisionSegment(
+                id=cut.id,
+                recording_id=cut.recording_id,
+                start=0,
+                duration=offset+wav_dur,
+                text=cut.text,
+            )
+            cut_multi_spk.tracks[0].cut.supervisions = [sup]
+            cut_set.append(cut_multi_spk)
+        
+        return CutSet.from_cuts(cut_set)
+

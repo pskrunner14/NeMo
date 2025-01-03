@@ -157,7 +157,8 @@ class LhotseSpeechToTextTgtSpkBpeDataset(torch.utils.data.Dataset):
         rttms = SupervisionSet.from_rttm(a_cut.rttm_filepath)
         basename = os.path.basename(a_cut.rttm_filepath).replace('.rttm', '')
         if isinstance(a_cut, MixedCut):
-            cut_list = [track.cut for track in a_cut.tracks] 
+            # cut_list = [track.cut for track in a_cut.tracks] 
+            cut_list = [track for track in a_cut.tracks] # is a list of track
         elif isinstance(a_cut, MonoCut):
             cut_list = [a_cut]
         else:
@@ -166,9 +167,15 @@ class LhotseSpeechToTextTgtSpkBpeDataset(torch.utils.data.Dataset):
         segments_total = []
         for cut in cut_list:
             if boundary_segments: # segments with seg_start < total_end and seg_end > total_start are included
-                segments_iterator = find_segments_from_rttm(recording_id=cut.recording_id, rttms=rttms, start_after=cut.start, end_before=cut.end)
+                if isinstance(a_cut, MixedCut):
+                    segments_iterator = find_segments_from_rttm(recording_id=a_cut.id, rttms=rttms, start_after=cut.offset, end_before=cut.offset + cut.cut.duration)
+                else:
+                    segments_iterator = find_segments_from_rttm(recording_id=cut.recording_id, rttms=rttms, start_after=cut.start, end_before=cut.end)
             else: # segments with seg_start > total_start and seg_end < total_end are included
-                segments_iterator = rttms.find(recording_id=cut.recording_id, start_after=cut.start, end_before=cut.end, adjust_offset=True)
+                if isinstance(a_cut, MixedCut):
+                    segments_iterator = rttms.find(recording_id=a_cut.id, start_after=cut.offset, end_before=cut.offset + cut.cut.duration, adjust_offset=False)
+                else:
+                    segments_iterator = rttms.find(recording_id=cut.recording_id, start_after=cut.start, end_before=cut.end, adjust_offset=True)
             segments = [s for s in segments_iterator]
             segments_total.extend(segments)
         # apply arrival time sorting to the existing segments
@@ -176,6 +183,8 @@ class LhotseSpeechToTextTgtSpkBpeDataset(torch.utils.data.Dataset):
 
         seen = set()
         seen_add = seen.add
+        if isinstance(a_cut, MixedCut):
+            cut = a_cut
         if 'query_speaker_id' in cut.custom:
             speaker_lst = [cut.query_speaker_id] + [s.speaker for s in segments_total] #add query speaker as the first speaker
         else:
@@ -196,7 +205,7 @@ class LhotseSpeechToTextTgtSpkBpeDataset(torch.utils.data.Dataset):
                 mask = np.zeros((num_speakers, encoder_hidden_len))
                 mask[0,:query_hidden_len] = 1
                 if not spk_tar_all_zero:
-                    for rttm_sup in segments:
+                    for rttm_sup in segments_total:
                         speaker_idx = speaker_to_idx_map[rttm_sup.speaker]
                         #only consider the first <num_speakers> speakers
                         if speaker_idx < 4:
@@ -219,12 +228,15 @@ class LhotseSpeechToTextTgtSpkBpeDataset(torch.utils.data.Dataset):
 
             else:
                 encoder_hidden_len = get_hidden_length_from_sample_length(cut.num_samples +  query.num_samples + self.separater_duration * self.cfg.sample_rate, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
+
                 separater_hidden_len = get_hidden_length_from_sample_length(self.separater_duration * self.cfg.sample_rate, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
+
                 query_hidden_len = get_hidden_length_from_sample_length(query.num_samples, num_sample_per_mel_frame, num_mel_frame_per_asr_frame) if 'query_speaker_id' in cut.custom else 0
+
                 mask = np.zeros((num_speakers, encoder_hidden_len))
                 mask[0,:query_hidden_len] = 1
                 if not spk_tar_all_zero:
-                    for rttm_sup in segments:
+                    for rttm_sup in segments_total:
                         speaker_idx = speaker_to_idx_map[rttm_sup.speaker]
                         #only consider the first <num_speakers> speakers
                         if speaker_idx < 4:
@@ -252,7 +264,7 @@ class LhotseSpeechToTextTgtSpkBpeDataset(torch.utils.data.Dataset):
             mask[0,:query_hidden_len] = 1
 
             if not spk_tar_all_zero:
-                for rttm_sup in segments:
+                for rttm_sup in segments_total:
                     speaker_idx = speaker_to_idx_map[rttm_sup.speaker]
                     #only consider the first <num_speakers> speakers
                     if speaker_idx < 4:

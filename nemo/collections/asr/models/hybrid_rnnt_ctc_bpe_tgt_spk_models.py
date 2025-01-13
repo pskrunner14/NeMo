@@ -46,13 +46,7 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
         super().__init__(cfg=cfg, trainer=trainer)
-        # import numpy as np
-        # import pickle
-        # with open("/home/jinhanw/Dataset/local/speaker_asr/TS_ASR_manifest_random_query_length/sample_mean.pickle",'rb') as f:
-        #     self.sample_mean_list = pickle.load(f)
-        # with open("/home/jinhanw/Dataset/local/speaker_asr/TS_ASR_manifest_random_query_length/sample_std.pickle",'rb') as f:
-        #     self.sample_std_list = pickle.load(f)
-        # self.sample_index = 0
+
         if 'diar_model_path' in self.cfg:
             self.diar = True
             # Initialize the speaker branch
@@ -116,8 +110,72 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
             #binarize diar_pred
             self.binarize_diar_preds_threshold = cfg.get('binarize_diar_preds_threshold', None)
 
+            # pre-encode level speaker kernel
+            if cfg.get('add_pre_encode_speaker_kernel', False):
+                self.add_pre_encode_speaker_kernel = True
+                self._init_pre_encode_speaker_kernel(cfg)
+            else:
+                self.add_pre_encode_speaker_kernel = False
+        
         else:
             self.diar = False
+
+    def _init_pre_encode_speaker_kernel(self, cfg):
+            # layer normalization, ln, l2, or None
+        self.pre_end_spk_norm = cfg.get('pre_end_spk_norm', None)
+
+        if cfg.pre_end_spk_norm == 'ln':
+            self.pre_end_spk_asr_norm = torch.nn.LayerNorm(cfg.model_defaults.enc_hidden)
+            self.pre_end_spk_diar_norm = torch.nn.LayerNorm(4)
+
+        self.pre_end_spk_kernel_norm = cfg.get('pre_end_spk_kernel_norm',None)
+
+        # projection layer
+        self.pre_end_spk_diar_kernel_type = cfg.get('pre_end_spk_diar_kernel_type', None)
+
+        proj_in_size = self.num_speakers + cfg.model_defaults.enc_hidden
+        proj_out_size = cfg.model_defaults.enc_hidden
+        self.pre_end_spk_joint_proj = torch.nn.Sequential(
+            torch.nn.Linear(proj_in_size, proj_out_size*2),
+            torch.nn.ReLU(),
+            torch.nn.Linear(proj_out_size*2, proj_out_size)
+        )
+        self.pre_end_spk_diar_kernal = self.joint_proj
+
+        if self.pre_end_spk_diar_kernel_type == 'sinusoidal':
+            self.pre_end_spk_diar_kernel = self.get_sinusoid_position_encoding(self.num_speakers, cfg.model_defaults.enc_hidden)
+        elif self.pre_end_spk_diar_kernel_type == 'metacat':
+            # projection layer
+            proj_in_size = self.num_speakers * cfg.model_defaults.enc_hidden
+            proj_out_size = cfg.model_defaults.enc_hidden
+            self.pre_end_spk_joint_proj = torch.nn.Sequential(
+                torch.nn.Linear(proj_in_size, proj_out_size*2),
+                torch.nn.ReLU(),
+                torch.nn.Linear(proj_out_size*2, proj_out_size)
+            )
+            self.pre_end_spk_diar_kernel = self.pre_end_spk_joint_proj
+        elif self.pre_end_spk_diar_kernel_type == 'metacat_residule' or self.pre_end_spk_diar_kernel_type == 'metacat_residule_early':
+            # projection layer
+            proj_in_size = cfg.model_defaults.enc_hidden
+            proj_out_size = cfg.model_defaults.enc_hidden
+            self.pre_end_spk_joint_proj = torch.nn.Sequential(
+                torch.nn.Linear(proj_in_size, proj_out_size*2),
+                torch.nn.ReLU(),
+                torch.nn.Linear(proj_out_size*2, proj_out_size)
+            )
+            self.pre_end_spk_diar_kernel = self.pre_end_spk_joint_proj
+        elif self.diar_kernel_type == 'metacat_residule_projection':
+            proj_in_size = cfg.model_defaults.enc_hidden + self.num_speakers
+            proj_out_size = cfg.model_defaults.enc_hidden
+            self.pre_end_spk_joint_proj = torch.nn.Sequential(
+                torch.nn.Linear(proj_in_size, proj_out_size*2),
+                torch.nn.ReLU(),
+                torch.nn.Linear(proj_out_size*2, proj_out_size)
+            )
+            self.pre_end_spk_diar_kernel = self.pre_end_spk_joint_proj                
+
+        #binarize diar_pred
+        self.binarize_diar_preds_threshold = cfg.get('binarize_diar_preds_threshold', None)
 
     def _init_diar_model(self):
         """
@@ -229,25 +287,8 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
     def train_val_forward(self, batch, batch_nb):
 
         signal, signal_len, transcript, transcript_len, spk_targets, spk_mappings = batch
-        # forward() only performs encoder forward
-        #use actual signal len 
-        # import ipdb; ipdb.set_trace()
-        
-        # import pickle
-        # import numpy as np
-        # with open('/home/jinhanw/workdir/workdir_nemo_speaker_asr/dataloader/pipeline/temp_dir/sample_len.pickle','rb') as f:
-        #     sample_len_list = pickle.load(f)
-        # signal_len[0] = sample_len_list[self.sample_index]
-        # self.sample_index += 1
 
-        
-        if (isinstance(batch, DALIOutputs) and batch.has_processed_signal) or signal.shape[1] == 80:
-            encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
-        else:
-            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
-        
-
-        encoded = torch.transpose(encoded, 1, 2) # B * D * T -> B * T * D
+        # speaker targetes
         if signal.shape[1] == 80:
             is_raw_waveform_input=False
         else:
@@ -275,9 +316,16 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
                 diar_preds = self._get_probablistic_mix(diar_preds=diar_preds, spk_targets=spk_targets, rttm_mix_prob=float(self.cfg.rttm_mix_prob))
             else:
                 raise ValueError(f"Invalid RTTM strategy {self.cfg.spk_supervision_strategy} is not supported.")
-            
-            del signal
+
+        if (isinstance(batch, DALIOutputs) and batch.has_processed_signal) or signal.shape[1] == 80:
+            encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len, diar_preds=diar_preds)
+        else:
+            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, diar_preds=diar_preds)
+    
+        encoded = torch.transpose(encoded, 1, 2) # B * D * T -> B * T * D
         
+
+        if self.diar == True:        
             # Speaker mapping shuffling to equalize the speaker label's distributions
             if self.cfg.shuffle_spk_mapping:
                 diar_preds = apply_spk_mapping(diar_preds, spk_mappings)
@@ -636,7 +684,7 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
         return results
     
     def forward(
-        self, input_signal=None, input_signal_length=None, processed_signal=None, processed_signal_length=None
+        self, input_signal=None, input_signal_length=None, processed_signal=None, processed_signal_length=None, diar_preds=None
     ):
         has_input_signal = input_signal is not None and input_signal_length is not None
         has_processed_signal = processed_signal is not None and processed_signal_length is not None
@@ -646,22 +694,71 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
                 " with ``processed_signal`` and ``processed_signal_len`` arguments."
             )
 
-        # import ipdb; ipdb.set_trace()
-
         if not has_processed_signal:
             processed_signal, processed_signal_length = self.preprocessor(
                 input_signal=input_signal,
                 length=input_signal_length,
             )
 
-        # # import ipdb; ipdb.set_trace()
-        # processed_signal = (torch.transpose(processed_signal, 1,2) - self.sample_mean_list[self.sample_index]) / self.sample_std_list[self.sample_index]
-        # self.sample_index += 1
-        # processed_signal = torch.transpose(processed_signal,1,2)
-
         # Spec augment is not applied during evaluation/testing
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
 
         encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
+        # import ipdb; ipdb.set_trace()
+        #encode speaker
+        if self.add_pre_encode_speaker_kernel and self.diar:
+            encoded = torch.transpose(encoded, 1, 2)
+            if(diar_preds.shape[1]!=encoded.shape[1]):
+            # KD duct-tape solution for extending the speaker predictions 
+                asr_frame_count = encoded.shape[1]
+                diar_preds = self.fix_diar_output(diar_preds, asr_frame_count)
+
+            # Normalize the features
+            if self.pre_end_spk_norm == 'ln':
+                diar_preds = self.pre_end_spk_diar_norm(diar_preds)
+                encoded = self.pre_end_spk_asr_norm(encoded)
+            elif self.pre_end_spk_norm == 'l2':
+                diar_preds = torch.nn.functional.normalize(diar_preds, p=2, dim=-1)
+                encoded = torch.nn.functional.normalize(encoded, p=2, dim=-1)
+            
+            if diar_preds.shape[1] > encoded.shape[1]:
+                diar_preds = diar_preds[:, :encoded.shape[1], :]
+
+            if self.pre_end_spk_diar_kernel_type == 'sinusoidal':
+                speaker_infusion_asr = torch.matmul(diar_preds, self.pre_end_spk_diar_kernel.to(diar_preds.device))
+                if self.kernel_norm == 'l2':
+                    speaker_infusion_asr = torch.nn.functional.normalize(speaker_infusion_asr, p=2, dim=-1)
+                encoded = speaker_infusion_asr + encoded
+            elif self.pre_end_spk_diar_kernel_type == 'metacat':
+                concat_enc_states = encoded.unsqueeze(2) * diar_preds.unsqueeze(3)
+                concat_enc_states = concat_enc_states.flatten(2,3)
+                encoded = self.pre_end_spk_joint_proj(concat_enc_states)
+            elif self.pre_end_spk_diar_kernel_type == 'metacat_residule':
+                #only pick speaker 0
+                concat_enc_states = encoded.unsqueeze(2) * diar_preds[:,:,:1].unsqueeze(3)
+                concat_enc_states = concat_enc_states.flatten(2,3)
+                encoded = encoded + self.pre_end_spk_joint_proj(concat_enc_states)    
+            elif self.pre_end_spk_diar_kernel_type == 'metacat_residule_early':
+                #only pick speaker 0
+                concat_enc_states = encoded.unsqueeze(2) * diar_preds[:,:,:1].unsqueeze(3)
+                concat_enc_states = concat_enc_states.flatten(2,3)
+                encoded = self.pre_end_spk_joint_proj(encoded + concat_enc_states)
+            elif self.pre_end_spk_diar_kernel_type == 'metacat_residule_projection':
+                #only pick speaker 0 and add diar_preds
+                concat_enc_states = encoded.unsqueeze(2) * diar_preds[:,:,:1].unsqueeze(3)
+                concat_enc_states = concat_enc_states.flatten(2,3)
+                encoded = encoded + concat_enc_states
+                concat_enc_states = torch.cat([encoded, diar_preds], dim = -1)
+                encoded = self.pre_end_spk_joint_proj(concat_enc_states)
+            else:
+                concat_enc_states = torch.cat([encoded, diar_preds], dim=-1)
+                encoded = self.pre_end_spk_joint_proj(concat_enc_states)
+            encoded = torch.transpose(encoded, 1, 2) # B * T * D -> B * D * T
+            
+        else:
+            encoded = encoded
+        
+
+
         return encoded, encoded_len

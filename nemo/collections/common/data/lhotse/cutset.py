@@ -432,7 +432,8 @@ def read_nemo_manifest(config, is_tarred: bool) -> CutSet:
         )
         cutsets = []
         weights = []
-        tar_paths = config.tarred_audio_filepaths if is_tarred else repeat((None,))
+        # tar_paths = config.tarred_audio_filepaths if is_tarred else repeat((None,))
+        tar_paths = config.tarred_audio_filepaths if is_tarred else repeat(None)
         # Create a stream for each dataset.
         for manifest_info, tar_path in zip(config.manifest_filepath, tar_paths):
             if isinstance(tar_path, (list, tuple, ListConfig)):

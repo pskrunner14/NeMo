@@ -12,7 +12,7 @@ name: "FastConformer-Hybrid-Transducer-CTC-BPE"
 model:
   sample_rate: 16000
   compute_eval_loss: false # eval samples can be very long and exhaust memory. Disable computation of transducer loss during validation/testing with this flag.
-  log_prediction: true # enables logging sample predictions in the output during training
+  log_prediction: false # enables logging sample predictions in the output during training
   skip_nan_grad: false
   # Speaker supervision from a diarization model
   freeze_diar: true # If True, diarization model is not trained
@@ -237,7 +237,7 @@ model:
       num_classes: -1
       vocabulary: []
     decoding:
-      strategy: "greedy"
+      strategy: "greedy_batch"
 
   # config for InterCTC loss: https://arxiv.org/abs/2102.03216
   # specify loss weights and which layers to use for InterCTC

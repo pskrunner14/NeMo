@@ -149,6 +149,10 @@ class LhotseDataLoadingConfig:
     # a different number of steps on different DDP ranks.
     force_finite: bool = False
 
+    # 6. Cut generation for MS-ASR
+    generators: Any = None 
+    including_real_data: bool = False
+
 
 def get_lhotse_dataloader_from_config(
     config: DictConfig,
@@ -189,14 +193,33 @@ def get_lhotse_dataloader_from_config(
     # 1. Load a manifest as a Lhotse CutSet.
     cuts, is_tarred = read_cutset_from_config(config)
 
-    # librimixgenerator
-    if hasattr(cuts[0], 'delays'):
-        if hasattr(cuts[0],'query_audio_filepath'):
-            generator = LibriSpeechMixGenerator_tgt()
-            cuts = generator.generate(cuts)
-        else:                
-            generator = LibriSpeechMixGenerator()
-            cuts = generator.generate(cuts)    
+    if config.generators is not None:
+        generated_cuts = CutSet()
+        for generator_name in config.generators.keys():
+            generator_config = config.generators[generator_name]
+            if generator_config.get('manifest_filepath', None):
+                cfg_for_generation = LhotseDataLoadingConfig()
+                cfg_for_generation = OmegaConf.create(cfg_for_generation)
+                cfg_for_generation.manifest_filepath = generator_config.manifest_filepath
+                cuts_for_generation, _ = read_cutset_from_config(cfg_for_generation)
+            else:
+                raise ValueError ('Invalid generator manifest filepath')
+            if generator_config.get('lsmix',False):
+                # # librimixgenerator
+                assert hasattr(cuts_for_generation[0], 'delays')
+                if hasattr(cuts[0],'query_audio_filepath'):
+                    generator = LibriSpeechMixGenerator_tgt()
+                    generated_cuts += generator.generate(cuts_for_generation)
+                else:                
+                    generator = LibriSpeechMixGenerator()
+                    generated_cuts += generator.generate(cuts_for_generation)
+        if config.including_real_data:
+            cuts = CutSet.from_cuts(cuts + generated_cuts)
+        else:
+            cuts = generated_cuts
+        if config.shuffle:
+            cuts = cuts.shuffle()
+
 
     # Apply channel selector
     if config.channel_selector is not None:

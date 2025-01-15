@@ -1329,7 +1329,7 @@ class LibriSpeechMixGenerator_tgt():
 
     def generate(self, cuts):
         cut_set = []
-        for cut in cuts:
+        for cut in tqdm(cuts, desc=f"Generating speaker intra-session mixtures", ncols=128):
             offsets = cut.delays
             durations = cut.durations
             wavs = cut.wavs

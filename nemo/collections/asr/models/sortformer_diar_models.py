@@ -444,15 +444,65 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
     @property
     def output_names(self):
-        # return ["processed_signal", "processed_signal_length"]
-        return ["preds"]
+        return ["mem_chunk_preds", "chunk_pre_encode_embs"]
     
     @property
     def input_names(self):
-        return ["processed_signal", "processed_signal_length"]
-        # return ["audio_signal", "audio_signal_length"]
+        return ["processed_signal", "processed_signal_length", "mem_last_time", "fifo_last_time"]
+        
+    def streaming_input_examples(self):
+        """
+        Input tensor examples for exporting streaming version of model.
+        
+        Returns:
+            processed_signal (torch.Tensor): tensor containing audio waveform
+                Dimension: (batch_size, feature frame count, dimension)
+            processed_signal_length (torch.Tensor): tensor containing lengths of audio waveforms
+                Dimension: (batch_size,)
+            mem_last_time (torch.Tensor): tensor containing memory for the embeddings from start
+                Dimension: (batch_size, mem_len, emb_dim)
+            fifo_last_time (torch.Tensor): tensor containing memory for the embeddings from latest chunks
+                Dimension: (batch_size, fifo_len, emb_dim)
+        """
+        processed_signal = torch.rand([1, 120, 80]).to(self.device)
+        processed_signal_length = torch.tensor([120]).to(self.device)
+        mem_last_time = torch.randn([1, 188, 512]).to(self.device)
+        fifo_last_time = torch.randn([1, 188, 512]).to(self.device)
+        return processed_signal, processed_signal_length, mem_last_time, fifo_last_time
+    
+    def streaming_export(self, output: str):
+        input_example = self.streaming_input_examples()
+        export_out = self.export(output, input_example=input_example) 
+        return export_out
+        
+    def forward_for_export(self, processed_signal, processed_signal_length, mem_last_time, fifo_last_time): 
+        """
+        This forward pass os for ONNX model export.
+        
+        Args:
+            processed_signal (torch.Tensor): tensor containing audio waveform
+                Dimension: (batch_size, feature frame count, dimension)
+            processed_signal_length (torch.Tensor): tensor containing lengths of audio waveforms
+                Dimension: (batch_size,)
+            mem_last_time (torch.Tensor): tensor containing memory for the embeddings from start
+                Dimension: (batch_size, mem_len, emb_dim)
+            fifo_last_time (torch.Tensor): tensor containing memory for the embeddings from latest chunks
+                Dimension: (batch_size, fifo_len, emb_dim) 
+                
+        Returns:
+            mem_chunk_preds (torch.Tensor): Sorted tensor containing predicted speaker labels
+                Dimension: (batch_size, max. diar frame count, num_speakers)
+            chunk_pre_encode_embs (torch.Tensor): tensor containing pre-encoded embeddings from the chunk
+                Dimension: (batch_size, num_frames, emb_dim)
+        """
+        chunk_pre_encode_embs, _ = self.encoder.pre_encode(x=processed_signal, lengths=processed_signal_length)
+        mem_chunk_pre_encode_embs, mem_chunk_pre_encode_lengths = self.sortformer_modules.concat_embs([mem_last_time, fifo_last_time, chunk_pre_encode_embs], return_lengths=True, dim=1, device=self.device) 
+        mem_chunk_fc_encoder_embs, _ = self.frontend_encoder(processed_signal=mem_chunk_pre_encode_embs, processed_signal_length=mem_chunk_pre_encode_lengths, pre_encode_input=True)
+        mem_chunk_preds = self.forward_infer(mem_chunk_fc_encoder_embs)
+        return mem_chunk_preds, chunk_pre_encode_embs
  
-    def forward_for_export(self, processed_signal, processed_signal_length):
+    def __forward_for_export(self, processed_signal, processed_signal_length):
+        """Place holder function"""
         processed_signal = processed_signal[:, :, :processed_signal_length.max()]
         emb_seq, _ = self.frontend_encoder(processed_signal=processed_signal, processed_signal_length=processed_signal_length)
         preds = self.forward_infer(emb_seq)
@@ -506,6 +556,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         previous_pred_out=None,
         left_offset=0,
         right_offset=0,
+        use_forward_export=True,
     ):
         """
         One-step forward pass for diarization inference in streaming mode.
@@ -537,7 +588,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 Dimension: (batch_size, total_pred_len, num_speakers)
             
         """
-
         B = processed_signal.shape[0]
         if mem_last_time is None:
             mem_last_time = self.sortformer_modules.init_memory(batch_size=B, d_model=self.sortformer_modules.fc_d_model, device=self.device)# memory to save the embeddings from start
@@ -546,12 +596,13 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         if previous_pred_out is None:
             previous_pred_out = self.sortformer_modules.init_memory(batch_size=B, d_model=self.sortformer_modules.unit_n_spks, device=self.device)
 
-        chunk_pre_encode_embs, _ = self.encoder.pre_encode(x=processed_signal, lengths=processed_signal_length)
-        
-        mem_chunk_pre_encode_embs, mem_chunk_pre_encode_lengths = self.sortformer_modules.concat_embs([mem_last_time, fifo_last_time, chunk_pre_encode_embs], return_lengths=True, dim=1, device=self.device) 
-        mem_chunk_fc_encoder_embs, _ = self.frontend_encoder(processed_signal=mem_chunk_pre_encode_embs, processed_signal_length=mem_chunk_pre_encode_lengths, pre_encode_input=True)
-        
-        mem_chunk_preds = self.forward_infer(mem_chunk_fc_encoder_embs)
+        if use_forward_export:
+            mem_chunk_preds, chunk_pre_encode_embs = self.forward_for_export(processed_signal, processed_signal_length, mem_last_time, fifo_last_time)
+        else:
+            chunk_pre_encode_embs, _ = self.encoder.pre_encode(x=processed_signal, lengths=processed_signal_length)
+            mem_chunk_pre_encode_embs, mem_chunk_pre_encode_lengths = self.sortformer_modules.concat_embs([mem_last_time, fifo_last_time, chunk_pre_encode_embs], return_lengths=True, dim=1, device=self.device) 
+            mem_chunk_fc_encoder_embs, _ = self.frontend_encoder(processed_signal=mem_chunk_pre_encode_embs, processed_signal_length=mem_chunk_pre_encode_lengths, pre_encode_input=True)
+            mem_chunk_preds = self.forward_infer(mem_chunk_fc_encoder_embs)
 
         mem, fifo, mem_preds, fifo_preds, chunk_preds = self.sortformer_modules.update_memory_FIFO(
             mem=mem_last_time,

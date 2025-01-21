@@ -1076,7 +1076,7 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
         super().__init__(cfg)
         # Initialize the asr branch
-
+        
         #KD edit
         if 'asr_model_path' in self.cfg and cfg.asr_model_path is not None:
             self._init_asr_model()
@@ -1129,6 +1129,17 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
                 if cfg.diar_kernel_type == 'sinusoidal':
                     self.diar_kernel_type = cfg.diar_kernel_type
                     self.diar_kernel = self.get_sinusoid_position_encoding(self.max_num_speakers, cfg.model_defaults.asr_enc_hidden)
+                elif cfg.diar_kernel_type == 'metacat':
+                    self.diar_kernel_type = cfg.diar_kernel_type
+                    # projection layer
+                    metacat_proj_in_size = 4 * cfg.model_defaults.asr_enc_hidden
+                    metacat_proj_out_size = cfg.model_defaults.lm_dec_hidden
+                    self.metacat_joint_proj = torch.nn.Sequential(
+                        torch.nn.Linear(metacat_proj_in_size, metacat_proj_out_size*2),
+                        torch.nn.ReLU(),
+                        torch.nn.Linear(metacat_proj_out_size*2, metacat_proj_out_size)
+                    )
+                    self.diar_kernel = self.metacat_joint_proj
             else:
                 self.diar_kernel_type = 'projection'
                 self.diar_kernel = self.joint_proj
@@ -1180,7 +1191,7 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
             self.encoder_decoder_proj.load_state_dict(pretrained_asr_model.encoder_decoder_proj.state_dict(), strict=True)
             if self.use_transf_encoder:
                 self.transf_encoder.load_state_dict(pretrained_asr_model.transf_encoder.state_dict(), strict=True)
-            self.transf_decoder.load_state_dict(pretrained_asr_model.transf_decoder.state_dict(), strict=True) 
+            # self.transf_decoder.load_state_dict(pretrained_asr_model.transf_decoder.state_dict(), strict=True) 
         
         if self.cfg.freeze_asr:
             self.encoder.eval()
@@ -1442,6 +1453,12 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
                     speaker_infusion_asr = torch.nn.functional.normalize(speaker_infusion_asr, p=2, dim=-1)
                 
                 enc_states = speaker_infusion_asr + asr_enc_states
+
+            elif self.diar_kernel_type == 'metacat':
+                concat_enc_states = asr_enc_states.unsqueeze(2) * diar_preds.unsqueeze(3)
+                concat_enc_states = concat_enc_states.flatten(2,3)
+                enc_states = self.metacat_joint_proj(concat_enc_states)
+            
             else:
                 concat_enc_states = torch.cat([asr_enc_states, diar_preds], dim=-1)
                 enc_states = self.joint_proj(concat_enc_states)

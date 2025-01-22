@@ -237,7 +237,7 @@ model:
       num_classes: -1
       vocabulary: []
     decoding:
-      strategy: "greedy_batch"
+      strategy: "greedy"
 
   # config for InterCTC loss: https://arxiv.org/abs/2102.03216
   # specify loss weights and which layers to use for InterCTC

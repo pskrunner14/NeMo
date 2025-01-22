@@ -49,7 +49,7 @@ from omegaconf import OmegaConf
 from nemo.collections.asr.models import EncDecCTCModel, EncDecHybridRNNTCTCModel
 from nemo.collections.asr.parts.submodules.ctc_decoding import CTCDecodingConfig
 from nemo.collections.asr.parts.utils.eval_utils import cal_write_wer
-from nemo.collections.asr.parts.utils.streaming_tgt_spk_utils import FrameBatchASR_tgt_spk
+from nemo.collections.asr.parts.utils.streaming_tgt_spk_utils import FrameBatchASR_tgt_spk, FeatureFrameBatchASR_tgt_spk
 from nemo.collections.asr.parts.utils.transcribe_utils import (
     compute_output_filename,
     write_transcription,
@@ -209,12 +209,20 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
     mid_delay = math.ceil((chunk_len + (total_buffer - chunk_len) / 2) / model_stride_in_secs)
     logging.info(f"tokens_per_chunk is {tokens_per_chunk}, mid_delay is {mid_delay}")
 
-    frame_asr = FrameBatchASR_tgt_spk(
-        asr_model=asr_model,
-        frame_len=chunk_len,
-        total_buffer=cfg.total_buffer_in_secs,
-        batch_size=cfg.batch_size,
-    )
+    if cfg.buffer_level == 'audio':
+        frame_asr = FrameBatchASR_tgt_spk(
+            asr_model=asr_model,
+            frame_len=chunk_len,
+            total_buffer=cfg.total_buffer_in_secs,
+            batch_size=cfg.batch_size,
+        )
+    elif cfg.buffer_level == 'feature':
+        frame_asr = FeatureFrameBatchASR_tgt_spk(
+            asr_model=asr_model,
+            frame_len=chunk_len,
+            total_buffer=cfg.total_buffer_in_secs,
+            batch_size=cfg.batch_size,
+        )
 
     with torch.amp.autocast(asr_model.device.type, enabled=cfg.amp):
         hyps = get_buffered_pred_feat_tgt_spk(

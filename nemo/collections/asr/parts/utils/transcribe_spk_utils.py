@@ -27,7 +27,7 @@ import nemo.collections.asr as nemo_asr
 from nemo.collections.asr.metrics.wer import word_error_rate
 from nemo.collections.asr.models import ASRModel, EncDecHybridRNNTCTCModel, EncDecMultiTaskModel
 from nemo.collections.asr.parts.utils import manifest_utils, rnnt_utils
-from nemo.collections.asr.parts.utils.streaming_tgt_spk_utils import FrameBatchASR_tgt_spk
+from nemo.collections.asr.parts.utils.streaming_tgt_spk_utils import FrameBatchASR_tgt_spk, FeatureFrameBatchASR_tgt_spk
 from nemo.collections.common.metrics.punct_er import OccurancePunctuationErrorRate
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
 from nemo.utils import logging, model_utils
@@ -39,7 +39,7 @@ from nemo.collections.asr.parts.utils.asr_multispeaker_utils import apply_spk_ma
 from nemo.collections.asr.parts.utils.transcribe_utils import wrap_transcription
 
 def get_buffered_pred_feat_tgt_spk(
-    asr: FrameBatchASR_tgt_spk,
+    asr: Union[FrameBatchASR_tgt_spk, FeatureFrameBatchASR_tgt_spk],
     frame_len: float,
     tokens_per_chunk: int,
     delay: int,
@@ -150,8 +150,9 @@ def setup_model(cfg: DictConfig, map_location: torch.device) -> Tuple[ASRModel, 
                 if cfg.disable_preprocessor_norm:
                     orig_config.preprocessor.normalize = 'NA'
             new_config = orig_config
+            #set strict to False if model is trained with old diarization model, otherwise set to True
             asr_model = imported_class.restore_from(
-                restore_path=cfg.model_path, strict = False, map_location=map_location, override_config_path=new_config
+                restore_path=cfg.model_path, strict = True, map_location=map_location, override_config_path=new_config
             )
             asr_model._init_diar_model()
             asr_model.diarization_model.to(asr_model.device)

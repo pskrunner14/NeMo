@@ -372,7 +372,7 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
                 encoded = encoded + concat_enc_states
                 concat_enc_states = torch.cat([encoded, diar_preds], dim = -1)
                 encoded = self.joint_proj(concat_enc_states)
-            else:
+            else: #projection
                 concat_enc_states = torch.cat([encoded, diar_preds], dim=-1)
                 encoded = self.joint_proj(concat_enc_states)
         else:

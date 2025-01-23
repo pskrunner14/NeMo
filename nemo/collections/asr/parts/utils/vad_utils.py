@@ -37,17 +37,7 @@ from pyannote.metrics import detection
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import ParameterGrid
 from tqdm import tqdm
-<<<<<<< HEAD
-
-# from nemo.collections.asr.models import EncDecClassificationModel, EncDecFrameClassificationModel
-from nemo.collections.asr.models.classification_models import (
-    ClassificationInferConfig,
-    EncDecClassificationModel,
-    EncDecFrameClassificationModel,
-)
-=======
 from nemo.collections.asr.models import EncDecClassificationModel, EncDecFrameClassificationModel
->>>>>>> origin/sortformer_pr01_fifo_memory
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
 from nemo.utils import logging
 

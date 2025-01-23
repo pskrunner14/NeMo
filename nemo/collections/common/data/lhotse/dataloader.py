@@ -210,10 +210,6 @@ def determine_use_iterable_dataset(use_iterable_dataset: bool, config: DictConfi
     use_iterable_dataset = (use_iterable_dataset or config.force_iterable_dataset) and not config.force_map_dataset
     return use_iterable_dataset
 
-    # 6. Cut simulation for multi-speaker ASR
-    simulators: Any = None  # dict | None = None
-    including_real_data: bool = False
-
 
 def get_lhotse_dataloader_from_config(
     config: dict | DictConfig,
@@ -267,7 +263,6 @@ def get_lhotse_dataloader_from_single_config(
     world_size: int,
     dataset: torch.utils.data.Dataset,
     tokenizer=None,
-    local_rank: int = 0,
 ) -> torch.utils.data.DataLoader:
     """
     Set up a Lhotse training dataloder.
@@ -480,11 +475,7 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
                     skip_long_segments=skip_long_segments,
                 )
                 
-<<<<<<< HEAD
-                simulated_cuts += simulator.simulate(cuts_for_simulation, num_meetings=simulator_config.num_meetings, num_jobs=1, seed=global_rank*world_size+local_rank+seed)
-=======
                 simulated_cuts += simulator.simulate(cuts_for_simulation, num_meetings=simulator_config.num_meetings, num_jobs=1, seed=global_rank+config.seed)
->>>>>>> origin/sortformer_pr01_fifo_memory
 
             if simulator_config.get('mix', False):
                 simulator = MixMeetingSimulator(
@@ -496,20 +487,6 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
                     speaker_count_distribution=simulator_config.speaker_count_distribution,
                 )
 
-<<<<<<< HEAD
-                simulated_cuts += simulator.simulate(cuts_for_simulation, num_meetings=simulator_config.num_meetings, num_jobs=1, seed=global_rank*world_size+local_rank+seed)
-
-            if simulator_config.get('lsmix', False):
-                simulator = LibriSpeechMixSimulator(
-                    data_type=simulator_config.ms_data_type,
-                    min_delay=0.5,
-                    max_num_speakers=simulator_config.max_num_speakers,
-                    speaker_token_position=simulator_config.speaker_token_position,
-                    speaker_count_distribution=simulator_config.speaker_count_distribution,
-                    delay_factor=simulator_config.delay_factor,
-                )
-                simulated_cuts += simulator.simulate(cuts_for_simulation, num_meetings=simulator_config.num_meetings, num_jobs=1, seed=global_rank*world_size+local_rank+seed)
-=======
                 simulated_cuts += simulator.simulate(cuts_for_simulation, num_meetings=simulator_config.num_meetings, num_jobs=1, seed=global_rank+config.seed)
 
             if simulator_config.get('lsmix', False):
@@ -530,21 +507,11 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
                         lsmix_cuts.to_jsonl(simulator_config.save_to)
                     
                 simulated_cuts += lsmix_cuts
->>>>>>> origin/sortformer_pr01_fifo_memory
 
         if config.including_real_data:
             cuts = CutSet.from_cuts(cuts + simulated_cuts)
         else:
             cuts = simulated_cuts
-<<<<<<< HEAD
-
-    if hasattr(cuts[0], 'delays'):
-        generator = LibriSpeechMixGenerator()
-        cuts = generator.generate(cuts)
-
-    # import ipdb; ipdb.set_trace()
-=======
->>>>>>> origin/sortformer_pr01_fifo_memory
 
     # Apply channel selector
     if config.channel_selector is not None:
@@ -626,22 +593,6 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
     # Duration filtering, same as native NeMo dataloaders.
     # We can filter after the augmentations because they are applied only when calling load_audio().
     cuts = cuts.filter(DurationFilter(config.min_duration, config.max_duration))
-<<<<<<< HEAD
-    
-    if config.use_multimodal_sampling:
-        constraint = MultimodalSamplingConstraint(
-            token_equivalent_duration=config.token_equivalent_duration,
-            batch_size=config.batch_size,
-            batch_tokens=config.batch_tokens,
-            quadratic_factor=config.quadratic_factor,
-        )
-    else:
-        constraint = TimeConstraint(
-            max_cuts=config.batch_size,
-            max_duration=config.batch_duration,
-            quadratic_duration=config.quadratic_duration,
-        )
-=======
     cuts = cuts.filter(
         TokenCountFilter(config.min_tokens, config.max_tokens, measure_total_length=config.measure_total_length)
     )
@@ -650,7 +601,6 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
     # Provides support for dynamic batch sizes, multimodal dataloading, 2D bucketing, etc.
     bucket_duration_bins = determine_bucket_duration_bins(config)
     constraint = determine_sampling_constraint(bucket_duration_bins, config)
->>>>>>> origin/sortformer_pr01_fifo_memory
 
     # 3. The sampler.
     if config.use_bucketing:
@@ -877,11 +827,7 @@ def _merge_supervisions(cuts: CutSet) -> CutSet:
 
 def _flatten_alt_text(cut) -> list:
     ans = [cut]
-<<<<<<< HEAD
-    if not isinstance(cut, Cut) or not hasattr(cut, 'custom') or cut.custom.get("alt_text") is None:
-=======
     if not isinstance(cut, Cut) or (not hasattr(cut, 'custom') or cut.custom is None) or cut.custom.get("alt_text") is None:
->>>>>>> origin/sortformer_pr01_fifo_memory
         return ans
     cut = cut.move_to_memory(audio_format="wav")  # performs I/O once and holds audio in memory from now on
     # Popping to ease eyesight on debug.

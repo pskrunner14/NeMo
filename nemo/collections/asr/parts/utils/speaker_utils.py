@@ -1293,13 +1293,8 @@ def segments_manifest_to_subsegments_manifest(
             segment = segment.strip()
             dic = json.loads(segment)
             audio, offset, duration, label = dic['audio_filepath'], dic['offset'], dic['duration'], dic['label']
-<<<<<<< HEAD
-            subsegments = get_subsegments(offset=offset, window=window, shift=shift, duration=duration)
-            if include_uniq_id and 'uniq_id' in dic and dic['uniq_id'] is not None:
-=======
             subsegments = get_subsegments_scriptable(offset=offset, window=window, shift=shift, duration=duration)
             if include_uniq_id and 'uniq_id' in dic:
->>>>>>> origin/sortformer_pr01_fifo_memory
                 uniq_id = dic['uniq_id']
             else:
                 uniq_id = None
@@ -1376,12 +1371,6 @@ def get_subsegments(
         subsegments = valid_subsegments.tolist()
     return subsegments
 
-<<<<<<< HEAD
-def get_subsegments_(offset: float, window: float, shift: float, duration: float) -> List[List[float]]:
-    """
-    Return subsegments from a segment of audio file.
-    
-=======
 def get_subsegments(
     offset: float,
     window: float,
@@ -1401,7 +1390,6 @@ def get_subsegments(
         Segment:  [12.05, 14.45]
         Subsegments: [[12.05, 13.55], [12.8, 14.3], [13.55, 14.45], [14.3, 14.45]]
 
->>>>>>> origin/sortformer_pr01_fifo_memory
     Args:
         offset (float): Start time of audio segment
         window (float): Window length for segments to subsegments length

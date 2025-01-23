@@ -37,15 +37,15 @@ from dataclasses import dataclass
 from types import MethodType
 from typing import Any, Dict
 
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 import torch
-from pytorch_lightning import LightningModule
-from pytorch_lightning.callbacks import Callback
-from pytorch_lightning.loops.optimization.automatic import ClosureResult
-from pytorch_lightning.trainer.connectors.logger_connector.result import _ResultCollection, _ResultMetric
-from pytorch_lightning.utilities import CombinedLoader, rank_zero_info
-from pytorch_lightning.utilities.signature_utils import is_param_in_hook_signature
-from pytorch_lightning.utilities.types import STEP_OUTPUT
+from lightning.pytorch import LightningModule
+from lightning.pytorch.callbacks import Callback
+from lightning.pytorch.loops.optimization.automatic import ClosureResult
+from lightning.pytorch.trainer.connectors.logger_connector.result import _ResultCollection, _ResultMetric
+from lightning.pytorch.utilities import CombinedLoader, rank_zero_info
+from lightning.pytorch.utilities.signature_utils import is_param_in_hook_signature
+from lightning.pytorch.utilities.types import STEP_OUTPUT
 from torch.nn.parallel import DistributedDataParallel
 
 __all__ = ["CUDAGraphCallback"]
@@ -137,25 +137,6 @@ def to_tensor(self, value, name):
         )
     value = value.squeeze()
     return value
-
-
-def register_key(self, key, meta, value):
-    # PyTorch Lightning creates all metrics on GPU, but creating the metric on
-    # its input device is prefered.
-    # Refer to: https://github.com/Lightning-AI/pytorch-lightning/blob/2.0.7/src/lightning/pytorch/trainer/connectors/logger_connector/result.py#L409
-    metric = _ResultMetric(meta, isinstance(value, torch.Tensor))
-    device = value.device if isinstance(value, torch.Tensor) else self.device
-    metric = metric.to(device)
-    self[key] = metric
-
-
-def update_metrics(self, key, value, batch_size):
-    # PyTorch Lightning always move all metrics to GPU, but moving the metric to
-    # its input device is prefered.
-    result_metric = self[key]
-    device = value.device if isinstance(value, torch.Tensor) else self.device
-    result_metric.forward(value.to(device), batch_size)
-    result_metric.has_reset = False
 
 
 def get_optimizer_step(state):
@@ -374,10 +355,6 @@ class CUDAGraphCallback(Callback):
         # Use smart metrics to avoid syncs
         LightningModule.__orig_to_tensor__ = LightningModule._LightningModule__to_tensor
         LightningModule._LightningModule__to_tensor = to_tensor
-        _ResultCollection.__orig_register_key__ = _ResultCollection.register_key
-        _ResultCollection.register_key = register_key
-        _ResultCollection.__orig_update_metrics__ = _ResultCollection.update_metrics
-        _ResultCollection.update_metrics = update_metrics
 
         # Save model outputs to static buffer for PL states reconstruct
         pl_module.__orig_training_step__ = pl_module.training_step
@@ -409,10 +386,6 @@ class CUDAGraphCallback(Callback):
 
         LightningModule._LightningModule__to_tensor = LightningModule.__orig_to_tensor__
         del LightningModule.__orig_to_tensor__
-        _ResultCollection.register_key = _ResultCollection.__orig_register_key__
-        del _ResultCollection.__orig_register_key__
-        _ResultCollection.update_metrics = _ResultCollection.__orig_update_metrics__
-        del _ResultCollection.__orig_update_metrics__
 
         pl_module.training_step = pl_module.__orig_training_step__
         del pl_module.__orig_training_step__
@@ -458,8 +431,8 @@ class CUDAGraphCallback(Callback):
         Called when saving a checkpoint to give you a chance to store anything else you might want to save.
 
         Args:
-            trainer: the current :class:`~pytorch_lightning.trainer.Trainer` instance.
-            pl_module: the current :class:`~pytorch_lightning.core.module.LightningModule` instance.
+            trainer: the current :class:`~lightning.pytorch.trainer.Trainer` instance.
+            pl_module: the current :class:`~lightning.pytorch.core.module.LightningModule` instance.
             checkpoint: the checkpoint dictionary that will be saved.
         """
         # Since we've add bound method to optimizer and lr_scheduler, it can lead to more

@@ -46,7 +46,6 @@ def main(cfg):
     sortformer_model = SortformerEncLabelModel(cfg=cfg.model, trainer=trainer)
     # Initialize the weights of the model from another model, if provided via config
     sortformer_model.maybe_init_from_pretrained_checkpoint(cfg)
-
     trainer.fit(sortformer_model)
 
 

@@ -46,17 +46,36 @@ Example usage:
 python scripts/nlp_language_modeling/prepare_packed_ft_dataset.py \
    model.data.train_ds.file_names=[/path/to/training.jsonl] \
    model.data.train_ds.max_seq_length=2048 \
-   +tokenizer_path=/path/to/tokenizer.model
-   +output_dir=/path/to/output_folder
+   +tokenizer_path=<see note 1 below> \
+   +output_dir=/path/to/output_folder \
    +pack_sizes=[2048,4096,8192]
    
+when using context parallelism (CP) with packed dataset, CP size needs to be set in the command:
+
+python scripts/nlp_language_modeling/prepare_packed_ft_dataset.py \
+    model.data.train_ds.file_names=[/path/to/training.jsonl] \
+    model.data.train_ds.max_seq_length=4096 \
+    ++model.context_parallel_size=2 \
+    +tokenizer_path=<see note 1 below> \
+    +output_dir=/path/to/output_folder \
+    +pack_sizes=[4096]
+
 Note: 
+  - Tokenizer path supports SentencePiece tokenizer and HF tokenizer. 
+    For SentencePiece tokenizer, specify the file /path/to/tokenizer.model 
+    For HF tokenizer, specify a folder /path/to/hf_folder which contains tokenizer.json, tokenizer_config.json
+    and special_tokens_map.json
+
   - If your model or dataset requires non-default configs for conventional SFT/PEFT training in NeMo, you will
     need to pass in the same configs to ``model.data.train_ds`` as you would for training with unpacked dataset.
 
   - ``model.data.train_ds.max_seq_length`` is the length to truncate each sequence before packing multiple sequences
     to the size of packed sequence (``pack_size``). ``max_seq_length`` should be set to the same value as unpacked data,
     and can be determined by examining the distribution of sequence lengths in the dataset.
+
+  - ``model.context_parallel_size`` is the CP size the model uses in SFT. The default value is 1 (no context parallelism)
+    if not specified. This argument is necessary to make each individual sequence length in a packed sequence a multiple of CP*2
+    when CP is enabled in SFT.
 
   - ``pack_sizes`` is a list of packed sequence lengths. In this example, there will be three output files, one for
     each pack size. The output files are named ``<output_folder>/packed_{pack_size}_seed{seed}.npy``.
@@ -83,12 +102,26 @@ def tokenize_dataset(cfg: 'DictConfig'):
     # using the same template as SFT/PEFT script. This may be overkill but guarantees the preprocess settings
     # are identical to normal SFT training
     data_cfg = cfg.model.data.train_ds
+    pad_seq_length_to_mult = 16
+    cp_size = cfg.model.get("context_parallel_size", 1)
+
+    # if context parallel is used, each individual data length in one packed dataset sample
+    # needs to be a multiple of (cp_size * 2): https://github.com/NVIDIA/TransformerEngine/pull/641
+    if cp_size > 1:
+        pad_seq_length_to_mult = max(pad_seq_length_to_mult, cp_size * 2)
+
+    if os.path.isdir(cfg.tokenizer_path):
+        # pass in a Hugging Face folder which contains tokenizer.json
+        tokenizer = get_nmt_tokenizer(library="huggingface", model_name=cfg.tokenizer_path, use_fast=True)
+    else:
+        tokenizer = get_nmt_tokenizer(library="sentencepiece", tokenizer_model=cfg.tokenizer_path)
+
     dataset = GPTSFTDataset(
         file_path=data_cfg.file_names[0],
-        tokenizer=get_nmt_tokenizer(library="sentencepiece", tokenizer_model=cfg.tokenizer_path),
+        tokenizer=tokenizer,
         max_seq_length=data_cfg.max_seq_length,
         min_seq_length=data_cfg.min_seq_length,
-        pad_seq_length_to_mult=16,  # adds padding in collate_fn so this value is irrelevant here
+        pad_seq_length_to_mult=pad_seq_length_to_mult,
         add_bos=data_cfg.get('add_bos', False),
         add_eos=data_cfg.get('add_eos', True),
         add_sep=data_cfg.get('add_sep', False),
@@ -110,7 +143,41 @@ def tokenize_dataset(cfg: 'DictConfig'):
         is_test=True,
     )
 
-    return np.array([dataset[i] for i in range(len(dataset))])
+    max_seq_length = dataset.max_seq_length
+    pad_id = dataset.tokenizer.eos_id
+    tokenizer = dataset.tokenizer
+    pad_seq_length_to_mult = dataset.pad_seq_length_to_mult
+    dataset = np.array([dataset[i] for i in range(len(dataset))])
+    if cp_size > 1:
+
+        def pre_pad_dataset(data, max_seq_length, max_length_to_pad, pad_id):
+            '''
+            pad each individual data point to the length of max_length
+            '''
+            assert max_seq_length >= max_length_to_pad
+            for key, val in data.items():
+                if key in {'input_ids', 'context_ids'}:
+                    if len(val) <= max_length_to_pad:
+                        # because input_ids are truncated by 1 for inputs and labels,
+                        # we add 1 extra padding here to make sure padded inputs and labels
+                        # are is a multiple of (cp_size * 2)
+                        val = val + [pad_id] * (max_length_to_pad - len(val) + 1)
+                        data[key] = val
+                    elif len(val) > max_seq_length:
+                        logging.info(
+                            f"""The current sequence length {len(val)} for packing is
+                                        larger than the max_seq_length specified ({max_seq_length}).
+                                        The current seqquence length is truncated to the size of max_seq_length.
+                                        Please consider increase the sequence packing size"""
+                        )
+                        data[key] = val[:max_seq_length]
+            return
+
+        ceil_to_nearest = lambda n, m: (n + m - 1) // m * m
+        for data in dataset:
+            max_length_to_pad = min(max_seq_length, ceil_to_nearest(len(data['input_ids']), pad_seq_length_to_mult))
+            pre_pad_dataset(data, max_seq_length, max_length_to_pad, pad_id)
+    return dataset, tokenizer
 
 
 @dataclass
@@ -135,11 +202,11 @@ class PackingArgs:
 )
 def main(cfg: 'DictConfig') -> None:
     args = PackingArgs().from_config(cfg)
-    dataset = tokenize_dataset(cfg)
+    dataset, tokenizer = tokenize_dataset(cfg)
     sequences, histogram = create_hist(dataset, cfg.model.data.train_ds.max_seq_length)
     for pack_size in args.pack_sizes:
         assignments = create_packing_strategy(histogram, pack_size, args.packing_algorithm)
-        output_data = fill_packing_strategy(assignments, sequences, pack_size)
+        output_data = fill_packing_strategy(assignments, sequences, pack_size, tokenizer.eos_id)
 
         # save output data
         os.makedirs(args.output_dir, exist_ok=True)
@@ -149,23 +216,9 @@ def main(cfg: 'DictConfig') -> None:
 
     logging.info(
         f"""
-✅ Packed datasets with pack sizes {args.pack_sizes} are prepared successfully.
-To train with packed sequences, you need to change three things in the SFT/PEFT config file
-1. Turn on the packed_sequence flag 
-   > +model.data.train_ds.packed_sequence=True
-2. Use the new dataset file instead of the original jsonl file
-   > model.data.train_ds.file_names=/path/to/packed_dataset.npy
-3. Specify the packed sequence length. This should be one of the ``pack_sizes`` you specified during data preparation.
-   > model.data.train_ds.max_seq_length=<pack_size>
-4. Adjust the batch sizes. 
-   Micro batch size has to be set to 1 as a nominal constraint. This is because batches are now concatenated 
-   in the preprocessing step. You can increase the pack_size to achieve the same purpose of increasing micro batch size.
-   Global batch size has to be reduced by the average number of sequences per pack `n`, 
-   where n = total number of sequences / total number of packs. This ensures that each gradient iteration 
-   sees (on average) the same number of sequences so that the recipe is maintained.
-   Please scroll up to see the value of n for each of your pack sizes.
-   > model.micro_batch_size=1
-   > model.global_batch_size=<previous GBS divided by n>
+✅ Packed datasets with pack sizes {args.pack_sizes} are prepared successfully. 
+To train with packed sequences, you need to make changes to the SFT/PEFT config file. See NeMo Documentation 
+for more details: <https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/features/throughput_optimizations.html#sequence-packing-for-sft-peft>
 """
     )
 

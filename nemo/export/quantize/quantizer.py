@@ -18,7 +18,7 @@ from typing import Callable, Optional
 
 import torch
 import torch.distributed as dist
-from megatron.core import mpu, parallel_state
+from megatron.core import parallel_state
 from megatron.core.transformer.module import Float16Module
 from omegaconf.omegaconf import DictConfig, open_dict
 
@@ -31,7 +31,15 @@ from nemo.utils.model_utils import save_artifacts, unwrap_model
 try:
     import modelopt.torch.quantization as mtq
     from modelopt.torch.export import export_tensorrt_llm_checkpoint
-    from modelopt.torch.utils.distributed import set_data_parallel_group, set_tensor_parallel_group
+
+    QUANT_CFG_CHOICES = {
+        "int8": mtq.INT8_DEFAULT_CFG,
+        "int8_sq": mtq.INT8_SMOOTHQUANT_CFG,
+        "fp8": mtq.FP8_DEFAULT_CFG,
+        "int4_awq": mtq.INT4_AWQ_CFG,
+        "w4a8_awq": mtq.W4A8_AWQ_BETA_CFG,
+        "int4": mtq.INT4_BLOCKWISE_WEIGHT_ONLY_CFG,
+    }
 
     HAVE_MODELOPT = True
 
@@ -41,14 +49,6 @@ except (ImportError, ModuleNotFoundError) as e:
 
 
 SUPPORTED_DTYPE = [16, "16", "bf16"]  # Default precision for non-quantized layers
-QUANT_CFG_CHOICES = {
-    "int8": mtq.INT8_DEFAULT_CFG,
-    "int8_sq": mtq.INT8_SMOOTHQUANT_CFG,
-    "fp8": mtq.FP8_DEFAULT_CFG,
-    "int4_awq": mtq.INT4_AWQ_CFG,
-    "w4a8_awq": mtq.W4A8_AWQ_BETA_CFG,
-    "int4": mtq.INT4_BLOCKWISE_WEIGHT_ONLY_CFG,
-}
 
 
 class Quantizer:
@@ -157,9 +157,6 @@ class Quantizer:
                 model.trainer.strategy.launcher.launch(dummy, trainer=model.trainer)
             model.trainer.strategy.setup_environment()
 
-        set_data_parallel_group(mpu.get_data_parallel_group())
-        set_tensor_parallel_group(mpu.get_tensor_model_parallel_group())
-
     @staticmethod
     def modify_model_config(model_cfg: DictConfig) -> DictConfig:
         """Modify model config for quantization."""
@@ -167,10 +164,6 @@ class Quantizer:
             if model_cfg.get("sequence_parallel", False):
                 logging.warning("Disabling sequence parallelism for quantization...")
                 model_cfg.sequence_parallel = False
-            # Only custom ModelOpt spec is supported for Quantization: this custom spec is largely based on local Megatron-LM
-            # layer definitions to avoid Transformer Engine implementations that are currently not supported.
-            # This layer spec also requires RoPE fusion to be disabled for tensor view operations in attention
-            # layer implementation from megatron/core/transformer/dot_product_attention.py to be functional.
             model_cfg.name = "modelopt"
             model_cfg.apply_rope_fusion = False
 
@@ -225,7 +218,8 @@ class Quantizer:
         assert self.export_config is not None, "Export config is not set"
         torch_dtype = torch_dtype_from_precision(self.export_config.dtype)
 
-        self._sample_output(model)
+        if self.export_config.get("sample_output", True):
+            self._sample_output(model)
 
         if model.cfg.megatron_amp_O2:
             model.model = unwrap_model(model.model, Float16Module)
@@ -250,7 +244,8 @@ class Quantizer:
             )
             dist.barrier()  # Wait until all ranks complete export_model_config step
             logging.info(
-                f"Exporting quantized weights, model artifacts, and tokenizer config to {self.export_config.save_path}..."
+                "Exporting quantized weights, model artifacts,"
+                f" and tokenizer config to {self.export_config.save_path}..."
             )
             if dist.get_rank() == 0:
                 save_artifacts(model, export_dir)

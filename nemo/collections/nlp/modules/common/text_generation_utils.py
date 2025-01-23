@@ -24,7 +24,7 @@ from typing import Callable, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-from lightning_fabric.utilities.seed import seed_everything
+from lightning.fabric.utilities.seed import seed_everything
 
 from nemo.collections.common.tokenizers.tabular_tokenizer import TabularTokenizer
 from nemo.collections.multimodal.data.neva.conversation import (
@@ -37,8 +37,7 @@ from nemo.collections.multimodal.data.neva.conversation import (
 from nemo.collections.nlp.modules.common.megatron.utils import get_ltor_masks_and_position_ids
 from nemo.collections.nlp.modules.common.text_generation_strategy import model_inference_strategy_dispatcher
 from nemo.collections.nlp.modules.common.transformer.text_generation import LengthParam, OutputType, SamplingParam
-from nemo.utils import AppState
-from nemo.utils.apex_utils import _reconfigure_microbatch_calculator
+from nemo.utils import AppState, logging
 
 try:
     from megatron.core import parallel_state, tensor_parallel
@@ -48,6 +47,15 @@ try:
 except (ImportError, ModuleNotFoundError):
 
     HAVE_MEGATRON_CORE = False
+
+try:
+    from megatron.core.num_microbatches_calculator import reconfigure_num_microbatches_calculator
+
+except (ImportError, ModuleNotFoundError):
+    logging.warning("Megatron num_microbatches_calculator not found, using Apex version.")
+    from apex.transformer.pipeline_parallel.utils import (
+        _reconfigure_microbatch_calculator as reconfigure_num_microbatches_calculator,
+    )
 
 __all__ = [
     "get_default_sampling_params",
@@ -280,6 +288,9 @@ def megatron_neva_generate(model, prompt_dict_list, length_params, sampling_para
         elif conv_template == "llama_3":
             clean_response = clean_response.rsplit("assistant<|end_header_id|>\n\n", 1)[-1]
             clean_response = re.sub(r"(<\|eot_id\|>)+$", "", clean_response)
+        elif conv_template == "yi_34b":
+            clean_response = clean_response.split("<|im_start|>assistant\n")[-1]
+            clean_response = clean_response.strip("<|im_end|>")
         elif conv_template == "v1":
             clean_response = clean_response.rsplit("ASSISTANT: ", 1)[-1]
 
@@ -438,10 +449,15 @@ def get_model_parallel_src_rank():
     all_ranks = np.arange(world_size)
     tp_size = parallel_state.get_tensor_model_parallel_world_size()
     pp_size = parallel_state.get_pipeline_model_parallel_world_size()
-    # [pipeline dim, data parallel, tensor dim]
-    all_ranks = all_ranks.reshape(pp_size, -1, tp_size)
     dp_rank = parallel_state.get_data_parallel_rank()
-    return all_ranks[:, dp_rank, :].min()
+    if AppState().use_tp_pp_dp_mapping:
+        # [DP, PP, TP]
+        all_ranks = all_ranks.reshape(-1, pp_size, tp_size)
+        return all_ranks[dp_rank, :, :].min()
+    else:
+        # [PP, DP, TP]
+        all_ranks = all_ranks.reshape(pp_size, -1, tp_size)
+        return all_ranks[:, dp_rank, :].min()
 
 
 def send_generate_info(
@@ -897,7 +913,7 @@ def sample_sequence_batch(
 
     app_state = AppState()
     micro_batch_size = context_tokens.shape[0]
-    _reconfigure_microbatch_calculator(
+    reconfigure_num_microbatches_calculator(
         rank=app_state.global_rank,
         rampup_batch_size=None,
         global_batch_size=micro_batch_size,
@@ -1089,7 +1105,7 @@ def tab_sample_sequence_batch(
 ):
     app_state = AppState()
     micro_batch_size = context_tokens.shape[0]
-    _reconfigure_microbatch_calculator(
+    reconfigure_num_microbatches_calculator(
         rank=app_state.global_rank,
         rampup_batch_size=None,
         global_batch_size=micro_batch_size,

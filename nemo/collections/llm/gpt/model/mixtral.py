@@ -1,12 +1,27 @@
+# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from nemo.collections.llm.gpt.model.base import GPTConfig, GPTModel
+from nemo.collections.llm.gpt.model.llama import _export_embedding, _export_head
 from nemo.lightning import io, teardown
 from nemo.lightning.pytorch.optim import OptimizerModule
 
@@ -18,10 +33,9 @@ if TYPE_CHECKING:
 
 
 @dataclass
-class MixtralConfig8x7B(GPTConfig):
+class MixtralConfig(GPTConfig):
     """
-    Config for Mixtral-8x7B model
-    Official announcement: https://mistral.ai/news/mixtral-of-experts/
+    Base config for Mixtral models.
     """
 
     normalization: str = "RMSNorm"
@@ -29,30 +43,83 @@ class MixtralConfig8x7B(GPTConfig):
     position_embedding_type: str = "rope"
     add_bias_linear: bool = False
     gated_linear_unit: bool = True
-    apply_query_key_layer_scaling: bool = False  # TODO: Should this be True?
 
     num_layers: int = 32
     hidden_size: int = 4096
     num_attention_heads: int = 32
     num_query_groups: int = 8
     ffn_hidden_size: int = 14336
-    max_position_embeddings: int = 4096  # 32768
-    seq_length: int = 4096  # 32768
+    max_position_embeddings: int = 4096
+    seq_length: int = 4096
+    attention_dropout: float = 0.0
+    hidden_dropout: float = 0.0
+    share_embeddings_and_output_weights: bool = False
+
     # MoE
     num_moe_experts: int = 8
-    moe_router_topk: int = 1
+    moe_aux_loss_coeff: float = 0.01
+    moe_router_topk: int = 2
+    moe_router_pre_softmax: bool = True
+    moe_token_dispatcher_type: str = "alltoall"
+    moe_router_load_balancing_type: str = 'aux_loss'
 
     init_method_std: float = 0.02
     layernorm_epsilon: float = 1e-5
     # rotary
-    rotary_percent: float = 0.5
-    rotary_base: float = 10000
+    rotary_percent: float = 1.0
+    rotary_base: float = 1000000.0
+    bf16: bool = True
+    params_dtype: torch.dtype = torch.bfloat16
+
+
+@dataclass
+class MixtralConfig8x3B(MixtralConfig):
+    """
+    NeMo's Mixtral-8x3B model variant
+    https://github.com/NVIDIA/NeMo-Framework-Launcher/blob/main/launcher_scripts/conf/training/mixtral/mixtral_8x3b.yaml
+    """
+
+    num_layers: int = 32
+    hidden_size: int = 2560
+    num_attention_heads: int = 32
+    ffn_hidden_size: int = 8960
+    max_position_embeddings: int = 4096
+    seq_length: int = 4096
+
+
+@dataclass
+class MixtralConfig8x7B(MixtralConfig):
+    """
+    Config for Mixtral-8x7B model
+    Official announcement: https://mistral.ai/news/mixtral-of-experts/
+    """
+
+    num_layers: int = 32
+    hidden_size: int = 4096
+    ffn_hidden_size: int = 14336
+    max_position_embeddings: int = 4096
+    seq_length: int = 4096
+
+
+@dataclass
+class MixtralConfig8x22B(MixtralConfig):
+    """
+    Config for Mixtral-8x22B model
+    Official announcement: https://mistral.ai/news/mixtral-8x22b/
+    """
+
+    num_layers: int = 56
+    hidden_size: int = 6144
+    num_attention_heads: int = 48
+    ffn_hidden_size: int = 16384
+    max_position_embeddings: int = 4096
+    seq_length: int = 4096
 
 
 class MixtralModel(GPTModel):
     def __init__(
         self,
-        config: Optional[MixtralConfig8x7B] = None,
+        config: Optional[Union[MixtralConfig8x7B, MixtralConfig8x22B]] = None,
         optim: Optional[OptimizerModule] = None,
         tokenizer: Optional["TokenizerSpec"] = None,
         model_transform: Optional[Callable[[nn.Module], nn.Module]] = None,
@@ -70,7 +137,7 @@ class HFMixtralImporter(io.ModelConnector["MixtralForCausalLM", MixtralModel]):
     def apply(self, output_path: Path) -> Path:
         from transformers import MixtralForCausalLM
 
-        source = MixtralForCausalLM.from_pretrained(str(self))
+        source = MixtralForCausalLM.from_pretrained(str(self), torch_dtype='auto', use_safetensors=True)
         target = self.init()
         trainer = self.nemo_setup(target)
         self.convert_state(source, target)
@@ -83,7 +150,6 @@ class HFMixtralImporter(io.ModelConnector["MixtralForCausalLM", MixtralModel]):
 
     def convert_state(self, source, target):
         mapping = {
-            "model.embed_tokens.weight": "embedding.word_embeddings.weight",
             "model.layers.*.self_attn.o_proj.weight": "decoder.layers.*.self_attention.linear_proj.weight",
             "model.layers.*.input_layernorm.weight": "decoder.layers.*.self_attention.linear_qkv.layer_norm_weight",
             "model.layers.*.post_attention_layernorm.weight": "decoder.layers.*.pre_mlp_layernorm.weight",
@@ -92,28 +158,37 @@ class HFMixtralImporter(io.ModelConnector["MixtralForCausalLM", MixtralModel]):
             "model.layers.*.block_sparse_moe.gate.weight": "decoder.layers.*.mlp.router.weight",
             # lm-head
             "model.norm.weight": "decoder.final_layernorm.weight",
-            "lm_head.weight": "output_layer.weight",
         }
 
-        return io.apply_transforms(source, target, mapping=mapping, transforms=[_import_qkv, _import_moe_w1_w3])
+        return io.apply_transforms(
+            source,
+            target,
+            mapping=mapping,
+            transforms=[_import_qkv, _import_moe_w1_w3, _import_embedding, _import_lm_head],
+        )
 
     @property
     def tokenizer(self) -> "AutoTokenizer":
         from nemo.collections.common.tokenizers.huggingface.auto_tokenizer import AutoTokenizer
 
-        return AutoTokenizer(str(self))
+        return AutoTokenizer(self.save_hf_tokenizer_assets(str(self)))
 
     @property
-    def config(self) -> MixtralConfig8x7B:
+    def config(self) -> MixtralConfig8x7B | MixtralConfig8x22B:
         from transformers import MixtralConfig as HfMixtralConfig
 
         config = HfMixtralConfig.from_pretrained(str(self))
-        return MixtralConfig8x7B(
+        config_cls = MixtralConfig8x7B
+        if '8x22b' in str(self).lower():
+            config_cls = MixtralConfig8x22B
+        return config_cls(
+            bf16=getattr(config, "torch_dtype", None) == torch.bfloat16,
             activation_func=F.silu,
             # network
             num_layers=config.num_hidden_layers,
             hidden_size=config.hidden_size,
             ffn_hidden_size=config.intermediate_size,
+            kv_channels=getattr(config, 'head_dim', config.hidden_size // config.num_attention_heads),
             max_position_embeddings=config.max_position_embeddings,  # TODO
             seq_length=config.max_position_embeddings,
             # RoPE
@@ -124,6 +199,7 @@ class HFMixtralImporter(io.ModelConnector["MixtralForCausalLM", MixtralModel]):
             num_query_groups=config.num_key_value_heads,
             num_moe_experts=config.num_local_experts,
             moe_router_topk=config.num_experts_per_tok,
+            moe_router_pre_softmax=True,
             # norm
             normalization='RMSNorm',
             layernorm_epsilon=config.rms_norm_eps,
@@ -132,7 +208,33 @@ class HFMixtralImporter(io.ModelConnector["MixtralForCausalLM", MixtralModel]):
             gated_linear_unit=True,
             # Vocab
             make_vocab_size_divisible_by=128,
+            # CPU init
+            use_cpu_initialization=True,
+            perform_initialization=False,
+            params_dtype=getattr(config, "torch_dtype", torch.bfloat16),
         )
+
+
+@io.state_transform(
+    source_key="model.embed_tokens.weight",
+    target_key="embedding.word_embeddings.weight",
+)
+def _import_embedding(ctx: io.TransformCTX, embedding):
+    embedding_weight = ctx.source.model.embed_tokens.weight
+    vocab_size = embedding_weight.shape[0]
+    ctx.target_state['embedding.word_embeddings.weight'][:vocab_size, :].copy_(embedding_weight)
+    return ctx.target_state['embedding.word_embeddings.weight']
+
+
+@io.state_transform(
+    source_key="lm_head.weight",
+    target_key="output_layer.weight",
+)
+def _import_lm_head(ctx: io.TransformCTX, embedding):
+    lm_head_weight = ctx.source.lm_head.weight
+    vocab_size = lm_head_weight.shape[0]
+    ctx.target_state['output_layer.weight'][:vocab_size, :].copy_(lm_head_weight)
+    return ctx.target_state['output_layer.weight']
 
 
 @io.state_transform(
@@ -151,7 +253,7 @@ def _import_qkv(ctx: io.TransformCTX, q, k, v):
     heads_per_group = head_num // num_query_groups
     hidden_size = megatron_config.hidden_size
     head_num = megatron_config.num_attention_heads
-    head_size = hidden_size // head_num
+    head_size = megatron_config.kv_channels
 
     old_tensor_shape = q.size()
     new_q_tensor_shape = (head_num, head_size) + old_tensor_shape[1:]
@@ -192,8 +294,10 @@ def _import_moe_w1_w3(gate_proj, up_proj):
 class HFMixtralExporter(io.ModelConnector[MixtralModel, "MixtralForCausalLM"]):
     def init(self) -> "MixtralForCausalLM":
         from transformers import AutoModelForCausalLM
+        from transformers.modeling_utils import no_init_weights
 
-        return AutoModelForCausalLM.from_config(self.config)
+        with no_init_weights(True):
+            return AutoModelForCausalLM.from_config(self.config)
 
     def apply(self, output_path: Path) -> Path:
         # TODO: Make it work with lazy init
@@ -212,7 +316,6 @@ class HFMixtralExporter(io.ModelConnector[MixtralModel, "MixtralForCausalLM"]):
 
     def convert_state(self, source, target):
         mapping = {
-            "embedding.word_embeddings.weight": "model.embed_tokens.weight",
             "decoder.layers.*.self_attention.linear_proj.weight": "model.layers.*.self_attn.o_proj.weight",
             "decoder.layers.*.self_attention.linear_qkv.layer_norm_weight": "model.layers.*.input_layernorm.weight",
             "decoder.layers.*.pre_mlp_layernorm.weight": "model.layers.*.post_attention_layernorm.weight",
@@ -221,10 +324,14 @@ class HFMixtralExporter(io.ModelConnector[MixtralModel, "MixtralForCausalLM"]):
             "decoder.layers.*.mlp.router.weight": "model.layers.*.block_sparse_moe.gate.weight",
             # lm-head
             "decoder.final_layernorm.weight": "model.norm.weight",
-            "output_layer.weight": "lm_head.weight",
         }
 
-        return io.apply_transforms(source, target, mapping=mapping, transforms=[_export_qkv, _export_moe_w1_w3])
+        return io.apply_transforms(
+            source,
+            target,
+            mapping=mapping,
+            transforms=[_export_qkv, _export_moe_w1_w3, _export_embedding, _export_head],
+        )
 
     @property
     def tokenizer(self):
@@ -232,7 +339,8 @@ class HFMixtralExporter(io.ModelConnector[MixtralModel, "MixtralForCausalLM"]):
 
     @property
     def config(self) -> "MixtralConfig":
-        source: MixtralConfig7B = io.load_ckpt(str(self)).model.config
+        # Either MixtralConfig8x7B or MixtralConfig8x22B
+        source: MixtralConfig8x7B = io.load_ckpt(str(self)).model.config
 
         from transformers import MixtralConfig as HfMixtralConfig
 
@@ -255,6 +363,7 @@ class HFMixtralExporter(io.ModelConnector[MixtralModel, "MixtralForCausalLM"]):
             initializer_range=source.init_method_std,
             # vocab
             vocab_size=self.tokenizer.vocab_size,
+            head_dim=source.kv_channels,
         )
 
 
@@ -274,7 +383,7 @@ def _export_qkv(ctx: io.TransformCTX, linear_qkv):
     heads_per_group = head_num // num_query_groups
     hidden_size = megatron_config.hidden_size
     head_num = megatron_config.num_attention_heads
-    head_size = hidden_size // head_num
+    head_size = megatron_config.kv_channels
     qkv_total_dim = head_num + 2 * num_query_groups
 
     linear_qkv = linear_qkv.reshape([qkv_total_dim, head_size, hidden_size])
@@ -305,3 +414,12 @@ def _export_moe_w1_w3(linear_fc1):
     gate_proj, up_proj = torch.chunk(linear_fc1, 2, dim=0)
 
     return gate_proj, up_proj
+
+
+__all__ = [
+    "MixtralConfig",
+    "MixtralConfig8x3B",
+    "MixtralConfig8x7B",
+    "MixtralConfig8x22B",
+    "MixtralModel",
+]

@@ -14,18 +14,16 @@
 
 
 import logging
-import math
 import multiprocessing
 from collections import defaultdict
 from pathlib import Path
+from typing import Optional, Union
 
-import numpy as np
 import torch
-from tensorrt_llm._utils import pad_vocab_size, str_dtype_to_torch, torch_to_numpy
+from tensorrt_llm._utils import pad_vocab_size, str_dtype_to_torch
 from tqdm import tqdm
 
-from nemo.collections.nlp.parts.utils_funcs import torch_dtype_from_precision
-from nemo.export.trt_llm.converter.utils import save_val, split_and_save_weight, weights_dict
+from nemo.export.trt_llm.converter.utils import save_scaling_factor, save_val, split_and_save_weight, weights_dict
 
 LOGGER = logging.getLogger("NeMo")
 
@@ -38,10 +36,26 @@ layer_names = {
 }
 
 
+def torch_dtype_from_precision(precision: Union[int, str], megatron_amp_O2: Optional[bool] = None) -> torch.dtype:
+    """Mapping from PTL precision types to corresponding PyTorch parameter datatype."""
+    # Copied from nemo.collections.nlp.parts.utils_funcs to avoid extra depenencies for NIM.
+    if megatron_amp_O2 is not None and megatron_amp_O2 is False:
+        return torch.float32
+
+    if precision in ['bf16', 'bf16-mixed']:
+        return torch.bfloat16
+    elif precision in [16, '16', '16-mixed']:
+        return torch.float16
+    elif precision in [32, '32', '32-true']:
+        return torch.float32
+    else:
+        raise ValueError(f"Could not parse the precision of `{precision}` to a valid torch.dtype")
+
+
 def extract_layers_with_prefix(model_, prefix):
     length_to_trim = len(prefix)
     model_state = model_.get("state_dict", model_)
-    return {key[length_to_trim:]: model_state[key] for key in model_state.keys() if prefix in key}
+    return {key[length_to_trim:]: model_state[key] for key in model_state.keys() if key.startswith(prefix)}
 
 
 def get_layer_name(layer_type: str, prefix: str):
@@ -56,10 +70,10 @@ def get_layer_prefix(layer_names, is_mcore):
     transformer_layer_prefix = None
 
     for layer_name in layer_names:
-        if 'self_attention' in layer_name:
+        if not layer_name.startswith('optimizer') and 'self_attention' in layer_name:
             transformer_layer_prefix = layer_name.split('layers')[0]
             break
-    assert transformer_layer_prefix is not None, "Cannot extract transformer layer prefix from {layer_name}"
+    assert transformer_layer_prefix is not None, f"Cannot extract transformer layer prefix from {layer_name}"
     if is_mcore:
         model_prefix = transformer_layer_prefix.split('decoder')[0]
     else:
@@ -94,6 +108,24 @@ def rename_key_dist_ckpt(old_key: str, layer: int):
     return rename_key(new_key)
 
 
+def is_scaling_factor(key: str) -> bool:
+    return "extra_state" in key
+
+
+def load_scaling_factors(model: dict, num_layers: int, export_config: dict) -> dict:
+    if not export_config.get('fp8_quantized', False):
+        return {}
+
+    scaling_factors = {}
+    for key, val in model.items():
+        if is_scaling_factor(key):
+            for layer in range(num_layers):
+                renamed_key = rename_key_dist_ckpt(key, layer)
+                scaling_factors = save_scaling_factor(scaling_factors, renamed_key, val[layer], export_config)
+
+    return scaling_factors
+
+
 @torch.no_grad()
 def convert_model_to_trt_llm_ckpt(
     nemo_model_config,
@@ -104,6 +136,8 @@ def convert_model_to_trt_llm_ckpt(
     decoder_type,
     use_parallel_embedding,
     processes,
+    fp8_quantized=False,
+    fp8_kvcache=False,
 ):
 
     # if checkpoints files could be found - start preparing output dir
@@ -137,10 +171,11 @@ def convert_model_to_trt_llm_ckpt(
             num_kv_heads = num_attention_heads
 
     export_config = {
-        "apply_layernorm_1p": nemo_model_config.get("normalization", "") == "layernorm1p",
+        "apply_layernorm_1p": nemo_model_config.get("normalization", "") == "layernorm1p"
+        or nemo_model_config.get("layernorm_zero_centered_gamma", False),
         "tp_size": training_tp_size,
         "split_gated_activation": nemo_model_config.get("activation", "gelu")
-        in ["swiglu", "geglu", "fast-swiglu", "fast-geglu"]
+        in ["swiglu", "geglu", "fast-swiglu", "fast-geglu", "openai-gelu"]
         and (decoder_type == "gptnext" or is_mcore),
         "num_attention_heads": num_attention_heads,
         "num_kv_heads": num_kv_heads,
@@ -148,6 +183,8 @@ def convert_model_to_trt_llm_ckpt(
         "use_attention_nemo_shape": True,
         "transpose_weights": True,
         "use_parallel_embedding": use_parallel_embedding,
+        "fp8_quantized": fp8_quantized,
+        "fp8_kvcache": fp8_kvcache,
     }
 
     # split_factor: in how many parts a TP training node is split
@@ -158,7 +195,7 @@ def convert_model_to_trt_llm_ckpt(
         if tp_idx == 0 and pp_idx == 0:
             if has_position_embedding:
                 val = model[get_layer_name("position_embedding", prefix)]
-                val = torch_to_numpy(val.to(storage_type).cpu())
+                val = val.to(storage_type).cpu()
                 model_level_weights["transformer.position_embedding.weight"].append(val)
         if pp_idx == 0:
             val = model.get("state_dict", model)[get_layer_name("word_embedding", prefix)]
@@ -171,19 +208,19 @@ def convert_model_to_trt_llm_ckpt(
                     pad_width = vocab_size_padded - vocab_size
                     val = torch.nn.functional.pad(val, (0, 0, 0, pad_width), value=0)
 
-            val = torch_to_numpy(val.to(storage_type).cpu())
+            val = val.to(storage_type).cpu()
             model_level_weights["transformer.vocab_embedding.weight"].append(val)
-        if has_lm_head and pp_idx == training_pp_size - 1:
+        if has_lm_head and pp_idx == training_pp_size - 1 and decoder_type != "gemma":
             val = model.get("state_dict", model)[get_layer_name("output_layer", prefix)]
-            val = torch_to_numpy(val.to(storage_type).cpu())
+            val = val.to(storage_type).cpu()
             model_level_weights["lm_head.weight"].append(val)
 
     weights_dict = {}
-
     tp_rank = 0
 
     handle_model_level_weights(model, 0, 0)
     model = extract_layers_with_prefix(model, transformer_layer_prefix)
+    scaling_factors = load_scaling_factors(model, num_layers, export_config)
 
     starmap_args = []
     for key, val in model.items():
@@ -197,11 +234,13 @@ def convert_model_to_trt_llm_ckpt(
                         # Let's rename/map the key to the old layer name previously. You can try printing out
                         # the rename_key output of the old llama checkpoint and compare.
                         rename_key_dist_ckpt(key, 0),
-                        # Since the state dict value has the full layers, let's select the ith layer weights/biases here.
+                        # Since the state dict value has the full layers,
+                        # let's select the ith layer weights/biases here.
                         [val],
                         storage_type,
                         None,
                         export_config,
+                        scaling_factors,
                     )
                 )
             else:
@@ -214,11 +253,13 @@ def convert_model_to_trt_llm_ckpt(
                             # Let's rename/map the key to the old layer name previously. You can try printing out
                             # the rename_key output of the old llama checkpoint and compare.
                             rename_key_dist_ckpt(key, i),
-                            # Since the state dict value has the full layers, let's select the ith layer weights/biases here.
+                            # Since the state dict value has the full layers,
+                            # let's select the ith layer weights/biases here.
                             [val[i]],
                             storage_type,
                             None,
                             export_config,
+                            scaling_factors,
                         )
                     )
 
@@ -236,9 +277,10 @@ def convert_model_to_trt_llm_ckpt(
     weights_dict.update(weights_dict_local)
 
     for key, values in model_level_weights.items():
-        model_level_weights[key] = np.concatenate(values, axis=0)
+        model_level_weights[key] = torch.concatenate(values, axis=0)
         weights_dict[key] = model_level_weights[key]
 
+    weights_dict.update(scaling_factors)
     return weights_dict
 
 
@@ -269,6 +311,8 @@ def dist_model_to_trt_llm_ckpt(
     inference_tp_size,
     inference_pp_size,
     tokenizer_vocab_size,
+    fp8_quantized=False,
+    fp8_kvcache=False,
 ):
     from megatron.core import parallel_state
     from megatron.core.tensor_parallel.utils import VocabUtility
@@ -294,7 +338,8 @@ def dist_model_to_trt_llm_ckpt(
             reshard_model = True
         else:
             raise NotImplementedError(
-                f"NeMo currently only supports PP>1 -> PP=1 resharding, other types of resharding will come in future releases."
+                "NeMo currently only supports PP>1 -> PP=1 resharding,"
+                " other types of resharding will come in future releases."
             )
 
     num_layers = nemo_model_config["num_layers"]
@@ -308,12 +353,14 @@ def dist_model_to_trt_llm_ckpt(
         "apply_layernorm_1p": nemo_model_config.get("normalization", "") == "layernorm1p",
         "tp_size": tp_size,
         "split_gated_activation": nemo_model_config.get("activation", "gelu")
-        in ["swiglu", "geglu", "fast-swiglu", "fast-geglu"],
+        in ["swiglu", "geglu", "fast-swiglu", "fast-geglu", "openai-gelu"],
         "num_attention_heads": nemo_model_config["num_attention_heads"],
         "num_kv_heads": nemo_model_config.get('num_query_groups', nemo_model_config['num_attention_heads']),
         "convert_on_device": True,
         "use_attention_nemo_shape": True,
         "transpose_weights": True,
+        "fp8_quantized": fp8_quantized,
+        "fp8_kvcache": fp8_kvcache,
     }
 
     starmap_config = {

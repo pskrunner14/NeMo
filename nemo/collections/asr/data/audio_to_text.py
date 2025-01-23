@@ -41,6 +41,8 @@ from nemo.utils.data_utils import (
     is_datastore_path,
     is_tarred_path,
 )
+from nemo.utils.decorators import deprecated
+from nemo.utils.distributed import webdataset_split_by_workers
 from nemo.utils.get_rank import is_global_rank_zero
 
 __all__ = [
@@ -142,6 +144,7 @@ class ASRManifestProcessor:
         eos_id: Optional[int] = None,
         pad_id: int = 0,
         index_by_file_id: bool = False,
+        manifest_parse_func: Optional[Callable] = None,
     ):
         self.parser = parser
 
@@ -152,6 +155,7 @@ class ASRManifestProcessor:
             max_duration=max_duration,
             max_number=max_utts,
             index_by_file_id=index_by_file_id,
+            parse_func=manifest_parse_func,
         )
 
         self.eos_id = eos_id
@@ -470,6 +474,7 @@ class _AudioTextDataset(Dataset):
         pad_id: Id of pad symbol. Defaults to 0
         return_sample_id (bool): whether to return the sample_id as a part of each sample
         channel_selector (int | Iterable[int] | str): select a single channel or a subset of channels from multi-channel audio. If set to `'average'`, it performs averaging across channels. Disabled if set to `None`. Defaults to `None`. Uses zero-based indexing.
+        manifest_parse_func: Optional function to parse manifest entries. Defaults to None.
     """
 
     @property
@@ -499,8 +504,7 @@ class _AudioTextDataset(Dataset):
         pad_id: int = 0,
         return_sample_id: bool = False,
         channel_selector: Optional[ChannelSelectorType] = None,
-        normalize_db: Optional[bool] = False,
-        normalize_db_target: Optional[float] = -25.0,
+        manifest_parse_func: Optional[Callable] = None,
     ):
         if type(manifest_filepath) == str:
             manifest_filepath = manifest_filepath.split(",")
@@ -517,6 +521,7 @@ class _AudioTextDataset(Dataset):
             bos_id=bos_id,
             eos_id=eos_id,
             pad_id=pad_id,
+            manifest_parse_func=manifest_parse_func,
         )
         self.featurizer = WaveformFeaturizer(sample_rate=sample_rate, int_values=int_values, augmentor=augmentor)
         self.trim = trim
@@ -593,6 +598,7 @@ class AudioToCharDataset(_AudioTextDataset):
         eos_id: Id of end of sequence symbol to append if not None
         return_sample_id (bool): whether to return the sample_id as a part of each sample
         channel_selector (int | Iterable[int] | str): select a single channel or a subset of channels from multi-channel audio. If set to `'average'`, it performs averaging across channels. Disabled if set to `None`. Defaults to `None`. Uses zero-based indexing.
+        manifest_parse_func: Optional function to parse manifest entries. Defaults to None.
     """
 
     @property
@@ -626,6 +632,7 @@ class AudioToCharDataset(_AudioTextDataset):
         parser: Union[str, Callable] = 'en',
         return_sample_id: bool = False,
         channel_selector: Optional[ChannelSelectorType] = None,
+        manifest_parse_func: Optional[Callable] = None,
     ):
         self.labels = labels
 
@@ -648,6 +655,7 @@ class AudioToCharDataset(_AudioTextDataset):
             pad_id=pad_id,
             return_sample_id=return_sample_id,
             channel_selector=channel_selector,
+            manifest_parse_func=manifest_parse_func,
         )
 
 
@@ -686,6 +694,7 @@ class AudioToBPEDataset(_AudioTextDataset):
             tokens to beginning and ending of speech respectively.
         return_sample_id (bool): whether to return the sample_id as a part of each sample
         channel_selector (int | Iterable[int] | str): select a single channel or a subset of channels from multi-channel audio. If set to `'average'`, it performs averaging across channels. Disabled if set to `None`. Defaults to `None`. Uses zero-based indexing.
+        manifest_parse_func: Optional function to parse manifest entries. Defaults to None.
     """
 
     @property
@@ -713,8 +722,7 @@ class AudioToBPEDataset(_AudioTextDataset):
         use_start_end_token: bool = True,
         return_sample_id: bool = False,
         channel_selector: Optional[ChannelSelectorType] = None,
-        normalize_db: Optional[bool] = False,
-        normalize_db_target: Optional[float] = -25.0,
+        manifest_parse_func: Optional[Callable] = None,
     ):
         
         if use_start_end_token and hasattr(tokenizer, "bos_id") and tokenizer.bos_id > 0:
@@ -765,11 +773,13 @@ class AudioToBPEDataset(_AudioTextDataset):
             trim=trim,
             return_sample_id=return_sample_id,
             channel_selector=channel_selector,
-            normalize_db=normalize_db,
-            normalize_db_target=normalize_db_target,
+            manifest_parse_func=manifest_parse_func,
         )
 
 
+@deprecated(
+    explanation='Webdataset support will be removed in v2.1.0 versions, please use LhotseSpeechToTextBpeDataset class instead'
+)
 class _TarredAudioToTextDataset(IterableDataset):
     """
     A similar Dataset to the AudioToCharDataset/AudioToBPEDataset, but which loads tarred audio files.
@@ -860,6 +870,7 @@ class _TarredAudioToTextDataset(IterableDataset):
         global_rank (int): Worker rank, used for partitioning shards. Defaults to 0.
         world_size (int): Total number of processes, used for partitioning shards. Defaults to 0.
         return_sample_id (bool): whether to return the sample_id as a part of each sample
+        manifest_parse_func: Optional function to parse manifest entries. Defaults to None.
     """
 
     def __init__(
@@ -882,6 +893,7 @@ class _TarredAudioToTextDataset(IterableDataset):
         global_rank: int = 0,
         world_size: int = 0,
         return_sample_id: bool = False,
+        manifest_parse_func: Optional[Callable] = None,
     ):
         self.shard_manifests = shard_manifests
 
@@ -907,6 +919,7 @@ class _TarredAudioToTextDataset(IterableDataset):
             eos_id=eos_id,
             pad_id=pad_id,
             index_by_file_id=True,  # Must set this so the manifest lines can be indexed by file ID
+            manifest_parse_func=manifest_parse_func,
         )
 
         self.len = self._compute_len()
@@ -1152,6 +1165,7 @@ class TarredAudioToCharDataset(_TarredAudioToTextDataset):
         global_rank (int): Worker rank, used for partitioning shards. Defaults to 0.
         world_size (int): Total number of processes, used for partitioning shards. Defaults to 0.
         return_sample_id (bool): whether to return the sample_id as a part of each sample
+        manifest_parse_func: Optional function to parse manifest entries. Defaults to None.
     """
 
     def __init__(
@@ -1178,6 +1192,7 @@ class TarredAudioToCharDataset(_TarredAudioToTextDataset):
         global_rank: int = 0,
         world_size: int = 0,
         return_sample_id: bool = False,
+        manifest_parse_func: Optional[Callable] = None,
     ):
         self.labels = labels
 
@@ -1204,6 +1219,7 @@ class TarredAudioToCharDataset(_TarredAudioToTextDataset):
             global_rank=global_rank,
             world_size=world_size,
             return_sample_id=return_sample_id,
+            manifest_parse_func=manifest_parse_func,
         )
 
 
@@ -1285,6 +1301,7 @@ class TarredAudioToBPEDataset(_TarredAudioToTextDataset):
         global_rank (int): Worker rank, used for partitioning shards. Defaults to 0.
         world_size (int): Total number of processes, used for partitioning shards. Defaults to 0.
         return_sample_id (bool): whether to return the sample_id as a part of each sample
+        manifest_parse_func: Optional function to parse manifest entries. Defaults to None.
     """
 
     def __init__(
@@ -1305,6 +1322,7 @@ class TarredAudioToBPEDataset(_TarredAudioToTextDataset):
         global_rank: int = 0,
         world_size: int = 0,
         return_sample_id: bool = False,
+        manifest_parse_func: Optional[Callable] = None,
     ):
         if use_start_end_token and hasattr(tokenizer, "bos_id") and tokenizer.bos_id > 0:
             bos_id = tokenizer.bos_id
@@ -1358,6 +1376,7 @@ class TarredAudioToBPEDataset(_TarredAudioToTextDataset):
             global_rank=global_rank,
             world_size=world_size,
             return_sample_id=return_sample_id,
+            manifest_parse_func=manifest_parse_func,
         )
 
 

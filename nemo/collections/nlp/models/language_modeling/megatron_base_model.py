@@ -23,12 +23,12 @@ from typing import Any, Dict, Optional, Union
 import omegaconf
 import torch
 import torch.nn as nn
+from lightning.pytorch.plugins.precision import MixedPrecisionPlugin
+from lightning.pytorch.trainer.connectors.logger_connector.fx_validator import _FxValidator
+from lightning.pytorch.trainer.trainer import Trainer
+from lightning.pytorch.utilities.exceptions import MisconfigurationException
 from omegaconf import OmegaConf, open_dict
 from omegaconf.dictconfig import DictConfig
-from pytorch_lightning.plugins.precision import MixedPrecisionPlugin
-from pytorch_lightning.trainer.connectors.logger_connector.fx_validator import _FxValidator
-from pytorch_lightning.trainer.trainer import Trainer
-from pytorch_lightning.utilities.exceptions import MisconfigurationException
 
 from nemo.collections.nlp.models.nlp_model import NLPModel
 from nemo.collections.nlp.modules.common.megatron.attention import HAVE_FLASH_ATTENTION
@@ -50,7 +50,6 @@ from nemo.utils.get_rank import is_global_rank_zero
 try:
     from megatron.core import ModelParallelConfig, parallel_state
     from megatron.core.distributed import DistributedDataParallel as McoreDDP
-    from megatron.core.num_microbatches_calculator import get_num_microbatches
     from megatron.core.transformer.module import Float16Module as MCoreFloat16Module
     from megatron.core.transformer.transformer_config import TransformerConfig
     from megatron.core.utils import init_method_normal, scaled_init_method_normal
@@ -62,6 +61,13 @@ except (ImportError, ModuleNotFoundError):
     ModelParallelConfig = TransformerConfig = ApexGuardDefaults
 
     HAVE_MEGATRON_CORE = False
+
+try:
+    from megatron.core.num_microbatches_calculator import get_current_global_batch_size, get_num_microbatches
+
+except (ImportError, ModuleNotFoundError):
+    logging.warning("Megatron num_microbatches_calculator not found, using Apex version.")
+    from apex.transformer.pipeline_parallel.utils import get_current_global_batch_size, get_num_microbatches
 
 try:
     from megatron.core import Timers
@@ -194,7 +200,8 @@ class MegatronBaseModel(NLPModel):
             global_batch_size=cfg.get('global_batch_size'),
             rampup_batch_size=cfg.get('rampup_batch_size', None),
             use_fp8=cfg.get('fp8', False),
-            init_mpi_proc_group=cfg.get('ub_tp_comm_overlap', False),
+            init_mpi_proc_group=cfg.get('ub_tp_comm_overlap', False)
+            and cfg.get('ub_tp_comm_bootstrap_backend', 'nccl') == 'mpi',
             seed=self.cfg.get('seed', 1234),
             apex_transformer_log_level=self.cfg.get('apex_transformer_log_level', 30),
             use_te_rng_tracker=self.cfg.get('use_te_rng_tracker', False),
@@ -402,7 +409,9 @@ class MegatronBaseModel(NLPModel):
                 self.cfg.persist_layer_norm = False
 
             # NVFUSER available starting with 21.11
-            if NVIDIA_TORCH_MAJOR >= 21 or (NVIDIA_TORCH_MAJOR == 21 and NVIDIA_TORCH_MINOR >= 11):
+            if (NVIDIA_TORCH_MAJOR >= 21 or (NVIDIA_TORCH_MAJOR == 21 and NVIDIA_TORCH_MINOR >= 11)) and (
+                NVIDIA_TORCH_MAJOR < 23 or (NVIDIA_TORCH_MAJOR == 23 and NVIDIA_TORCH_MINOR < 11)
+            ):
 
                 # NVFUSER
                 torch._C._jit_set_profiling_executor(True)
@@ -526,6 +535,8 @@ class MegatronBaseModel(NLPModel):
         recompute_method = self.cfg.get('activations_checkpoint_method', None)
         recompute_num_layers = self.cfg.get('activations_checkpoint_num_layers', None)
 
+        tp_only_amax_red = self.cfg.get('tp_only_amax_red', False)
+
         # any configs that are not in the nemo model config will be added here
         config_mapping = {
             'apply_query_key_layer_scaling': apply_query_key_layer_scaling,
@@ -549,6 +560,7 @@ class MegatronBaseModel(NLPModel):
             'fp8': None,
             'rotary_interleaved': rotary_interleaved,
             'deallocate_pipeline_outputs': True,
+            'tp_only_amax_red': tp_only_amax_red,
         }
 
         # populate the transformer config dict
@@ -880,7 +892,17 @@ class MegatronBaseModel(NLPModel):
                     ]
                 for bucket in buckets:
                     self._optimizer.init_params_bucket(bucket)
-                self._optimizer.init_params_bucket(self.parameters())
+                try:
+                    # We first attempt to only get the parameters that require grad.
+                    # This is to support multimodal training in child classes
+                    # where some modules might be pretrained and frozen.
+                    params = self.parameters(requires_grad_only=True)
+                except TypeError as e:
+                    if "unexpected keyword argument 'requires_grad_only'" in str(e):
+                        params = self.parameters()
+                    else:
+                        raise
+                self._optimizer.init_params_bucket(params)
             if hasattr(self, 'distributed_adam_buckets'):
                 del self.distributed_adam_buckets
 
@@ -911,9 +933,7 @@ class MegatronBaseModel(NLPModel):
         app_state = AppState()
 
         if self.cfg.get('rampup_batch_size', None):
-            from megatron.core.num_microbatches_calculator import _GLOBAL_NUM_MICROBATCHES_CALCULATOR
-
-            current_global_batch_size = getattr(_GLOBAL_NUM_MICROBATCHES_CALCULATOR, 'current_global_batch_size', 1)
+            current_global_batch_size = get_current_global_batch_size() if get_current_global_batch_size() else 1
             consumed_samples = self.prev_consumed_samples + self.if_first_step * current_global_batch_size
         else:
             consumed_samples = (
@@ -1164,6 +1184,7 @@ class MegatronBaseModel(NLPModel):
             "grad_sync_func": None,  # set dynamically during training
             "param_sync_func": None,  # set dynamically during training
             "tp_comm_overlap": self.cfg.get('ub_tp_comm_overlap', False),
+            "tp_comm_bootstrap_backend": self.cfg.get('ub_tp_comm_bootstrap_backend', 'nccl'),
         }
 
         # instantitate ModelParallelConfig from this dict

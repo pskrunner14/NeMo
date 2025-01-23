@@ -8,7 +8,7 @@ Model Classes
     :show-inheritance:
     :no-members:
     :members: __init__, configure_optimizers
-    :no-index:
+    :noindex:
 
 
 .. autoclass:: nemo.collections.multimodal.models.text_to_image.stable_diffusion.ldm.ddpm.MegatronLatentDiffusion
@@ -20,7 +20,7 @@ Model Classes
 .. autoclass:: nemo.collections.multimodal.models.text_to_image.dreambooth.dreambooth.MegatronDreamBooth
     :show-inheritance:
     :no-members:
-    :members: __init__, training_step, validation_step, setup, build_train_valid_test_datasets
+    :members: __init__, training_step, validation_step, setup
 
 
 .. autoclass:: nemo.collections.multimodal.models.text_to_image.controlnet.controlnet.MegatronControlNet

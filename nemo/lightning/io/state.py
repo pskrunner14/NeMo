@@ -1,10 +1,26 @@
+# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import inspect
 import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Generic, List, Optional, Tuple, TypeVar, Union, overload
 
 import numpy as np
+import torch
 from torch import nn
+from nemo.lightning.pytorch.utils import extract_dtypes
 
 SourceModuleT = TypeVar("SourceModuleT", bound=nn.Module)
 TargetModuleT = TypeVar("TargetModuleT", bound=nn.Module)
@@ -13,17 +29,20 @@ F = TypeVar("F", bound=Callable[..., Any])
 
 @dataclass
 class TransformCTX:
+    """Transform Data class Definition."""
+
     source: nn.Module
     source_state: dict
     target: nn.Module
     target_state: dict
 
 
+@torch.no_grad
 def apply_transforms(
     source: nn.Module,
     target: TargetModuleT,
     mapping: Dict[str, str],
-    transforms: Optional[List[Callable[[TransformCTX], TransformCTX]]] = None,
+    transforms: Optional[List[Callable[[TransformCTX], TransformCTX]]] = [],
 ) -> TargetModuleT:
     """
     Applies a series of transformations to adapt the state dictionary of a source module to
@@ -90,6 +109,9 @@ def apply_transforms(
     if hasattr(target, "module") and isinstance(target.module, MegatronModule):
         _target = target.module
 
+    # Track dtypes to make sure they weren't modified during conversion.
+    target_orig_dtypes = extract_dtypes(_target.named_parameters())
+
     target_state = _target.state_dict()
     ctx = TransformCTX(
         source=_source,
@@ -101,9 +123,8 @@ def apply_transforms(
     for key, val in mapping.items():
         ctx = StateDictTransform(key, val)(ctx)
 
-    if transforms:
-        for transform in transforms:
-            ctx = transform(ctx)
+    for transform in transforms:
+        ctx = transform(ctx)
 
     _params: Dict[str, nn.Parameter] = {}
     for name, param in _target.named_parameters():
@@ -144,9 +165,9 @@ def apply_transforms(
 
         _module.register_buffer(_key, val)
 
-    keys = [name for name in list(target_state.keys()) if not name.endswith("_extra_state")]
+    keys = list(filter(lambda x: x is not None and not x.endswith("_extra_state"), target_state.keys()))
     if len(keys) != 0:
-        raise RuntimeError(f"Additional keys: {target_state.keys()} in checkpoint but not in model.")
+        raise RuntimeError(f"Additional keys: {keys} in checkpoint but not in model.")
 
     # TODO: Is this correct?
     # for key in target.state_dict():
@@ -156,6 +177,11 @@ def apply_transforms(
     """finally:
         cls._set_model_restore_state(is_being_restored=False)"""
 
+    assert target_orig_dtypes == extract_dtypes(_target.named_parameters()), (
+        f"dtype mismatch between source and target state dicts. "
+        f"Left side is { {k: v for k, v in target_orig_dtypes.items() if v!=torch.bfloat16} }, "
+        f"Right side is { {k: v for k, v in extract_dtypes(_target.named_parameters()).items() if v!=torch.bfloat16} }"
+    )
     if hasattr(target, "module") and isinstance(target.module, MegatronModule):
         target.module = _target
 
@@ -165,7 +191,7 @@ def apply_transforms(
 
 
 def _default_transform(inp):
-    return inp.float()
+    return inp
 
 
 class StateDictTransform(Generic[F]):
@@ -218,7 +244,12 @@ class StateDictTransform(Generic[F]):
             source_matches_dict = {k: _match_keys(list(source_dict.keys()), v) for k, v in source_key_dict.items()}
             target_matches = _match_keys(list(target_dict.keys()), target_key)
             param_names = list(filter(lambda x: x in source_matches_dict, fn_params))
-            for layer_names_group in zip(*([source_matches_dict[v] for v in param_names] + [target_matches])):
+            source_matches = [
+                source_matches_dict[v] if source_matches_dict[v].ndim > 0 else [source_matches_dict[v].item()]
+                for v in param_names
+            ]
+            target_matches = [target_matches if target_matches.ndim > 0 else [target_matches.item()]]
+            for layer_names_group in zip(*(source_matches + target_matches)):
                 # Wrap in a list if it's a single layer (ie non-expert)
                 if isinstance(layer_names_group[0], str):
                     layer_names_group = [[x] for x in layer_names_group]
@@ -236,7 +267,7 @@ class StateDictTransform(Generic[F]):
 
             if isinstance(target_key, str):
                 target_matches = _match_keys(target_keys, target_key)
-                if target_matches.size < 1:
+                if target_matches.size == 1 and target_matches == np.array(None):
                     raise ValueError(f"No matches found for target key: {target_key}")
             else:
                 if isinstance(target_key, dict):
@@ -254,7 +285,6 @@ class StateDictTransform(Generic[F]):
             if multiple_sources:
                 for target_index, target_match in np.ndenumerate(target_matches):
                     source_match = source_matches[target_index]
-
                     if accepts_var_args:
                         source_values = [source_dict[k] for k in source_match]
                         target_dict[target_match] = self.call_transform(ctx, *source_values)
@@ -304,6 +334,7 @@ class StateDictTransform(Generic[F]):
         return ctx
 
     def call_transform(self, ctx: TransformCTX, *args, **kwargs):
+        """Perform transform and check if the given args valid."""
         func_params = inspect.signature(self.transform).parameters
         expected_num_args = len([p for p in func_params if p not in ['self', 'ctx']])
         provided_num_args = len(args) + len(kwargs)
@@ -321,10 +352,30 @@ class StateDictTransform(Generic[F]):
 
 
 def _match_keys(keys: List[str], pattern: str) -> np.ndarray:
-    regex_pattern = re.compile("^" + pattern.replace("*", "(.*)") + "$")
-    wildcard_matches = [[] for _ in range(pattern.count("*"))]
+    escaped_pattern = ''
+    i = 0
+    wildcard_positions = []
+    while i < len(pattern):
+        if pattern[i : i + 2] == '**':
+            escaped_pattern += r'(.+)'  # Match any characters including dots
+            wildcard_positions.append('**')
+            i += 2
+        elif pattern[i] == '*':
+            escaped_pattern += r'([^.]+)'  # Match any characters except dots
+            wildcard_positions.append('*')
+            i += 1
+        else:
+            if pattern[i] == '.':
+                escaped_pattern += r'\.'  # Escape the dot
+            else:
+                escaped_pattern += pattern[i]
+            i += 1
 
-    for key in keys:
+    regex_pattern = re.compile("^" + escaped_pattern + "$")
+    num_wildcards = len(wildcard_positions)
+    wildcard_matches = [[] for _ in range(num_wildcards)]
+
+    for key in filter(lambda x: x is not None, keys):
         match = regex_pattern.match(key)
         if match:
             for i, group in enumerate(match.groups()):
@@ -338,11 +389,14 @@ def _match_keys(keys: List[str], pattern: str) -> np.ndarray:
     # Determine the shape of the output array based on the unique matches for each wildcard
     shape = [len(matches) for matches in wildcard_matches]
 
+    if len(wildcard_matches) == 0:
+        # If there is no wildcard matches, assuming it is a single match
+        shape = [1]
     # Initialize an empty array with the determined shape
     output_array = np.empty(shape, dtype=object)
 
     # Populate the array with the keys, now that we have the correct shape and ordering
-    for key in keys:
+    for key in filter(lambda x: x is not None, keys):
         match = regex_pattern.match(key)
         if match:
             # Convert match groups to indices based on their position in wildcard_matches
@@ -405,3 +459,72 @@ def state_transform(
         return wrapper
 
     return wrapper(fn)
+
+
+class TransformFns:
+    """
+    A collection of common functions used in state dict transformation.
+    """
+
+    @staticmethod
+    def split_qkv(ctx: TransformCTX, linear_qkv):
+        """
+        Split interleave-concatenated qkv to q, k, v
+
+        Example: export layer linear_qkv to HF {q|k|v}_proj
+        """
+        megatron_config = ctx.source.config
+
+        head_num = megatron_config.num_attention_heads
+        num_query_groups = megatron_config.num_query_groups
+        heads_per_group = head_num // num_query_groups
+        # hidden_size = megatron_config.hidden_size
+        head_size = megatron_config.kv_channels
+        qkv_total_dim = head_num + 2 * num_query_groups
+
+        linear_qkv = linear_qkv.reshape([qkv_total_dim, head_size, -1])
+        # when converting base model (linear_qkv), hidden size = megatron_config.hidden_size
+        # when converting lora (linear_qkv.adapter.linear_out), hidden size = lora_r
+        hidden_size = linear_qkv.size(-1)
+        q_slice = torch.cat(
+            [
+                torch.arange((heads_per_group + 2) * i, (heads_per_group + 2) * i + heads_per_group)
+                for i in range(num_query_groups)
+            ]
+        )
+        k_slice = torch.arange(heads_per_group, qkv_total_dim, (heads_per_group + 2))
+        v_slice = torch.arange(heads_per_group + 1, qkv_total_dim, (heads_per_group + 2))
+
+        q_proj = linear_qkv[q_slice].reshape(-1, hidden_size).cpu()
+        k_proj = linear_qkv[k_slice].reshape(-1, hidden_size).cpu()
+        v_proj = linear_qkv[v_slice].reshape(-1, hidden_size).cpu()
+
+        return q_proj, k_proj, v_proj
+
+    @staticmethod
+    def split_fc1(linear_fc1):
+        """
+        Split concatenated fc1 to gate and up proj
+
+        Example: export layer linear_fc1 to HF {gate|up}_proj
+        """
+        gate_proj, up_proj = torch.chunk(linear_fc1, 2, dim=0)
+        return gate_proj, up_proj
+
+    @staticmethod
+    def duplicate2(param):
+        """
+        Duplicate the source parameter to two target parameters
+
+        Example: export Performant LoRA linear_fc1.adapter.linear_in to HF {gate|up}_proj.lora_A
+        """
+        return param, param
+
+    @staticmethod
+    def duplicate3(param):
+        """
+        Duplicate the source parameter to three target parameters
+
+        Example: export Performant LoRA linear_qkv.adapter.linear_in to HF {q|k|v}_proj.lora_A
+        """
+        return param, param, param

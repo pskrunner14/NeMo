@@ -28,13 +28,15 @@ PyTorch Lightning Trainer arguments and args of the model and the optimizer can 
 """
 from enum import Enum
 
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 import torch
 from omegaconf import OmegaConf
 
 from nemo.collections.audio.models.enhancement import (
     EncMaskDecAudioToAudioModel,
+    FlowMatchingAudioToAudioModel,
     PredictiveAudioToAudioModel,
+    SchroedingerBridgeAudioToAudioModel,
     ScoreBasedGenerativeAudioToAudioModel,
 )
 from nemo.core.config import hydra_runner
@@ -48,6 +50,8 @@ class ModelType(str, Enum):
     MaskBased = 'mask_based'
     Predictive = 'predictive'
     ScoreBased = 'score_based'
+    SchroedingerBridge = 'schroedinger_bridge'
+    FlowMatching = 'flow_matching'
 
 
 def get_model_class(model_type: ModelType):
@@ -58,6 +62,10 @@ def get_model_class(model_type: ModelType):
         return PredictiveAudioToAudioModel
     elif model_type == ModelType.ScoreBased:
         return ScoreBasedGenerativeAudioToAudioModel
+    elif model_type == ModelType.SchroedingerBridge:
+        return SchroedingerBridgeAudioToAudioModel
+    elif model_type == ModelType.FlowMatching:
+        return FlowMatchingAudioToAudioModel
     else:
         raise ValueError(f'Unknown model type: {model_type}')
 

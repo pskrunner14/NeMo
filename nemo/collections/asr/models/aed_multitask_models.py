@@ -34,7 +34,8 @@ from nemo.collections.asr.metrics.der import concat_perm_word_error_rate as cpWE
 from nemo.collections.asr.models.asr_model import ASRModel, ExportableEncDecModel
 from nemo.collections.asr.models.label_models import EncDecSpeakerLabelModel
 # from nemo.collections.asr.models import SortformerEncLabelModel
-from nemo.collections.asr.models.eesd_models import SortformerEncLabelModel
+# from nemo.collections.asr.models.eesd_models import SortformerEncLabelModel
+from nemo.collections.asr.models.sortformer_diar_models import SortformerEncLabelModel
 from nemo.collections.asr.parts.mixins import ASRBPEMixin, ASRModuleMixin, ASRTranscriptionMixin
 from nemo.collections.asr.parts.mixins.transcription import (
     GenericTranscriptionType,
@@ -1327,9 +1328,10 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
         input_signal=None,
         input_signal_length=None,
     ):
-        preds, _preds, attn_score_stack, total_memory_list, encoder_states_list = self.diarization_model.forward(audio_signal=input_signal, audio_signal_length=input_signal_length)
+        # preds, _preds, attn_score_stack, total_memory_list, encoder_states_list = 
+        preds = self.diarization_model.forward(audio_signal=input_signal, audio_signal_length=input_signal_length)
 
-        return preds, _preds, attn_score_stack, total_memory_list, encoder_states_list
+        return preds
 
     def fix_diar_output(
         self,
@@ -1427,7 +1429,8 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
 
         if self.diar == True:
             with torch.set_grad_enabled(not self.cfg.freeze_diar):
-                diar_preds, _preds, attn_score_stack, total_memory_list, encoder_states_list = self.forward_diar(input_signal, input_signal_length)
+                # diar_preds, _preds, attn_score_stack, total_memory_list, encoder_states_list = self.forward_diar(input_signal, input_signal_length)
+                diar_preds = self.forward_diar(input_signal, input_signal_length)
                 # pred shape = B * T (-1 or -2) * D 
                 # May 23 2024 -> sortformer produces 1 or 2 frames less than FC, FIX!!!
 

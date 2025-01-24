@@ -56,6 +56,10 @@ def read_cutset_from_config(config: DictConfig) -> Tuple[CutSet, bool]:
         cuts = read_lhotse_manifest(config, is_tarred)
     return cuts, is_tarred
 
+class IncompleteConfigError(RuntimeError):
+    pass
+
+
 
 KNOWN_DATASET_CONFIG_TYPES = frozenset(("nemo", "nemo_tarred", "lhotse", "lhotse_shar", "txt", "txt_pair", "group"))
 

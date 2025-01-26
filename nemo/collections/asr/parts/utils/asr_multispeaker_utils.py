@@ -1026,7 +1026,8 @@ class LibriSpeechMixSimulator():
         max_num_speakers: int = 4,
         speaker_token_position: str = 'sot',
         speaker_count_distribution: List[float] = [0, 2, 3, 4],
-        delay_factor: int = 1
+        delay_factor: int = 1,
+        max_mixed_sample_sec: float = 75.0,
     ):
         """
         Args:
@@ -1044,6 +1045,8 @@ class LibriSpeechMixSimulator():
         self.max_num_speakers = max_num_speakers
         self.speaker_token_position = speaker_token_position
         self.speaker_count_distribution = speaker_count_distribution
+        self._max_mix_cut_duration = 0.0
+        self._max_mixed_sample_sec = max_mixed_sample_sec 
         assert len(speaker_count_distribution) == max_num_speakers, f"Length of speaker_count_distribution {len(speaker_count_distribution)} must be equal to max_num_speakers {max_num_speakers}"
 
     def fit(self, cuts) -> CutSet:
@@ -1066,16 +1069,20 @@ class LibriSpeechMixSimulator():
         sampled_speaker_ids = random.sample(self.speaker_ids, n_speakers)
         
         mono_cuts = []
+        original_cuts = []
         for speaker_id in sampled_speaker_ids:
             cut_id = random.choice(self.speaker_id2cut_ids[speaker_id])
             cut = self.id2cuts[cut_id]
             mono_cuts.append(cut)
+            original_cuts.append(deepcopy(cut))
 
         mixed_cuts = []
         for i in range(self.delay_factor):
             tracks = []
             offset = 0.0
-            for mono_cut in mono_cuts:
+            max_cut_count = len(mono_cuts)
+            offset_history = []
+            for mi, mono_cut in enumerate(mono_cuts):
                 custom = {
                         'pnc': 'no',
                         'source_lang': 'en',
@@ -1084,7 +1091,9 @@ class LibriSpeechMixSimulator():
                     }
                 mono_cut.custom.update(custom)
                 tracks.append(MixTrack(cut=deepcopy(mono_cut), type=type(mono_cut), offset=offset))
-                offset += random.uniform(self.min_delay, cut.duration)
+                next_offset_gain = random.uniform(self.min_delay, original_cuts[mi].duration)
+                offset_history.append(offset)
+                offset += next_offset_gain
         
             mixed_cut = MixedCut(id='lsmix_' + '_'.join([track.cut.id for track in tracks]) + '_' + str(uuid4()), tracks=tracks)
             
@@ -1100,9 +1109,11 @@ class LibriSpeechMixSimulator():
 
             if self.data_type == "diar":
                 pass # TODO: need to implement the diar data type
-
-            mixed_cuts.append(mixed_cut)
-
+            if  mixed_cut.supervisions[0].duration < self._max_mixed_sample_sec:
+                mixed_cuts.append(mixed_cut)
+            else:
+                logging.info(f"Skipped mixed cut due to duration {mixed_cut.supervisions[0].duration} exceeding max_mixed_sample_sec {self._max_mixed_sample}")
+        self._max_mix_cut_duration = max(self._max_mix_cut_duration, mixed_cut.supervisions[0].duration)
         return mixed_cuts
     
     # TODO: text is necessary for msasr and tsasr, but not for diar
@@ -1180,9 +1191,17 @@ class LibriSpeechMixSimulator():
         for n_speakers, n_mt in self.num_speakers2num_meetings.items():
             if n_mt <= 0:
                 continue
-            for i in tqdm(range(n_mt), desc=f"Simulating {n_speakers}-speaker mixtures", ncols=128):
-                cut_set.extend(self._create_mixture(n_speakers=n_speakers))
-
+            # for i in tqdm(range(n_mt), desc=f"Simulating {n_speakers}-speaker mixtures", ncols=128):
+            #     cut_set.extend(self._create_mixture(n_speakers=n_speakers))
+            imix = 0
+            with tqdm(total=n_mt, desc=f"Simulating {n_speakers}-speaker mixtures", ncols=128) as pbar:
+                while imix < n_mt:
+                    generated_mixed_cuts = self._create_mixture(n_speakers=n_speakers)
+                    add_count = len(generated_mixed_cuts)
+                    cut_set.extend(generated_mixed_cuts)
+                    imix += add_count
+                    pbar.update(add_count)
+            logging.info(f"Max duration of n_speakers={n_speakers} mixture: {self._max_mix_cut_duration:.3f} seconds")
         return CutSet.from_cuts(cut_set).shuffle()
 
 class LibriSpeechMixGenerator():

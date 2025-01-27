@@ -1112,7 +1112,7 @@ class LibriSpeechMixSimulator():
             if  mixed_cut.supervisions[0].duration < self._max_mixed_sample_sec:
                 mixed_cuts.append(mixed_cut)
             else:
-                logging.info(f"Skipped mixed cut due to duration {mixed_cut.supervisions[0].duration} exceeding max_mixed_sample_sec {self._max_mixed_sample}")
+                logging.info(f"Skipped mixed cut due to duration {mixed_cut.supervisions[0].duration} exceeding max_mixed_sample_sec {self._max_mixed_sample_sec}")
         self._max_mix_cut_duration = max(self._max_mix_cut_duration, mixed_cut.supervisions[0].duration)
         return mixed_cuts
     

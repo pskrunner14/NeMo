@@ -1081,8 +1081,7 @@ class MSEncDecMultiTaskModel(EncDecMultiTaskModel):
         #KD edit
         if 'asr_model_path' in self.cfg and cfg.asr_model_path is not None:
             self._init_asr_model()
-
-        if 'diar_model_path' in self.cfg:
+        if len(self.cfg.get('diar_model_path', '')) > 0 and 'diar_model_path' in self.cfg:
             self.diar = True
             # Initialize the speaker branch
             if 'init_diar' in self.cfg:

@@ -255,8 +255,8 @@ def get_lhotse_dataloader_from_config(
                                 delay_factor=simulator_config.delay_factor,
                             )
                         lsmix_cuts = simulator.simulate(cuts_for_simulation, num_meetings=simulator_config.num_meetings, num_jobs=1, seed=global_rank*world_size+seed)
-                    if simulator_config.get('save_to',None):
-                        lsmix_cuts.to_jsonl(simulator_config.save_to)
+                        if simulator_config.get('save_to',None):
+                            lsmix_cuts.to_jsonl(simulator_config.save_to)
                     simulated_cuts += lsmix_cuts
                 elif simulator_config.ms_data_type == 'msasr':
                     #MS-ASR

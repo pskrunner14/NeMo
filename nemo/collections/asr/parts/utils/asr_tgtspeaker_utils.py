@@ -224,7 +224,6 @@ class LibriSpeechMixSimulator_tgt():
                 if len(query_cut_list) == 0:
                     #no query utterance different from target utterance is found
                     return mixed_cuts
-                query_cut_list = deepcopy(self.speaker_id2cut_ids[query_speaker_id])
                 query_id = random.choice(query_cut_list)
                 query_cut = self.id2cuts[query_id]
                 text = self.get_text(mixed_cut, query_speaker_id)
@@ -276,13 +275,13 @@ class LibriSpeechMixSimulator_tgt():
         min_duration = min(min_duration, max_duration)
         
         # Generate random duration within bounds
-        segment_duration = random.uniform(min_duration, max_duration)
+        segment_duration = np.round(random.uniform(min_duration, max_duration), decimals=3)
         
         # Calculate maximum possible start time
         max_start = total_duration - segment_duration
         
         # Generate random start time
-        segment_start = random.uniform(start_time, start_time + max_start)
+        segment_start = np.round(random.uniform(start_time, start_time + max_start), decimals=3)
         
         return segment_start, segment_duration
     

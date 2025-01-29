@@ -22,7 +22,7 @@ import torch.utils.data
 from lhotse.cut import MixedCut, MonoCut
 from lhotse.dataset import AudioSamples
 from lhotse.dataset.collation import collate_vectors, collate_matrices
-from lhotse.utils import compute_num_samples
+from lhotse.utils import compute_num_samples, uuid4
 from lhotse import SupervisionSet, SupervisionSegment, MonoCut, Recording, CutSet
 
 import numpy as np
@@ -98,12 +98,8 @@ class LhotseSpeechToTextTgtSpkBpeDataset(torch.utils.data.Dataset):
             spk_targets = [torch.transpose(torch.zeros(self.num_speakers, get_hidden_length_from_sample_length(cut.num_samples, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame)), 0, 1) for cut in cuts]
             audio, audio_lens, cuts = self.load_audio(cuts)
         else:
-            query_cuts = CutSet.from_cuts(get_query_cut(c) for c in cuts)
-            if cuts[0].rttm_filepath is None or (not hasattr(cuts[0], 'rttm_filepath')):
-                #if rttm file is not provided, set spk_targets to be all zero
-                spk_targets = [torch.transpose(torch.zeros(self.num_speakers, get_hidden_length_from_sample_length(c.num_samples + q.num_samples + self.separater_duration * cuts[0].sampling_rate, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame)), 0, 1) for c, q in zip(cuts, query_cuts)]
-            else:         
-                spk_targets = [torch.transpose(torch.as_tensor(self.speaker_to_target_tgt_speaker_0(c, q, self.num_speakers, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, self.spk_tar_all_zero), dtype=torch.float32), 0, 1) for c, q in zip(cuts,query_cuts)]
+            query_cuts = CutSet.from_cuts(get_query_cut(c) for c in cuts)        
+            spk_targets = [torch.transpose(torch.as_tensor(self.speaker_to_target_tgt_speaker_0(c, q, self.num_speakers, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, self.spk_tar_all_zero), dtype=torch.float32), 0, 1) for c, q in zip(cuts,query_cuts)]
             audio, audio_lens, cuts = self.load_audio(cuts)
             query_audio, query_audio_lens, query_cuts = self.load_audio(query_cuts)
             if self.add_separater_audio:
@@ -158,33 +154,48 @@ class LhotseSpeechToTextTgtSpkBpeDataset(torch.utils.data.Dataset):
             mask (Tensor): speaker mask with shape (num_speaker, hidden_lenght)
         '''
         # get cut-related segments from rttms
-        rttms = SupervisionSet.from_rttm(a_cut.rttm_filepath)
-        basename = os.path.basename(a_cut.rttm_filepath).replace('.rttm', '')
         if isinstance(a_cut, MixedCut):
-            # cut_list = [track.cut for track in a_cut.tracks] 
-            cut_list = [track for track in a_cut.tracks] # is a list of track
+            cut_list = [track.cut for track in a_cut.tracks if isinstance(track.cut, MonoCut)]
+            offsets = [track.offset for track in a_cut.tracks if isinstance(track.cut, MonoCut)]
         elif isinstance(a_cut, MonoCut):
             cut_list = [a_cut]
+            offsets = [0]
         else:
             raise ValueError(f"Unsupported cut type type{cut}: only MixedCut and MonoCut are supported")
-        
+
         segments_total = []
-        for cut in cut_list:
+        for i, cut in enumerate(cut_list):
+            if hasattr(cut, 'rttm_filepath') and cut.rttm_filepath is not None:
+                rttms = SupervisionSet.from_rttm(cut.rttm_filepath)
+            elif hasattr(cut, 'speaker_id') and cut.speaker_id is not None:
+                rttms = SupervisionSet.from_segments([SupervisionSegment(
+                    id=uuid4(),
+                    recording_id=cut.recording_id,
+                    start=0,
+                    duration=cut.duration,
+                    channel=1,
+                    speaker=cut.speaker_id,
+                    language=None
+                )])
+            else:
+                raise ValueError(f"Cut {cut.id} does not have rttm_filepath or speaker_id")
             if boundary_segments: # segments with seg_start < total_end and seg_end > total_start are included
-                if isinstance(a_cut, MixedCut):
-                    segments_iterator = find_segments_from_rttm(recording_id=a_cut.id, rttms=rttms, start_after=cut.offset, end_before=cut.offset + cut.cut.duration)
-                else:
-                    segments_iterator = find_segments_from_rttm(recording_id=cut.recording_id, rttms=rttms, start_after=cut.start, end_before=cut.end)
+                segments_iterator = find_segments_from_rttm(recording_id=cut.recording_id, rttms=rttms, start_after=cut.start, end_before=cut.end, tolerance=0.0)
             else: # segments with seg_start > total_start and seg_end < total_end are included
-                if isinstance(a_cut, MixedCut):
-                    segments_iterator = rttms.find(recording_id=a_cut.id, start_after=cut.offset, end_before=cut.offset + cut.cut.duration, adjust_offset=False)
-                else:
-                    segments_iterator = rttms.find(recording_id=cut.recording_id, start_after=cut.start, end_before=cut.end, adjust_offset=True)
-            segments = [s for s in segments_iterator]
-            segments_total.extend(segments)
+                segments_iterator = rttms.find(recording_id=cut.recording_id, start_after=cut.start, end_before=cut.end, adjust_offset=True)
+
+            for seg in segments_iterator:
+                if seg.start < 0:
+                    seg.duration += seg.start
+                    seg.start = 0
+                if seg.end > cut.duration:
+                    seg.duration -= seg.end - cut.duration
+                seg.start += offsets[i]
+                segments_total.append(seg)
+    
+            # segments_total.extend(segments)
         # apply arrival time sorting to the existing segments
         segments_total.sort(key = lambda rttm_sup: rttm_sup.start)
-
         seen = set()
         seen_add = seen.add
         if isinstance(a_cut, MixedCut):

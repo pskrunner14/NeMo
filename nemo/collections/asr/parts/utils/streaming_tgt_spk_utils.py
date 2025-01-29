@@ -141,9 +141,12 @@ class FrameBatchASR_tgt_spk:
         # pad on the right side
         samples = np.pad(samples, (0, int(delay * model_stride_in_secs * self.asr_model._cfg.sample_rate)))
         # query related variables
-        query_samples = self.get_partial_samples(query_audio_file, query_offset, query_duration)
         separater_audio = get_separator_audio(separater_freq, self.asr_model._cfg.sample_rate, separater_duration, separater_unvoice_ratio)
-        query_samples = np.concatenate([query_samples, separater_audio])
+        if query_duration > 0:
+            query_samples = self.get_partial_samples(query_audio_file, query_offset, query_duration)
+            query_samples = np.concatenate([query_samples, separater_audio])
+        else:
+            query_samples = separater_audio
         # import ipdb; ipdb.set_trace()
         frame_reader = AudioIterator_tgt_spk(samples, query_samples, self.frame_len, self.asr_model.device)
         self.query_pred_len = get_hidden_length_from_sample_length(len(query_samples), 160, 8)

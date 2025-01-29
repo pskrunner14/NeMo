@@ -199,33 +199,6 @@ def get_lhotse_dataloader_from_config(
     cuts, is_tarred = read_cutset_from_config(config)
 
     if config.generators is not None:
-        generated_cuts = CutSet()
-        for generator_name in config.generators.keys():
-            generator_config = config.generators[generator_name]
-            if generator_config.get('manifest_filepath', None):
-                cfg_for_generation = LhotseDataLoadingConfig()
-                cfg_for_generation = OmegaConf.create(cfg_for_generation)
-                cfg_for_generation.manifest_filepath = generator_config.manifest_filepath
-                cuts_for_generation, _ = read_cutset_from_config(cfg_for_generation)
-            else:
-                raise ValueError ('Invalid generator manifest filepath')
-            if generator_config.get('lsmix',False):
-                # # librimixgenerator
-                assert hasattr(cuts_for_generation[0], 'delays')
-                if hasattr(cuts[0],'query_audio_filepath'):
-                    generator = LibriSpeechMixGenerator_tgt()
-                    generated_cuts += generator.generate(cuts_for_generation)
-                else:                
-                    generator = LibriSpeechMixGenerator()
-                    generated_cuts += generator.generate(cuts_for_generation)
-        if config.including_real_data:
-            cuts = CutSet.from_cuts(cuts + generated_cuts)
-        else:
-            cuts = generated_cuts
-        if config.shuffle:
-            cuts = cuts.shuffle()
-
-    if config.generators is not None:
         #genertor use pre-defined mixed manifest to generator audio. It requires pre-generated rttm/audio_file_path. Only wav need to be mixed here. This is meant to alleviate the storage overhead for millions of mixed audio
         generated_cuts = CutSet()
         for generator_name in config.generators.keys():
@@ -270,15 +243,21 @@ def get_lhotse_dataloader_from_config(
             if simulator_config.get('lsmix',False):
                 if simulator_config.ms_data_type == 'tsasr':
                     #TS-ASR
-                    simulator = LibriSpeechMixSimulator_tgt(
-                            data_type=simulator_config.ms_data_type,
-                            min_delay=0.5,
-                            max_num_speakers=simulator_config.max_num_speakers,
-                            speaker_count_distribution=simulator_config.speaker_count_distribution,
-                            query_duration=simulator_config.query_duration,
-                            delay_factor=simulator_config.delay_factor,
-                        )
-                    simulated_cuts += simulator.simulate(cuts_for_simulation, num_meetings=simulator_config.num_meetings, num_jobs=1, seed=global_rank*world_size+seed)
+                    if simulator_config.get('save_to', None) and os.path.exists(simulator_config.save_to):
+                        lsmix_cuts = CutSet.from_jsonl(simulator_config.save_to)
+                    else:
+                        simulator = LibriSpeechMixSimulator_tgt(
+                                data_type=simulator_config.ms_data_type,
+                                min_delay=0.5,
+                                max_num_speakers=simulator_config.max_num_speakers,
+                                speaker_count_distribution=simulator_config.speaker_count_distribution,
+                                query_duration=simulator_config.query_duration,
+                                delay_factor=simulator_config.delay_factor,
+                            )
+                        lsmix_cuts = simulator.simulate(cuts_for_simulation, num_meetings=simulator_config.num_meetings, num_jobs=1, seed=global_rank*world_size+seed)
+                    if simulator_config.get('save_to',None):
+                        lsmix_cuts.to_jsonl(simulator_config.save_to)
+                    simulated_cuts += lsmix_cuts
                 elif simulator_config.ms_data_type == 'msasr':
                     #MS-ASR
                     simulator = LibriSpeechMixSimulator(

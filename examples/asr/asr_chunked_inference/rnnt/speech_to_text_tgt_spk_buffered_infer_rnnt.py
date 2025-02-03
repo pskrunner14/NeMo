@@ -13,12 +13,19 @@
 # limitations under the License.
 
 """
-This script serves three goals:
-    (1) Demonstrate how to use NeMo Models outside of PytorchLightning
-    (2) Shows example of batch ASR inference
-    (3) Serves as CI test for pre-trained checkpoint
+Script to perform buffered inference using RNNT models.
 
-python speech_to_text_buffered_infer_ctc.py \
+Buffered inference is the primary form of audio transcription when the audio segment is longer than 20-30 seconds.
+This is especially useful for models such as Conformers, which have quadratic time and memory scaling with
+audio duration.
+
+The difference between streaming and buffered inference is the chunk size (or the latency of inference).
+Buffered inference will use large chunk sizes (5-10 seconds) + some additional buffer for context.
+Streaming inference will use small chunk sizes (0.1 to 0.25 seconds) + some additional buffer for context.
+
+# Middle Token merge algorithm
+
+python speech_to_text_buffered_infer_rnnt.py \
     model_path=null \
     pretrained_name=null \
     audio_dir="<remove or path to folder of audio files>" \
@@ -30,6 +37,21 @@ python speech_to_text_buffered_infer_ctc.py \
     batch_size=32 \
     clean_groundtruth_text=True \
     langid='en'
+
+# Longer Common Subsequence (LCS) Merge algorithm
+
+python speech_to_text_buffered_infer_rnnt.py \
+    model_path=null \
+    pretrained_name=null \
+    audio_dir="<remove or path to folder of audio files>" \
+    dataset_manifest="<remove or path to manifest>" \
+    output_filename="<remove or specify output filename>" \
+    total_buffer_in_secs=4.0 \
+    chunk_len_in_secs=1.6 \
+    model_stride=4 \
+    batch_size=32 \
+    merge_algo="lcs" \
+    lcs_alignment_dir=<OPTIONAL: Some path to store the LCS alignments> 
 
 # NOTE:
     You can use `DEBUG=1 python speech_to_text_buffered_infer_ctc.py ...` to print out the
@@ -44,24 +66,28 @@ from typing import Optional
 
 import lightning.pytorch as pl
 import torch
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 
-from nemo.collections.asr.models import EncDecCTCModel, EncDecHybridRNNTCTCModel
-from nemo.collections.asr.parts.submodules.ctc_decoding import CTCDecodingConfig
+from nemo.collections.asr.models import EncDecHybridRNNTCTCModel, EncDecRNNTModel
+from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTDecodingConfig
 from nemo.collections.asr.parts.utils.eval_utils import cal_write_wer
-from nemo.collections.asr.parts.utils.streaming_tgt_spk_utils import FrameBatchASR_tgt_spk, FeatureFrameBatchASR_tgt_spk
+from nemo.collections.asr.parts.utils.streaming_utils import (
+    LongestCommonSubsequenceBatchedFrameASRRNNT
+)
+from nemo.collections.asr.parts.utils.streaming_tgt_spk_utils import (
+    BatchedFrameASRRNNT_tgt_spk
+)
+from nemo.collections.asr.parts.utils.streaming_utils import BatchedFrameASRRNNT
 from nemo.collections.asr.parts.utils.transcribe_utils import (
     compute_output_filename,
     write_transcription,
 )
 from nemo.collections.asr.parts.utils.transcribe_spk_utils import (
     setup_model,
-    get_buffered_pred_feat_tgt_spk_ctc,
+    get_buffered_pred_feat_tgt_spk_rnnt,
 )
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
-
-can_gpu = torch.cuda.is_available()
 
 
 @dataclass
@@ -94,21 +120,28 @@ class TranscriptionConfig:
     chunk_len_in_secs: float = 1.6  # Chunk length in seconds
     total_buffer_in_secs: float = 4.0  # Length of buffer (chunk + left and right padding) in seconds
     model_stride: int = (
-        8  # Model downsampling factor, 8 for Citrinet and FasConformer models and 4 for Conformer models.
+        8  # Model downsampling factor, 8 for Citrinet and FastConformer models and 4 for Conformer models.
     )
-
-    # Decoding strategy for CTC models
-    decoding: CTCDecodingConfig = CTCDecodingConfig()
 
     # Set `cuda` to int to define CUDA device. If 'None', will look for CUDA
     # device anyway, and do inference on CPU only if CUDA device is not found.
     # If `cuda` is a negative number, inference will be on CPU only.
     cuda: Optional[int] = None
-    amp: bool = False
     audio_type: str = "wav"
 
     # Recompute model transcription, even if the output folder exists with scores.
     overwrite_transcripts: bool = True
+
+    # Decoding strategy for RNNT models
+    decoding: RNNTDecodingConfig = RNNTDecodingConfig()
+
+    # Decoding configs
+    max_steps_per_timestep: int = 5  #'Maximum number of tokens decoded per acoustic timestep'
+    stateful_decoding: bool = False  # Whether to perform stateful decoding
+
+    # Merge algorithm for transducers
+    merge_algo: Optional[str] = 'middle'  # choices=['middle', 'lcs'], choice of algorithm to apply during inference.
+    lcs_alignment_dir: Optional[str] = None  # Path to a directory to store LCS algo alignments
 
     # Config for word / character error rate calculation
     calculate_wer: bool = True
@@ -157,6 +190,7 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
     logging.info(f"Inference will be done on device : {device}")
 
     asr_model, model_name = setup_model(cfg, map_location)
+
     model_cfg = copy.deepcopy(asr_model._cfg)
     OmegaConf.set_struct(model_cfg.preprocessor, False)
     # some changes for streaming scenario
@@ -164,7 +198,7 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
     model_cfg.preprocessor.pad_to = 0
 
     if model_cfg.preprocessor.normalize != "per_feature":
-        logging.error("Only EncDecCTCModelBPE models trained with per_feature normalization are supported currently")
+        logging.error("Only EncDecRNNTBPEModel models trained with per_feature normalization are supported currently")
 
     # Disable config overwriting
     OmegaConf.set_struct(model_cfg.preprocessor, True)
@@ -180,25 +214,31 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
         )
         return cfg
 
+    asr_model.freeze()
+    asr_model = asr_model.to(asr_model.device)
+
+    # Change Decoding Config
+    with open_dict(cfg.decoding):
+        if cfg.stateful_decoding:
+            cfg.decoding.strategy = "greedy"
+        else:
+            cfg.decoding.strategy = "greedy_batch"
+        cfg.decoding.preserve_alignments = True  # required to compute the middle token for transducers.
+        cfg.decoding.fused_batch_size = -1  # temporarily stop fused batch during inference.
+        cfg.decoding.beam.return_best_hypothesis = True  # return and write the best hypothsis only
+
     # Setup decoding strategy
     if hasattr(asr_model, 'change_decoding_strategy'):
-        if not isinstance(asr_model, EncDecCTCModel) and not isinstance(asr_model, EncDecHybridRNNTCTCModel):
-            raise ValueError("The script supports ctc model and hybrid model with ctc decodng!")
-
+        if not isinstance(asr_model, EncDecRNNTModel) and not isinstance(asr_model, EncDecHybridRNNTCTCModel):
+            raise ValueError("The script supports rnnt model and hybrid model with rnnt decodng!")
         else:
-            if cfg.compute_langs:
-                raise ValueError("CTC models do not support `compute_langs` at the moment.")
-
-            if hasattr(
-                asr_model, 'cur_decoder'
-            ):  # hybrid model with ctc decoding or potential other models containing decoding switch feature
-                asr_model.change_decoding_strategy(cfg.decoding, decoder_type='ctc')
-
-            else:  # ctc model
+            # rnnt model
+            if isinstance(asr_model, EncDecRNNTModel):
                 asr_model.change_decoding_strategy(cfg.decoding)
 
-    asr_model.eval()
-    asr_model = asr_model.to(asr_model.device)
+            # hybrid ctc rnnt model with decoder_type = rnnt
+            if hasattr(asr_model, 'cur_decoder'):
+                asr_model.change_decoding_strategy(cfg.decoding, decoder_type='rnnt')
 
     feature_stride = model_cfg.preprocessor['window_stride']
     model_stride_in_secs = feature_stride * cfg.model_stride
@@ -209,33 +249,43 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
     mid_delay = math.ceil((chunk_len + (total_buffer - chunk_len) / 2) / model_stride_in_secs)
     logging.info(f"tokens_per_chunk is {tokens_per_chunk}, mid_delay is {mid_delay}")
 
-    if cfg.buffer_level == 'audio':
-        frame_asr = FrameBatchASR_tgt_spk(
+    if cfg.merge_algo == 'middle':
+        frame_asr = BatchedFrameASRRNNT_tgt_spk(
             asr_model=asr_model,
             frame_len=chunk_len,
             total_buffer=cfg.total_buffer_in_secs,
             batch_size=cfg.batch_size,
-        )
-    elif cfg.buffer_level == 'feature':
-        frame_asr = FeatureFrameBatchASR_tgt_spk(
-            asr_model=asr_model,
-            frame_len=chunk_len,
-            total_buffer=cfg.total_buffer_in_secs,
-            batch_size=cfg.batch_size,
+            max_steps_per_timestep=cfg.max_steps_per_timestep,
+            stateful_decoding=cfg.stateful_decoding,
         )
 
-    with torch.amp.autocast(asr_model.device.type, enabled=cfg.amp):
-        hyps = get_buffered_pred_feat_tgt_spk_ctc(
-            frame_asr,
-            chunk_len,
-            tokens_per_chunk,
-            mid_delay,
-            model_cfg.preprocessor,
-            model_stride_in_secs,
-            asr_model.device,
-            manifest,
-            filepaths,
+    elif cfg.merge_algo == 'lcs':
+        frame_asr = LongestCommonSubsequenceBatchedFrameASRRNNT(
+            asr_model=asr_model,
+            frame_len=chunk_len,
+            total_buffer=cfg.total_buffer_in_secs,
+            batch_size=cfg.batch_size,
+            max_steps_per_timestep=cfg.max_steps_per_timestep,
+            stateful_decoding=cfg.stateful_decoding,
+            alignment_basepath=cfg.lcs_alignment_dir,
         )
+        # Set the LCS algorithm delay.
+        frame_asr.lcs_delay = math.floor(((total_buffer - chunk_len)) / model_stride_in_secs)
+
+    else:
+        raise ValueError("Invalid choice of merge algorithm for transducer buffered inference.")
+
+    hyps = get_buffered_pred_feat_tgt_spk_rnnt(
+        asr=frame_asr,
+        tokens_per_chunk=tokens_per_chunk,
+        delay=mid_delay,
+        model_stride_in_secs=model_stride_in_secs,
+        batch_size=cfg.batch_size,
+        manifest=manifest,
+        filepaths=filepaths,
+        accelerator=accelerator,
+    )
+
     output_filename, pred_text_attr_name = write_transcription(
         hyps, cfg, model_name, filepaths=filepaths, compute_langs=False, timestamps=False
     )

@@ -200,7 +200,12 @@ class LibriSpeechMixSimulator_tgt():
             cut_ids.append(cut_id)
 
         mixed_cuts = []
-        for i in range(self.delay_factor):
+        if n_speakers == 1:
+            #do not add delay factor to single-spk sample as augmented one will be the same
+            delay_factor = 1
+        else:
+            delay_factor = self.delay_factor
+        for i in range(delay_factor):
             tracks = []
             offset = 0.0
             for mono_cut in mono_cuts:
@@ -227,6 +232,65 @@ class LibriSpeechMixSimulator_tgt():
                 query_id = random.choice(query_cut_list)
                 query_cut = self.id2cuts[query_id]
                 text = self.get_text(mixed_cut, query_speaker_id)
+                sup = SupervisionSegment(id = mixed_cut.id, recording_id = mixed_cut.id, start = 0, duration=mixed_cut.duration, text = text)
+                query_offset, query_duration = self.get_bounded_segment(query_cut.start, query_cut.duration, min_duration=self.query_duration[0], max_duration=self.query_duration[1])
+                custom = {
+                        'pnc': 'no',
+                        'source_lang': 'en',
+                        'target_lang': 'en',
+                        'task': 'asr',
+                        'query_audio_filepath': query_cut.recording.sources[0].source,
+                        'query_speaker_id': query_speaker_id,
+                        'query_offset': query_offset,
+                        'query_duration': query_duration,
+                        'custom': None 
+                    }
+                mixed_cut.tracks[0].cut.supervisions = [sup]
+                mixed_cut.tracks[0].cut.custom.update(custom)
+
+            mixed_cuts.append(mixed_cut)
+
+        return mixed_cuts
+    
+    def _create_non_existing_query_mixture(self, n_speakers: int) -> MixedCut:
+        sampled_speaker_ids = random.sample(self.speaker_ids, n_speakers)
+        
+        mono_cuts = []
+        cut_ids = []
+        for speaker_id in sampled_speaker_ids:
+            cut_id = random.choice(self.speaker_id2cut_ids[speaker_id])
+            cut = self.id2cuts[cut_id]
+            mono_cuts.append(cut)
+            cut_ids.append(cut_id)
+
+        mixed_cuts = []
+        for i in range(self.delay_factor):
+            tracks = []
+            offset = 0.0
+            for mono_cut in mono_cuts:
+                custom = {
+                        'pnc': 'no',
+                        'source_lang': 'en',
+                        'target_lang': 'en',
+                        'task': 'asr'
+                    }
+                mono_cut.custom.update(custom)
+                tracks.append(MixTrack(cut=deepcopy(mono_cut), type=type(mono_cut), offset=offset))
+                offset += random.uniform(self.min_delay, mono_cut.duration)
+        
+            mixed_cut = MixedCut(id='lsmix_' + '_'.join([track.cut.id for track in tracks]) + '_' + str(uuid4()), tracks=tracks)
+
+            if self.data_type == "tsasr":
+                # index = random.randrange(len(sampled_speaker_ids))
+                query_speaker_id = random.sample(set(self.speaker_ids) - set(sampled_speaker_ids), 1)[0]
+                query_cut_list = self.speaker_id2cut_ids[query_speaker_id]
+                # query_cut_list.remove(cut_ids[index])
+                if len(query_cut_list) == 0:
+                    #no query utterance different from target utterance is found
+                    return mixed_cuts
+                query_id = random.choice(query_cut_list)
+                query_cut = self.id2cuts[query_id]
+                text = ""
                 sup = SupervisionSegment(id = mixed_cut.id, recording_id = mixed_cut.id, start = 0, duration=mixed_cut.duration, text = text)
                 query_offset, query_duration = self.get_bounded_segment(query_cut.start, query_cut.duration, min_duration=self.query_duration[0], max_duration=self.query_duration[1])
                 custom = {
@@ -305,6 +369,7 @@ class LibriSpeechMixSimulator_tgt():
     def simulate(self, 
         cuts: CutSet,
         num_meetings: int = 10000,
+        non_existing_query_ratio: float = 0,
         seed: int = 0,
         num_jobs: int = 1,
     ) -> CutSet:
@@ -320,4 +385,9 @@ class LibriSpeechMixSimulator_tgt():
                 continue
             for i in tqdm(range(n_mt), desc=f"Simulating {n_speakers}-speaker mixtures", ncols=128):
                 cut_set.extend(self._create_mixture(n_speakers=n_speakers))
+        if non_existing_query_ratio > 0:
+            #add samples where query speaker not in target utterance and set text field to be empty straing
+            num_no_query_samples = int(num_meetings * non_existing_query_ratio)
+            for i in tqdm(range(num_no_query_samples), desc=f"Simulating non existing query samples", ncols=128):
+                cut_set.extend(self._create_non_existing_query_mixture(n_speakers=np.random.choice(np.arange(1, self.max_num_speakers+1))))           
         return CutSet.from_cuts(cut_set).shuffle()

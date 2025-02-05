@@ -50,11 +50,11 @@ def read_cutset_from_config(config: DictConfig) -> Tuple[CutSet, bool]:
         is_tarred = config.get("shar_path") is not None
     if use_nemo_manifest:
         # Read NeMo manifest -- use the right wrapper depending on tarred/non-tarred.
-        cuts = read_nemo_manifest(config, is_tarred)
+        cuts, weights = read_nemo_manifest(config, is_tarred)
     else:
         # Read Lhotse manifest (again handle both tarred(shar)/non-tarred).
         cuts = read_lhotse_manifest(config, is_tarred)
-    return cuts, is_tarred
+    return cuts, is_tarred, weights
 
 
 KNOWN_DATASET_CONFIG_TYPES = frozenset(("nemo", "nemo_tarred", "lhotse", "lhotse_shar", "txt", "txt_pair", "group"))
@@ -412,6 +412,7 @@ def read_nemo_manifest(config, is_tarred: bool) -> CutSet:
                 cuts = cuts.repeat()
         else:
             cuts = CutSet(LazyNeMoIterator(config.manifest_filepath, **notar_kwargs, **common_kwargs))
+            weights = [len(cuts)]
     else:
         # Format option 1:
         #   Assume it's [[path1], [path2], ...] (same for tarred_audio_filepaths).
@@ -487,7 +488,7 @@ def read_nemo_manifest(config, is_tarred: bool) -> CutSet:
             seed=config.shard_seed,
             force_finite=force_finite or metadata_only,
         )
-    return cuts
+    return cuts, weights
 
 
 def mux(

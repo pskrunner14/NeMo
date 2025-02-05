@@ -196,7 +196,7 @@ def get_lhotse_dataloader_from_config(
     fix_random_seed(seed)
 
     # 1. Load a manifest as a Lhotse CutSet.
-    cuts, is_tarred = read_cutset_from_config(config)
+    cuts, is_tarred, weights = read_cutset_from_config(config)
 
     if config.generators is not None:
         #genertor use pre-defined mixed manifest to generator audio. It requires pre-generated rttm/audio_file_path. Only wav need to be mixed here. This is meant to alleviate the storage overhead for millions of mixed audio
@@ -207,7 +207,7 @@ def get_lhotse_dataloader_from_config(
                 cfg_for_generation = LhotseDataLoadingConfig()
                 cfg_for_generation = OmegaConf.create(cfg_for_generation)
                 cfg_for_generation.manifest_filepath = generator_config.manifest_filepath
-                cuts_for_generation, _ = read_cutset_from_config(cfg_for_generation)
+                cuts_for_generation, _, _ = read_cutset_from_config(cfg_for_generation)
             else:
                 raise ValueError ('Invalid generator manifest filepath')
             if generator_config.get('lsmix',False):
@@ -222,7 +222,8 @@ def get_lhotse_dataloader_from_config(
                     generator = LibriSpeechMixGenerator()
                     generated_cuts += generator.generate(cuts_for_generation)
         if config.including_real_data:
-            cuts = CutSet.from_cuts(cuts + generated_cuts)
+            # cuts = CutSet.from_cuts(cuts + generated_cuts)
+            cuts = CutSet.mux(cuts, simulated_cuts, weights = [sum(weights), len(generated_cuts)])
         else:
             cuts = generated_cuts
         if config.shuffle:
@@ -237,7 +238,7 @@ def get_lhotse_dataloader_from_config(
                 cfg_for_simulation = LhotseDataLoadingConfig()
                 cfg_for_simulation = OmegaConf.create(cfg_for_simulation)
                 cfg_for_simulation.manifest_filepath = simulator_config.manifest_filepath
-                cuts_for_simulation, _ = read_cutset_from_config(cfg_for_simulation)
+                cuts_for_simulation, _, _ = read_cutset_from_config(cfg_for_simulation)
             else:
                 raise ValueError ('Invalid simulator manifest filepath')
             if simulator_config.get('lsmix',False):
@@ -272,7 +273,9 @@ def get_lhotse_dataloader_from_config(
                 else:
                     raise ValueError('Invalid ms_data_type, chosen from msasr / tsasr')
         if config.including_real_data:
-            cuts = CutSet.from_cuts(cuts + simulated_cuts)
+            # cuts = CutSet.from_cuts(cuts + simulated_cuts)
+            # only support uniform sampling, self-defined sampling TODO
+            cuts = CutSet.mux(cuts, simulated_cuts, weights = [sum(weights), len(simulated_cuts)])
         else:
             cuts = simulated_cuts
         if config.shuffle:

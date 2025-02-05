@@ -226,8 +226,6 @@ def get_lhotse_dataloader_from_config(
             cuts = CutSet.mux(cuts, simulated_cuts, weights = [sum(weights), len(generated_cuts)])
         else:
             cuts = generated_cuts
-        if config.shuffle:
-            cuts = cuts.shuffle()
 
     if config.simulators is not None:
         #simulator simulates manifest from single-speaker manifest. audio / rttm / text are all generated on the fly.
@@ -278,8 +276,6 @@ def get_lhotse_dataloader_from_config(
             cuts = CutSet.mux(cuts, simulated_cuts, weights = [sum(weights), len(simulated_cuts)])
         else:
             cuts = simulated_cuts
-        if config.shuffle:
-            cuts = cuts.shuffle()
 
 
     # Apply channel selector

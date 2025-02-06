@@ -62,6 +62,8 @@ class MetaCatResidual(torch.nn.Module):
         x: (B, T, D)
         mask: (B, T)
         """
+        if mask.shape[1] != x.shape[1]:
+            mask = F.pad(mask, (0, x.shape[1] - mask.shape[1]), value=0)
         x = x * mask.unsqueeze(2)
         x = x + self.proj(x)
         return x

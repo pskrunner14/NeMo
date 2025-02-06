@@ -1084,7 +1084,7 @@ class LibriSpeechMixSimulator():
                     }
                 mono_cut.custom.update(custom)
                 tracks.append(MixTrack(cut=deepcopy(mono_cut), type=type(mono_cut), offset=offset))
-                offset += random.uniform(self.min_delay, cut.duration)
+                offset += random.uniform(self.min_delay, mono_cut.duration)
         
             mixed_cut = MixedCut(id='lsmix_' + '_'.join([track.cut.id for track in tracks]) + '_' + str(uuid4()), tracks=tracks)
             

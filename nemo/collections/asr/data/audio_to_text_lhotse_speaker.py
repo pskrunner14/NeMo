@@ -70,7 +70,7 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
     def __getitem__(self, cuts) -> Tuple[torch.Tensor, ...]:
 
         audio, audio_lens, cuts = self.load_audio(cuts)
-        if hasattr('rttm_filepath', cuts[0]) and cuts[0].rttm_filepath:
+        if hasattr(cuts[0], 'rttm_filepath') and cuts[0].rttm_filepath or hasattr(cuts[0], 'speaker_id') and cuts[0].speaker_id:
             spk_targets = [torch.as_tensor(speaker_to_target(cut, self.num_speakers, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, self.spk_tar_all_zero), dtype=torch.float32) for cut in cuts]
             spk_targets = collate_matrices(spk_targets)
         else:
@@ -81,7 +81,14 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
         query_speaker_ids = []
 
         for cut in cuts:
-            non_padding_cuts = [track.cut for track in cut.tracks if isinstance(track.cut, MonoCut)]
+            non_padding_cuts = []
+            if isinstance(cut, MonoCut):
+                non_padding_cuts.append(cut)
+            elif isinstance(cut, MixedCut):
+                for track in cut.tracks:
+                    if isinstance(track.cut, MonoCut):
+                        non_padding_cuts.append(track.cut)
+
             if self.fixed_spk_id is None: # Randomly select a speaker during training
                 query_spk_id = random.choice(range(len(non_padding_cuts)))
             else: # fix the speaker id for inference
@@ -90,11 +97,9 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
             tokens.append(torch.as_tensor(self.tokenizer(query_cut.custom['text'], cut.supervisions[0].language)))
             query_speaker_ids.append(query_spk_id)
             query_cuts.append(query_cut)
-        # query_cuts = CutSet.from_cuts(query_cuts)
-        # query, query_lens, _ = self.load_audio(query_cuts)
+
         token_lens = torch.tensor([t.size(0) for t in tokens], dtype=torch.long)
         tokens = collate_vectors(tokens, padding_value=0)
         query_speaker_ids = torch.tensor(query_speaker_ids, dtype=torch.long)
 
-        # return audio, audio_lens, query, query_lens, tokens, token_lens, spk_targets, query_speaker_ids # sometimes need query for debugging
         return audio, audio_lens, tokens, token_lens, spk_targets, query_speaker_ids

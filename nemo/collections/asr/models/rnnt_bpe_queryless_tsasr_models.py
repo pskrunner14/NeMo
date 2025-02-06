@@ -48,119 +48,123 @@ from nemo.core.classes.common import PretrainedModelInfo
 
 from nemo.utils import logging
 
+class MetaCatResidual(torch.nn.Module):
+    def __init__(self, input_size, output_size):
+        super().__init__()
+        self.proj = torch.nn.Sequential(
+            torch.nn.Linear(input_size, output_size*2),
+            torch.nn.ReLU(),
+            torch.nn.Linear(output_size*2, output_size)
+        )
+
+    def forward(self, x, mask):
+        """
+        x: (B, T, D)
+        mask: (B, T)
+        """
+        x = x * mask.unsqueeze(2)
+        x = x + self.proj(x)
+        return x
+
 class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
     """Base class for encoder decoder RNNT-based models with subword tokenization."""
-
-    @classmethod
-    def list_available_models(cls) -> List[PretrainedModelInfo]:
-        """
-        This method returns a list of pre-trained model which can be instantiated directly from NVIDIA's NGC cloud.
-
-        Returns:
-            List of available pre-trained models.
-        """
-        results = []
-
-        return results
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
         super().__init__(cfg=cfg, trainer=trainer)
 
         self.num_speakers = cfg.model_defaults.get('num_speakers', 4)
         if 'diar_model_path' in self.cfg:
-            if self.training:
-                self._init_diar_model()
+            self._init_diar_model()
 
             self.pre_diar_kernel = cfg.get('pre_diar_kernel', None)
-            self.post_diar_kernel = cfg.get('post_diar_kernel', None)
+            self.fc_diar_kernel = cfg.get('fc_diar_kernel', None)
+            self.diar_kernel_layer = cfg.get('diar_kernel_layer', [])
             self.binary_diar_preds = cfg.get('binary_diar_preds', True)
             self.spk_supervision = cfg.get('spk_supervision', 'rttm')
+            
+            if isinstance(self.diar_kernel_layer, int):
+                self.diar_kernel_layer = list(range(1, 1 + self.diar_kernel_layer))
+            elif isinstance(self.diar_kernel_layer, ListConfig):
+                pass
+            elif self.fc_diar_kernel is not None:
+                raise ValueError(f"Invalid diar_kernel_layer {self.diar_kernel_layer}, should be int or list")
 
-            if self.pre_diar_kernel == 'metacat':
-                # projection layer
-                proj_in_size = cfg.model_defaults.enc_hidden
-                proj_out_size = cfg.model_defaults.enc_hidden
-                self.pre_proj = torch.nn.Sequential(
-                    torch.nn.Linear(proj_in_size, proj_out_size*2),
-                    torch.nn.ReLU(),
-                    torch.nn.Linear(proj_out_size*2, proj_out_size)
-                )
-            elif self.pre_diar_kernel == 'metacat_residule':
-                # projection layer
-                proj_in_size = cfg.model_defaults.enc_hidden
-                proj_out_size = cfg.model_defaults.enc_hidden
-                self.pre_proj = torch.nn.Sequential(
-                    torch.nn.Linear(proj_in_size, proj_out_size*2),
-                    torch.nn.ReLU(),
-                    torch.nn.Linear(proj_out_size*2, proj_out_size)
-                )
-            elif self.pre_diar_kernel == 'metacat_projection':
-                # projection layer
-                proj_in_size = cfg.model_defaults.enc_hidden + 1
-                proj_out_size = cfg.model_defaults.enc_hidden
-                self.pre_proj = torch.nn.Sequential(
-                    torch.nn.Linear(proj_in_size, proj_out_size*2),
-                    torch.nn.ReLU(),
-                    torch.nn.Linear(proj_out_size*2, proj_out_size)
-                )
-            elif self.pre_diar_kernel == 'sinusoidal':
-                self.pre_proj = self.get_sinusoid_position_encoding(self.num_speakers, cfg.model_defaults.enc_hidden)
+            in_size = cfg.model_defaults.enc_hidden
+            out_size = cfg.model_defaults.enc_hidden
+            self.spk_kernels = torch.nn.ModuleDict()
 
-            if self.post_diar_kernel == 'metacat':
-                # projection layer
-                proj_in_size = cfg.model_defaults.enc_hidden
-                proj_out_size = cfg.model_defaults.enc_hidden
-                self.post_proj = torch.nn.Sequential(
-                    torch.nn.Linear(proj_in_size, proj_out_size*2),
-                    torch.nn.ReLU(),
-                    torch.nn.Linear(proj_out_size*2, proj_out_size)
-                )
-            elif self.post_diar_kernel == 'metacat_residule':
-                # projection layer
-                proj_in_size = cfg.model_defaults.enc_hidden
-                proj_out_size = cfg.model_defaults.enc_hidden
-                self.post_proj = torch.nn.Sequential(
-                    torch.nn.Linear(proj_in_size, proj_out_size*2),
-                    torch.nn.ReLU(),
-                    torch.nn.Linear(proj_out_size*2, proj_out_size)
-                )
-            elif self.post_diar_kernel == 'metacat_projection':
-                # projection layer
-                proj_in_size = cfg.model_defaults.enc_hidden + 1
-                proj_out_size = cfg.model_defaults.enc_hidden
-                self.post_proj = torch.nn.Sequential(
-                    torch.nn.Linear(proj_in_size, proj_out_size*2),
-                    torch.nn.ReLU(),
-                    torch.nn.Linear(proj_out_size*2, proj_out_size)
-                )
-            elif self.post_diar_kernel == 'sinusoidal':
-                self.post_proj = self.get_sinusoid_position_encoding(self.num_speakers, cfg.model_defaults.enc_hidden)
+            # diar kernel for pre-encoder
+            if 0 in self.diar_kernel_layer:
+                if self.pre_diar_kernel == 'metacat_residule':
+                    # projection layer
+                    self.spk_kernels['0'] = MetaCatResidual(in_size, out_size)
 
+                elif self.pre_diar_kernel == 'sinusoidal':
+                    # self.pre_proj = self.get_sinusoid_position_encoding(self.num_speakers, cfg.model_defaults.enc_hidden)
+                    pass
+
+            # diar kernel for fast conformer encoder layers
+            if self.fc_diar_kernel == 'metacat_residule':
+                for l_i in self.diar_kernel_layer:
+                    if l_i != 0:
+                        self.spk_kernels[str(l_i)] = MetaCatResidual(in_size, out_size)
+            elif self.fc_diar_kernel == 'sinusoidal':
+                # self.post_proj = self.get_sinusoid_position_encoding(self.num_speakers, cfg.model_defaults.enc_hidden)
+                pass
+            
+            logging.info(f"Registered speaker kernels to layers {list(self.spk_kernels.keys())}")
+            # register the speaker injection model to each layer
+            for k, spk_kernel in self.spk_kernels.items():
+                hook_func = self.get_hook_function(k)
+                idx = int(k)
+                if idx == 0:
+                    self.encoder.pre_encode.register_forward_hook(hook_func)
+                else:
+                    self.encoder.layers[idx-1].register_forward_hook(hook_func)
+                
 
     def _init_diar_model(self):
         """
         Initialize the speaker model.
         """
         logging.info(f"Initializing diarization model from pretrained checkpoint {self.cfg.diar_model_path}")
-        
-        
-        # model_path = self.cfg.diar_model_path
-        model_path = "/disk_a/models/sortformer_diarization/noEK/nov_22_2024_PR_ver/im382no-normNA-mem1_epoch6-18.nov20_2024.nemo"
 
-        if model_path.endswith('.nemo'):
-            pretrained_diar_model = SortformerEncLabelModel.restore_from(model_path, map_location="cpu")
-            logging.info("Diarization Model restored locally from {}".format(model_path))
-        elif model_path.endswith('.ckpt'):
-            pretrained_diar_model = SortformerEncLabelModel.load_from_checkpoint(model_path, map_location="cpu")
-            logging.info("Diarization Model restored locally from {}".format(model_path))
-        else:
-            pretrained_diar_model = SortformerEncLabelModel.from_pretrained(model_path)
+        model_path = self.cfg.diar_model_path
+
+        try:
+            if model_path.endswith('.nemo'):
+                pretrained_diar_model = SortformerEncLabelModel.restore_from(model_path, map_location="cpu")
+                logging.info("Diarization Model restored locally from {}".format(model_path))
+            elif model_path.endswith('.ckpt'):
+                pretrained_diar_model = SortformerEncLabelModel.load_from_checkpoint(model_path, map_location="cpu")
+                logging.info("Diarization Model restored locally from {}".format(model_path))
+            else:
+                pretrained_diar_model = SortformerEncLabelModel.from_pretrained(model_path)
+                logging.info("Diarization Model restored from NGC")
+        except:
+            pretrained_diar_model = SortformerEncLabelModel.from_pretrained("nvidia/diar_sortformer_4spk-v1")
             logging.info("Diarization Model restored from NGC")
-
+        
         self.diarization_model = pretrained_diar_model
 
         if self.cfg.freeze_diar:
-           self.diarization_model.eval()
+            self.diarization_model.eval()
+
+    def get_hook_function(self, index):
+        """Returns a forward hook function that applies the metacat modules"""
+        def hook(module, input, output):
+            # import ipdb; ipdb.set_trace()
+            if isinstance(output, tuple): # pre-encode, B x T x D
+                x, *cache = output
+                x = self.spk_kernels[index](x, self.spk_targets)
+                # import ipdb; ipdb.set_trace()
+                
+                return (x, *cache)
+            else:
+                # import ipdb; ipdb.set_trace()
+                return self.spk_kernels[index](output, self.spk_targets)
+        
+        return hook
 
     def forward_diar(
         self,
@@ -170,8 +174,8 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         with torch.no_grad():
             processed_signal, processed_signal_length = self.diarization_model.process_signal(audio_signal=audio_signal, audio_signal_length=audio_signal_length)
             processed_signal = processed_signal[:, :, :processed_signal_length.max()]
-            emb_seq, _ = self.diarization_model.frontend_encoder(processed_signal=processed_signal, processed_signal_length=processed_signal_length)
-            preds = self.diarization_model.forward_infer(emb_seq)
+            emb_seq, emb_seq_length = self.diarization_model.frontend_encoder(processed_signal=processed_signal, processed_signal_length=processed_signal_length)
+            preds = self.diarization_model.forward_infer(emb_seq, emb_seq_length)
 
         return preds
 
@@ -215,7 +219,9 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
             diar_kernel_type = self.post_diar_kernel
         else:
             raise ValueError(f"Invalid position {position}")
-        
+
+        if self.binary_diar_preds:
+            diar_preds = (diar_preds > 0.5).float().to(encoded.device)
 
         if diar_kernel_type == 'metacat':
             if diar_preds.shape[1] != encoded.shape[2]:
@@ -275,17 +281,17 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
             1) The log probabilities tpensor of shape [B, T, D].
             2) The lengths of the acoustic sequence after propagation through the encoder, of shape [B].
         """
-        pre_encoded, pre_encoded_len = self.forward_pre_encode(
-            input_signal=signal, input_signal_length=signal_len
-        )
 
-        if self.pre_diar_kernel:
-            pre_encoded = self.forward_diar_kernel(pre_encoded.transpose(1, 2), pre_encoded_len, spk_targets, 'pre')
+        processed_signal, processed_signal_length = self.preprocessor(
+                input_signal=signal,
+                length=signal_len,
+            )
 
-        encoded, encoded_len = self.encoder(audio_signal=pre_encoded.transpose(1, 2), length=pre_encoded_len, pre_encode_input=True)
+        # Spec augment is not applied during evaluation/testing
+        if self.spec_augmentation is not None and self.training:
+            processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
 
-        if self.post_diar_kernel:
-            encoded = self.forward_diar_kernel(encoded, encoded_len, spk_targets, 'post')
+        encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
 
         return encoded, encoded_len
 
@@ -330,7 +336,8 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
 
         if self.spk_supervision == 'diar':
             spk_targets = self.forward_diar(audio_signal=signal, audio_signal_length=signal_len)
-        spk_targets = torch.stack([spk_targets[i, :, spk_ids[i]] for i in range(len(spk_ids))])
+        
+        self.spk_targets = torch.stack([spk_targets[i, :, spk_ids[i]] for i in range(len(spk_ids))])
 
         encoded, encoded_len = self.forward_train_val(
             signal=signal, signal_len=signal_len, spk_targets=spk_targets
@@ -428,7 +435,8 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
 
         if self.spk_supervision == 'diar':
             spk_targets = self.forward_diar(audio_signal=signal, audio_signal_length=signal_len)
-        spk_targets = torch.stack([spk_targets[i, :, spk_ids[i]] for i in range(len(spk_ids))])
+        
+        self.spk_targets = torch.stack([spk_targets[i, :, spk_ids[i]] for i in range(len(spk_ids))])
 
         encoded, encoded_len = self.forward_train_val(
             signal=signal, signal_len=signal_len, spk_targets=spk_targets
@@ -498,16 +506,20 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         signal, signal_len, transcript, transcript_len, spk_targets, spk_ids = batch
 
         if self.spk_supervision == 'diar':
-            spk_targets = self.forward_diar(audio_signal=signal, audio_signal_length=signal_len)
-        spk_ids = [self.fixed_spk_id for _ in range(len(signal_len))]
-        spk_targets = torch.stack([spk_targets[i, :, spk_ids[i]] for i in range(len(spk_ids))])
+            spk_targets = self.forward_diar(audio_signal=signal, audio_signal_length=signal_len) # B x T x N
+        n_mix = trcfg.mix
+
+        # Multi-instance inference
+        self.spk_targets = spk_targets[:, :, :n_mix].transpose(1, 2).reshape(-1, spk_targets.size(1)) # B x T x N_mix -> BN_mix x T
+        signal = signal.unsqueeze(1).repeat(1, n_mix, 1).reshape(-1, signal.size(1)) # B x T -> BN_mix x T
+        signal_len = signal_len.unsqueeze(1).repeat(1, n_mix).reshape(-1) # B -> BN_mix
 
         encoded, encoded_len = self.forward_train_val(
             signal=signal, signal_len=signal_len, spk_targets=spk_targets
         )
         del signal
 
-        output = dict(encoded=encoded, encoded_len=encoded_len, spk_targets=spk_targets)
+        output = dict(encoded=encoded, encoded_len=encoded_len, spk_targets=self.spk_targets)
 
         return output
 
@@ -537,7 +549,8 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         else:
             all_hypotheses += best_hyp
         self.total_results.append(hypotheses)
-        # self.preds_rttms.append(spk_targets)
+
+        # import ipdb; ipdb.set_trace()
 
         return (hypotheses, all_hypotheses)
 
@@ -728,7 +741,7 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         if self.encoder.streaming_cfg.drop_extra_pre_encoded > 0 and cache_last_channel is not None:
             processed_signal = processed_signal[:, self.encoder.streaming_cfg.drop_extra_pre_encoded :, :]
             processed_signal_length = (processed_signal_length - self.encoder.streaming_cfg.drop_extra_pre_encoded).clamp(min=0)
-
+        
         (
             encoded,
             encoded_len,

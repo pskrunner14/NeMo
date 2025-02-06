@@ -24,6 +24,7 @@ import pytorch_lightning as pl
 import torch
 from omegaconf import OmegaConf, open_dict
 
+import nemo.collections.asr as nemo_asr
 from nemo.collections.asr.models import EncDecCTCModel, EncDecHybridRNNTCTCModel, EncDecMultiTaskModel
 from nemo.collections.asr.modules.conformer_encoder import ConformerChangeConfig
 from nemo.collections.asr.parts.submodules.ctc_decoding import CTCDecodingConfig
@@ -201,7 +202,9 @@ class TranscriptionConfig:
     extract_nbest: bool = False  # Extract n-best hypotheses from the model
 
     fixed_spk_id: Optional[int] = None  # Fixed speaker
-
+    binary_diar_preds: bool = True  # Use binary diarization predictions
+    spk_supervision: str = 'rttm'  # Use speaker supervision
+    mix: int = 2  # Number of speakers in the mixture
 
 @hydra_runner(config_name="TranscriptionConfig", schema=TranscriptionConfig)
 def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig, List[Hypothesis]]:
@@ -254,7 +257,12 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig, List[Hypothesis
 
     logging.info(f"Inference will be done on device: {map_location}")
 
-    asr_model, model_name = setup_model(cfg, map_location)
+    # asr_model, model_name = setup_model(cfg, map_location)
+    model_cfg = nemo_asr.models.ASRModel.restore_from(restore_path=cfg.model_path, return_config=True)
+    model_cfg.diar_model_path = cfg.diar_model_path
+    model_cfg.spk_supervision = cfg.spk_supervision
+    model_cfg.binary_diar_preds = cfg.binary_diar_preds
+    asr_model = nemo_asr.models.ASRModel.restore_from(restore_path=cfg.model_path, override_config_path=model_cfg)
 
     trainer = pl.Trainer(devices=device, accelerator=accelerator)
     asr_model.set_trainer(trainer)
@@ -375,9 +383,6 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig, List[Hypothesis
         def autocast(dtype=None):
             yield
 
-    # Compute output filename
-    cfg = compute_output_filename(cfg, model_name)
-
     # if transcripts should not be overwritten, and already exists, skip re-transcription step and return
     if not cfg.return_transcriptions and not cfg.overwrite_transcripts and os.path.exists(cfg.output_filename):
         logging.info(
@@ -414,6 +419,7 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig, List[Hypothesis
                 override_cfg.text_field = cfg.gt_text_attr_name
                 override_cfg.lang_field = cfg.gt_lang_attr_name
                 override_cfg.fixed_spk_id = cfg.fixed_spk_id
+                override_cfg.mix = cfg.mix
                 transcriptions = asr_model.transcribe(audio=cfg.dataset_manifest, override_config=override_cfg,)
     if cfg.dataset_manifest is not None:
         logging.info(f"Finished transcribing from manifest file: {cfg.dataset_manifest}")
@@ -439,7 +445,8 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig, List[Hypothesis
     output_filename = write_transcription_to_seglst(
         transcriptions,
         filepaths=filepaths,
-        output_filename=cfg.output_filename
+        output_filename=cfg.output_filename,
+        cfg=cfg,
     )
     logging.info(f"Finished writing predictions to {output_filename}!")
 
@@ -454,14 +461,19 @@ def write_transcription_to_seglst(
     transcriptions: List[Hypothesis],
     filepaths: Union[str, List[str]],
     output_filename: str,
+    cfg: TranscriptionConfig
 ):
     output_jsons = []
-    for i, trans in enumerate(transcriptions):
+    n_mix = cfg.mix
+
+    transcriptions = [tran for batch in transcriptions for tran in batch]
+    transcriptions = [transcriptions[i:i+n_mix] for i in range(0, len(transcriptions), n_mix)]
+    for i in range(len(transcriptions)):
         audio_path = filepaths[i]
         session_id = audio_path.split("/")[-1][:-4]
-        for j, tran in enumerate(trans):
-            speaker = str(j+1)
-            words = tran.text
+        for j in range(n_mix):
+            speaker = str(j)
+            words = transcriptions[i][j].text
             output_json = {
                 "audio_filepath": audio_path,
                 "session_id": session_id,
@@ -469,6 +481,7 @@ def write_transcription_to_seglst(
                 "words": words,
             }
             output_jsons.append(output_json)
+
     with open(output_filename, 'w') as f:
         f.write(json.dumps(output_jsons, indent=2) + "\n")
     return output_filename

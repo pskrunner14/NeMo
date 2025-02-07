@@ -112,7 +112,7 @@ class DiarizationConfig:
     output_path: Optional[str] = None
     pad_and_drop_preencoded: bool = False
     set_decoder: Optional[str] = None # ["ctc", "rnnt"]
-    att_context_size: Optional[str] = "[210,13]"
+    att_context_size: Optional[list] = None
     generate_scripts: bool = True
     
     word_window: int = 50
@@ -168,7 +168,7 @@ def perform_streaming(
     feat_frame_count = 0
     for step_num, (chunk_audio, chunk_lengths) in enumerate(streaming_buffer_iter):
 
-        print(step_num)
+        logging.info(f"Step ID: {step_num}")
         loop_start_time = time.time()
         with torch.inference_mode():
             with autocast:
@@ -314,7 +314,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
 
     if args.att_context_size is not None:
         if hasattr(asr_model.encoder, "set_default_att_context_size"):
-            asr_model.encoder.set_default_att_context_size(att_context_size=json.loads(args.att_context_size))
+            asr_model.encoder.set_default_att_context_size(att_context_size=args.att_context_size)
         else:
             raise ValueError("Model does not support multiple lookaheads.")
 

@@ -62,8 +62,12 @@ class MetaCatResidual(torch.nn.Module):
         x: (B, T, D)
         mask: (B, T)
         """
-        if mask.shape[1] != x.shape[1]:
-            mask = F.pad(mask, (0, x.shape[1] - mask.shape[1]), value=0)
+        if mask.shape[1] < x.shape[1]:
+            mask = F.pad(mask, (x.shape[1] - mask.shape[1], 0), value=0)
+
+        if mask.shape[1] > x.shape[1]:
+            mask = mask[:, -x.shape[1]:]
+
         x = x * mask.unsqueeze(2)
         x = x + self.proj(x)
         return x
@@ -155,15 +159,14 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
     def get_hook_function(self, index):
         """Returns a forward hook function that applies the metacat modules"""
         def hook(module, input, output):
-            # import ipdb; ipdb.set_trace()
+
             if isinstance(output, tuple): # pre-encode, B x T x D
                 x, *cache = output
                 x = self.spk_kernels[index](x, self.spk_targets)
-                # import ipdb; ipdb.set_trace()
                 
                 return (x, *cache)
+            
             else:
-                # import ipdb; ipdb.set_trace()
                 return self.spk_kernels[index](output, self.spk_targets)
         
         return hook
@@ -176,78 +179,10 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         with torch.no_grad():
             processed_signal, processed_signal_length = self.diarization_model.process_signal(audio_signal=audio_signal, audio_signal_length=audio_signal_length)
             processed_signal = processed_signal[:, :, :processed_signal_length.max()]
-            emb_seq, emb_seq_length = self.diarization_model.frontend_encoder(processed_signal=processed_signal, processed_signal_length=processed_signal_length)
-            preds = self.diarization_model.forward_infer(emb_seq, emb_seq_length)
+            emb_seq, _ = self.diarization_model.frontend_encoder(processed_signal=processed_signal, processed_signal_length=processed_signal_length)
+            preds = self.diarization_model.forward_infer(emb_seq)
 
         return preds
-
-    def forward_pre_encode(
-        self,
-        input_signal=None,
-        input_signal_length=None
-    ):
-        processed_signal, processed_signal_length = self.preprocessor(
-                input_signal=input_signal,
-                length=input_signal_length,
-            )
-
-        # Spec augment is not applied during evaluation/testing
-        if self.spec_augmentation is not None and self.training:
-            processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
-
-        processed_signal, processed_signal_length = self.encoder.pre_encode(x=processed_signal.transpose(1, 2).contiguous(), lengths=processed_signal_length)
-
-        return processed_signal, processed_signal_length
-
-    def forward_diar_kernel(
-        self,
-        encoded,
-        encoded_len,
-        diar_preds,
-        position='pre'
-    ):
-        """
-        Args:
-            encoded: torch.tensor, shape (B, D, T)
-            encoded_len: torch.tensor, shape (B)
-            diar_preds: torch.tensor, shape (B, T)
-            position: str, 'pre' or 'post'
-        """
-        if position == 'pre':
-            joint_proj = self.pre_proj
-            diar_kernel_type = self.pre_diar_kernel
-        elif position == 'post':
-            joint_proj = self.post_proj
-            diar_kernel_type = self.post_diar_kernel
-        else:
-            raise ValueError(f"Invalid position {position}")
-
-        if self.binary_diar_preds:
-            diar_preds = (diar_preds > 0.5).float().to(encoded.device)
-
-        if diar_kernel_type == 'metacat':
-            if diar_preds.shape[1] != encoded.shape[2]:
-                diar_preds = F.pad(diar_preds, (0, encoded.shape[2] - diar_preds.shape[1]), value=0)
-            enc_states_with_metacat = encoded * diar_preds.unsqueeze(1)
-            encoded = joint_proj(enc_states_with_metacat.transpose(1, 2)).transpose(1, 2)
-        elif diar_kernel_type == 'metacat_residule':
-            if diar_preds.shape[1] != encoded.shape[2]:
-                diar_preds = F.pad(diar_preds, (0, encoded.shape[2] - diar_preds.shape[1]), value=0)
-            enc_states_with_metacat = encoded * diar_preds.unsqueeze(1)
-            encoded = encoded + joint_proj(enc_states_with_metacat.transpose(1, 2)).transpose(1, 2)
-        elif diar_kernel_type == 'metacat_projection':
-            if diar_preds.shape[1] != encoded.shape[2]:
-                diar_preds = F.pad(diar_preds, (0, encoded.shape[2] - diar_preds.shape[1]), value=0)
-            enc_states_with_metacat = torch.cat([encoded, diar_preds.unsqueeze(1)], dim=1)
-            encoded = joint_proj(enc_states_with_metacat.transpose(1, 2)).transpose(1, 2)
-
-        elif diar_kernel_type == 'sinusoidal':
-            pass
-
-        else:
-            raise ValueError(f"Invalid diar_kernel_type {diar_kernel_type}")
-
-        return encoded
 
     def forward_train_val(
         self,
@@ -675,6 +610,7 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         return_transcription: bool = True,
         return_log_probs: bool = False,
         spk_targets: torch.Tensor = None,
+        n_mix = 1,
     ):
         """
         It simulates a forward step with caching for streaming purposes.
@@ -702,133 +638,32 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
             log_probs: the logits tensor of current streaming chunk, only returned when return_log_probs=True
             encoded_len: the length of the output log_probs + history chunk log_probs, only returned when return_log_probs=True
         """
-        if not isinstance(self, asr_models.EncDecRNNTModel) and not isinstance(self, asr_models.EncDecCTCModel):
-            raise NotImplementedError(f"stream_step does not support {type(self)}!")
-
-        if not isinstance(self.encoder, StreamingEncoder):
-            raise NotImplementedError(f"Encoder of this model does not support streaming!")
-
-        if isinstance(self, asr_models.EncDecRNNTModel) and return_transcription is False:
-            logging.info(
-                "return_transcription can not be False for Transducer models as decoder returns the transcriptions too."
-            )
-
-        if not isinstance(self, asr_models.EncDecCTCModel) and return_log_probs is True:
-            logging.info("return_log_probs can only be True for CTC models.")
-
-        # pre-encode the input
-        processed_signal, processed_signal_length = self.encoder.pre_encode(x=processed_signal.transpose(1, 2).contiguous(), lengths=processed_signal_length)
-
+        # Multi-instance inference
         if len(spk_targets.size()) == 3:
+            # N: # speakers
             # spk_targets: (B, T, N) -> (BN, T)
+            self.spk_targets = spk_targets[:, :, :n_mix].transpose(1, 2).reshape(-1, spk_targets.size(1))
+
             # processed_signal: (B, T, D) -> (BN, T, D)
-            n_spk = spk_targets.size(2)
-            spk_targets = spk_targets.transpose(1, 2).reshape(-1, spk_targets.size(1))
-            processed_signal = processed_signal.unsqueeze(1).repeat(1, n_spk, 1, 1).reshape(-1, processed_signal.size(1), processed_signal.size(2))
-            processed_signal_length = processed_signal_length.unsqueeze(1).repeat(1, n_spk).reshape(-1)
-        
+            processed_signal = processed_signal.unsqueeze(1).repeat(1, n_mix, 1, 1).reshape(-1, processed_signal.size(1), processed_signal.size(2))
+            processed_signal_length = processed_signal_length.unsqueeze(1).repeat(1, n_mix).reshape(-1)
+
         if cache_last_channel_len.shape[0] != processed_signal.shape[0]:
-            cache_last_channel = cache_last_channel.unsqueeze(2).repeat(1, 1, n_spk, 1, 1).reshape(cache_last_channel.size(0), -1, cache_last_channel.size(2), cache_last_channel.size(3))
-            cache_last_time = cache_last_time.unsqueeze(2).repeat(1, 1, n_spk, 1, 1).reshape(cache_last_time.size(0), -1, cache_last_time.size(2), cache_last_time.size(3))
-            cache_last_channel_len = cache_last_channel_len.unsqueeze(1).repeat(1, n_spk).reshape(-1)
+            cache_last_channel = cache_last_channel.unsqueeze(2).repeat(1, 1, n_mix, 1, 1).reshape(cache_last_channel.size(0), -1, cache_last_channel.size(2), cache_last_channel.size(3))
+            cache_last_time = cache_last_time.unsqueeze(2).repeat(1, 1, n_mix, 1, 1).reshape(cache_last_time.size(0), -1, cache_last_time.size(2), cache_last_time.size(3))
+            cache_last_channel_len = cache_last_channel_len.unsqueeze(1).repeat(1, n_mix).reshape(-1)
 
-        # apply diarization kernel
-        if self.pre_diar_kernel:
-            processed_signal = self.forward_diar_kernel(processed_signal.transpose(1, 2), processed_signal_length, spk_targets, 'pre')  
-
-        processed_signal = processed_signal.transpose(1, 2)
-
-        processed_signal_length = processed_signal_length.to(torch.int64)
-        # self.streaming_cfg is set by setup_streaming_cfg(), called in the init
-        if self.encoder.streaming_cfg.drop_extra_pre_encoded > 0 and cache_last_channel is not None:
-            processed_signal = processed_signal[:, self.encoder.streaming_cfg.drop_extra_pre_encoded :, :]
-            processed_signal_length = (processed_signal_length - self.encoder.streaming_cfg.drop_extra_pre_encoded).clamp(min=0)
-        
-        (
-            encoded,
-            encoded_len,
-            cache_last_channel_next,
-            cache_last_time_next,
-            cache_last_channel_next_len,
-        ) = self.encoder.cache_aware_stream_step(
+        return super().conformer_stream_step(
             processed_signal=processed_signal,
             processed_signal_length=processed_signal_length,
             cache_last_channel=cache_last_channel,
             cache_last_time=cache_last_time,
             cache_last_channel_len=cache_last_channel_len,
             keep_all_outputs=keep_all_outputs,
+            previous_hypotheses=previous_hypotheses,
+            previous_pred_out=previous_pred_out,
             drop_extra_pre_encoded=drop_extra_pre_encoded,
-            pre_encode_input=True
+            return_transcription=return_transcription,
+            return_log_probs=return_log_probs
         )
-
-        if self.post_diar_kernel:
-            encoded = self.forward_diar_kernel(encoded, encoded_len, spk_targets, 'post')
-
-        if isinstance(self, asr_models.EncDecCTCModel) or (
-            isinstance(self, asr_models.EncDecHybridRNNTCTCModel) and self.cur_decoder == "ctc"
-        ):
-            if hasattr(self, "ctc_decoder"):
-                decoding = self.ctc_decoding
-                decoder = self.ctc_decoder
-            else:
-                decoding = self.decoding
-                decoder = self.decoder
-
-            log_probs = decoder(encoder_output=encoded)
-            predictions_tensor = log_probs.argmax(dim=-1, keepdim=False)
-
-            # Concatenate the previous predictions with the current one to have the full predictions.
-            # We drop the extra predictions for each sample by using the lengths returned by the encoder (encoded_len)
-            # Then create a list of the predictions for the batch. The predictions can have different lengths because of the paddings.
-            greedy_predictions = []
-            if return_transcription:
-                all_hyp_or_transcribed_texts = []
-            else:
-                all_hyp_or_transcribed_texts = None
-            for preds_idx, preds in enumerate(predictions_tensor):
-                if encoded_len is None:
-                    preds_cur = predictions_tensor[preds_idx]
-                else:
-                    preds_cur = predictions_tensor[preds_idx, : encoded_len[preds_idx]]
-                if previous_pred_out is not None:
-                    greedy_predictions_concat = torch.cat((previous_pred_out[preds_idx], preds_cur), dim=-1)
-                    encoded_len[preds_idx] += len(previous_pred_out[preds_idx])
-                else:
-                    greedy_predictions_concat = preds_cur
-                greedy_predictions.append(greedy_predictions_concat)
-
-                # TODO: make decoding more efficient by avoiding the decoding process from the beginning
-                if return_transcription:
-                    decoded_out = decoding.ctc_decoder_predictions_tensor(
-                        decoder_outputs=greedy_predictions_concat.unsqueeze(0),
-                        decoder_lengths=encoded_len[preds_idx : preds_idx + 1],
-                        return_hypotheses=False,
-                    )
-                    all_hyp_or_transcribed_texts.append(decoded_out[0][0])
-            best_hyp = None
-        else:
-
-            best_hyp, all_hyp_or_transcribed_texts = self.decoding.rnnt_decoder_predictions_tensor(
-                encoder_output=encoded,
-                encoded_lengths=encoded_len,
-                return_hypotheses=True,
-                partial_hypotheses=previous_hypotheses,
-            )
-            greedy_predictions = [hyp.y_sequence for hyp in best_hyp]
-
-            if all_hyp_or_transcribed_texts is None:
-                all_hyp_or_transcribed_texts = best_hyp
-
-        result = [
-            greedy_predictions,
-            all_hyp_or_transcribed_texts,
-            cache_last_channel_next,
-            cache_last_time_next,
-            cache_last_channel_next_len,
-            best_hyp,
-        ]
-        if return_log_probs:
-            result.append(log_probs)
-            result.append(encoded_len)
-
-        return tuple(result)
+    

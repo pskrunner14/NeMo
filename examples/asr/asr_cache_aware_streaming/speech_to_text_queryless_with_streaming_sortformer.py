@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import json
-import os
 from dataclasses import dataclass, is_dataclass
 from typing import Optional, Union, List, Tuple, Dict, Any
 
@@ -54,8 +53,6 @@ import itertools
 import time
 from functools import wraps
 import math
-
-
 
 @dataclass
 class DiarizationConfig:
@@ -115,12 +112,11 @@ class DiarizationConfig:
     output_path: Optional[str] = None
     pad_and_drop_preencoded: bool = False
     set_decoder: Optional[str] = None # ["ctc", "rnnt"]
-    att_context_size: Optional[str] = None
+    att_context_size: Optional[str] = "[210,13]"
     generate_scripts: bool = True
     
     word_window: int = 50
     fix_speaker_assignments: bool = False
-    sentence_break_threshold_in_sec: float = 10000.0
     fix_prev_words_count: int = 5
     update_prev_words_sentence: int = 5
     left_frame_shift: int = -1
@@ -137,8 +133,11 @@ class DiarizationConfig:
 
     feat_len_sec: float = 0.01
     finetune_realtime_ratio: float = 0.01
-    uppercase_first_letter: bool = True
-    remove_pnc: bool = False
+
+    mix: int = 2
+    spk_supervision: str = "diar"
+    binary_diar_preds: bool = False
+
 
 def format_time(seconds):
     minutes = math.floor(seconds / 60)
@@ -165,13 +164,11 @@ def perform_streaming(
     left_offset, right_offset = 0, 0
 
     multispk_asr_streamer = SpeakerTaggedASR(cfg, asr_model, diar_model)
-    feat_frame_count = 0
-    # print(f"Waiting for start_flag.txt to appear... ")
-    # while True:
-    #     if os.path.exists("/home/taejinp/projects/mimsasr_sortformer_pr01_fifo_memory/start_flag.txt"):
-    #         break
     session_start_time = time.time()
+    feat_frame_count = 0
     for step_num, (chunk_audio, chunk_lengths) in enumerate(streaming_buffer_iter):
+
+        print(step_num)
         loop_start_time = time.time()
         with torch.inference_mode():
             with autocast:
@@ -202,8 +199,10 @@ def perform_streaming(
                         left_offset=left_offset,
                         right_offset=right_offset,
                         pad_and_drop_preencoded=False,
+                        binary_diar_preds=cfg.binary_diar_preds,
+                        n_mix=cfg.mix,
                     )
-
+        
         if debug_mode:
             logging.info(f"Streaming transcriptions: {extract_transcriptions(transcribed_texts)}")
         
@@ -216,8 +215,7 @@ def perform_streaming(
                          f"Time difference for real-time mode: {time_diff:.4f} seconds")
             time.sleep(max(0, (chunk_audio.shape[-1] - cfg.discarded_frames)*cfg.feat_len_sec - 
                            (loop_end_time - loop_start_time) - time_diff * cfg.finetune_realtime_ratio))
-    final_streaming_tran = extract_transcriptions(transcribed_texts)
-            
+    
     final_streaming_tran = extract_transcriptions(transcribed_texts)
     
     return final_streaming_tran, final_offline_tran
@@ -298,7 +296,11 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
 
     if args.asr_model.endswith('.nemo'):
         logging.info(f"Using local ASR model from {args.asr_model}")
-        asr_model = nemo_asr.models.ASRModel.restore_from(restore_path=args.asr_model)
+        model_cfg = nemo_asr.models.ASRModel.restore_from(restore_path=cfg.asr_model, return_config=True)
+        model_cfg.diar_model_path = cfg.diar_model_path
+        model_cfg.spk_supervision = cfg.spk_supervision
+        model_cfg.binary_diar_preds = cfg.binary_diar_preds
+        asr_model = nemo_asr.models.ASRModel.restore_from(restore_path=cfg.asr_model, override_config_path=model_cfg)
     else:
         logging.info(f"Using NGC cloud ASR model {args.asr_model}")
         asr_model = nemo_asr.models.ASRModel.from_pretrained(model_name=args.asr_model)
@@ -359,12 +361,6 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
 
     else:
         online_normalization = False
-
-    streaming_buffer = CacheAwareStreamingAudioBuffer(
-        model=asr_model,
-        online_normalization=online_normalization,
-        pad_and_drop_preencoded=args.pad_and_drop_preencoded,
-    )
     
     if args.audio_file is not None:
         # stream a single audio file
@@ -385,14 +381,22 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         with open(args.manifest_file, 'r') as f:
             for line in f:
                 item = json.loads(line)
+                item['duration'] = None
                 samples.append(item)
 
         # Override batch size: The batch size should be equal to the number of samples in the manifest file
-        args.batch_size = len(samples)
+        # args.batch_size = 1
         logging.info(f"Loaded {len(samples)} from the manifest at {args.manifest_file}.")
 
         start_time = time.time()
+        all_streaming_tran = []
+        streaming_buffer = CacheAwareStreamingAudioBuffer(
+            model=asr_model,
+            online_normalization=online_normalization,
+            pad_and_drop_preencoded=args.pad_and_drop_preencoded,
+        )
         for sample_idx, sample in enumerate(samples):
+            
             processed_signal, processed_signal_length, stream_id = streaming_buffer.append_audio_file(
                 sample['audio_filepath'], offset=sample['offset'], duration=sample['duration'], stream_id=-1
             )
@@ -408,6 +412,30 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
                     diar_model=diar_model,
                     streaming_buffer=streaming_buffer,
                 )
+                all_streaming_tran.extend(streaming_tran)
+                streaming_buffer.reset_buffer()
+                
+        if args.output_path is not None:
+
+            hyp_json = args.output_path
+            records = []
+            
+            for i, hyp in enumerate(all_streaming_tran):
+                idx = i // args.mix
+                mod = i % args.mix
+                audio_filepath = samples[idx]["audio_filepath"]
+                uniq_id = audio_filepath.split('/')[-1].split('.')[0]
+                if mod % args.mix < args.mix:
+                    record = {
+                        "audio_filepath": audio_filepath, 
+                        "session_id": uniq_id,
+                        "speaker": uniq_id + '-' + str(mod),
+                        "words": hyp,
+                    }
+                    records.append(record)
+            with open(hyp_json, 'w') as out_f:
+                json.dump(records, out_f, indent=4)
+            logging.info(f"Saved the transcriptions of the streaming inference in {hyp_json}.")
                 
 if __name__ == '__main__':
     main()

@@ -38,6 +38,7 @@ from lhotse.dataset.sampling.dynamic_bucketing import FixedBucketBatchSizeConstr
 from lhotse.lazy import LazyFlattener
 from lhotse.utils import fastcopy, fix_random_seed
 from omegaconf import DictConfig, OmegaConf
+from nemo.collections.common.data.lhotse.cutset import mux
 
 from nemo.collections.common.data.lhotse.cutset import guess_parse_cutset, read_cutset_from_config
 from nemo.collections.common.prompts.fn import get_prompt_format_fn
@@ -197,7 +198,7 @@ def get_lhotse_dataloader_from_config(
 
     # 1. Load a manifest as a Lhotse CutSet.
     cuts, is_tarred, weights = read_cutset_from_config(config)
-
+    
     if config.generators is not None:
         #genertor use pre-defined mixed manifest to generator audio. It requires pre-generated rttm/audio_file_path. Only wav need to be mixed here. This is meant to alleviate the storage overhead for millions of mixed audio
         generated_cuts = CutSet()
@@ -223,7 +224,7 @@ def get_lhotse_dataloader_from_config(
                     generated_cuts += generator.generate(cuts_for_generation)
         if config.including_real_data:
             # cuts = CutSet.from_cuts(cuts + generated_cuts)
-            cuts = CutSet.mux(cuts, simulated_cuts, weights = [sum(weights), len(generated_cuts)])
+            cuts = mux(cuts, generated_cuts, weights = [sum(weights), len(generated_cuts)])
         else:
             cuts = generated_cuts
 
@@ -273,10 +274,9 @@ def get_lhotse_dataloader_from_config(
         if config.including_real_data:
             # cuts = CutSet.from_cuts(cuts + simulated_cuts)
             # only support uniform sampling, self-defined sampling TODO
-            cuts = CutSet.mux(cuts, simulated_cuts, weights = [sum(weights), len(simulated_cuts)])
+            cuts = mux(cuts, simulated_cuts, weights = [sum(weights), len(simulated_cuts)])
         else:
             cuts = simulated_cuts
-
 
     # Apply channel selector
     if config.channel_selector is not None:

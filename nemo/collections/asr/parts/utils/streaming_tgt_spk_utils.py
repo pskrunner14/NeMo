@@ -182,7 +182,6 @@ class FrameBatchASR_tgt_spk:
                 predictions = log_probs.argmax(dim=-1, keepdim=False)
             else:
                 log_probs, encoded_len, predictions = forward_outs
-            import ipdb; ipdb.set_trace()
             #remove pred from query
             log_probs = log_probs[:,self.query_pred_len:,:]
             predictions = predictions[:,self.query_pred_len:]

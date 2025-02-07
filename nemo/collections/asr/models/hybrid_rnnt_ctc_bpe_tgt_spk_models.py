@@ -140,7 +140,7 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
             torch.nn.ReLU(),
             torch.nn.Linear(proj_out_size*2, proj_out_size)
         )
-        self.pre_end_spk_diar_kernal = self.joint_proj
+        self.pre_end_spk_diar_kernal = self.pre_end_spk_joint_proj
 
         if self.pre_end_spk_diar_kernel_type == 'sinusoidal':
             self.pre_end_spk_diar_kernel = self.get_sinusoid_position_encoding(self.num_speakers, cfg.model_defaults.enc_hidden)
@@ -752,6 +752,7 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
                 concat_enc_states = torch.cat([encoded, diar_preds], dim = -1)
                 encoded = self.pre_end_spk_joint_proj(concat_enc_states)
             else:
+                #projection
                 concat_enc_states = torch.cat([encoded, diar_preds], dim=-1)
                 encoded = self.pre_end_spk_joint_proj(concat_enc_states)
             encoded = torch.transpose(encoded, 1, 2) # B * T * D -> B * D * T

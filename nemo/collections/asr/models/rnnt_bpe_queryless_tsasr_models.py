@@ -63,7 +63,7 @@ class MetaCatResidual(torch.nn.Module):
         mask: (B, T)
         """
         if mask.shape[1] < x.shape[1]:
-            mask = F.pad(mask, (x.shape[1] - mask.shape[1], 0), value=0)
+            mask = F.pad(mask, (0, x.shape[1] - mask.shape[1]), mode='replicate')
 
         if mask.shape[1] > x.shape[1]:
             mask = mask[:, -x.shape[1]:]
@@ -177,10 +177,7 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         audio_signal_length=None
     ):
         with torch.no_grad():
-            processed_signal, processed_signal_length = self.diarization_model.process_signal(audio_signal=audio_signal, audio_signal_length=audio_signal_length)
-            processed_signal = processed_signal[:, :, :processed_signal_length.max()]
-            emb_seq, _ = self.diarization_model.frontend_encoder(processed_signal=processed_signal, processed_signal_length=processed_signal_length)
-            preds = self.diarization_model.forward_infer(emb_seq)
+            preds = self.diarization_model(audio_signal=audio_signal, audio_signal_length=audio_signal_length)
 
         return preds
 
